@@ -894,6 +894,47 @@ function openPosition(signal) {
   console.log(`[CLOB] OPEN ${side} ${shares}sh @ ${fillOdds.toFixed(3)} | spread=${(fill.spread*100).toFixed(1)}¢ impact=${(fill.impact*100).toFixed(1)}¢ | $${fillSize}${fillNote} | edge ${(edge*100).toFixed(1)}¢`);
 }
 
+// ── SIM MARKET PRICE MODEL ───────────────────────────────────────────────────────────────
+// Updates prices for sim (non-live) markets every 2s using a proper binary option model.
+// This mimics how a real Polymarket market maker reprices based on the underlying asset.
+// Real markets (live:true) are updated via fetchBTCMarkets() every 90s — same as LIVE mode.
+function updateSimMarketPrices() {
+  if (state.markets.length === 0) return;
+  const btc = state.btcPrice;
+  if (!btc || btc <= 0) return;
+  const now = Date.now();
+  // Realized vol (1-min window), annualized per hour for the binary model
+  const realizedVol = recentVolatility(60000); // stdev of 1s returns
+  const volPerHour  = realizedVol * Math.sqrt(3600); // scale to per-hour
+
+  for (const m of state.markets) {
+    if (m.live) continue; // real markets updated by fetchBTCMarkets only
+    if (!m.outcomePrices) m.outcomePrices = [0.5, 0.5];
+
+    // Parse strike from question: "Will BTC be above $97,000 in 15 min?"
+    const strikeMatch = m.question.match(/\$([0-9,]+)/);
+    const strike = strikeMatch ? parseFloat(strikeMatch[1].replace(/,/g, '')) : btc;
+
+    const msLeft    = m.endDate ? new Date(m.endDate).getTime() - now : 15 * 60000;
+    const hoursLeft = Math.max(1 / 3600, msLeft / 3600000); // min 1s
+
+    // Binary call option: P(BTC_T > strike) ≈ Φ(d1)
+    // d1 = ln(S/K) / (σ * sqrt(T)), where σ is realized hourly vol
+    const lnRatio   = Math.log(btc / strike);
+    const sigmaT    = Math.max(0.001, volPerHour * Math.sqrt(hoursLeft));
+    const d1        = lnRatio / sigmaT;
+    // Standard normal CDF approximation
+    const rawProb   = 1 / (1 + Math.exp(-1.7 * d1)); // logistic CDF ≈ normal CDF
+
+    // Add tiny microstructure noise (±0.5¢) — real markets have bid/ask noise
+    const noise     = (Math.random() - 0.5) * 0.005;
+    const newYes    = Math.max(0.03, Math.min(0.97, rawProb + noise));
+
+    m.outcomePrices[0] = Math.round(newYes * 1000) / 1000;
+    m.outcomePrices[1] = Math.round((1 - m.outcomePrices[0]) * 1000) / 1000;
+  }
+}
+
 // ── POSITION CLOSE ───────────────────────────────────────────────────────────────
 
 function closePosition(pos, exitOdds, reason) {
@@ -1323,6 +1364,8 @@ server.listen(PORT, async () => {
   // Refresh markets every 90s — ensures fresh Polymarket prices and valid expiry windows.
   // This natural polling lag (90s) mirrors Polymarket's real update cycle for both SIM and LIVE.
   setInterval(fetchBTCMarkets, 90 * 1000);
+  // Sim market price model: re-prices non-live markets every 2s using real BTC + binary option math
+  setInterval(updateSimMarketPrices, 2000);
   // Binance REST fallback every 2s when WS is down — keeps priceHistory dense
   setInterval(pollBinanceRest, 2000);
   // Position monitor — 150ms for fast TP/SL response
