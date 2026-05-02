@@ -571,7 +571,9 @@ function BtcChartBody({ market, candles, currentCandle }) {
           </span>
           {market.priceSource === 'binance'
             ? <span className="blink" style={{ color: 'var(--green)' }}>● LIVE</span>
-            : <span style={{ color: 'var(--amber)' }}>● REST</span>
+            : market.priceSource === 'binance-rest'
+              ? <span style={{ color: 'var(--amber)' }}>● REST</span>
+              : <span style={{ color: 'var(--red)' }}>● OFF</span>
           }
           <span style={{ color: 'var(--t3)' }}>candles 5s</span>
         </div>

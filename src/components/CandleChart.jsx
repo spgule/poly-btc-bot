@@ -28,6 +28,7 @@ export default function CandleChart({ candles = [], currentCandle = null }) {
     if (!containerRef.current) return;
 
     const chart = createChart(containerRef.current, {
+      autoSize: true,
       layout: {
         background: { type: ColorType.Solid, color: '#0a0a14' },
         textColor: '#5a5a88',

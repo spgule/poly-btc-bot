@@ -212,7 +212,7 @@ function connectBinance() {
 
   ws.on('close', () => {
     state.binanceConnected = false;
-    broadcast({ type: 'CONNECTION', data: { binanceConnected: false, priceSource: 'coingecko' } });
+    broadcast({ type: 'CONNECTION', data: { binanceConnected: false, priceSource: 'binance-rest' } });
     console.log('[Binance] Disconnected – reconnecting in 4s');
     binanceTimer = setTimeout(connectBinance, 4000);
   });
@@ -269,30 +269,12 @@ async function loadBinanceHistory() {
       .filter(k => Number(k[0]) >= fiveMinAgo)
       .map(k => ({ time: Number(k[0]), price: parseFloat(k[4]) }));
 
-    // Build closed candles from 1m klines (use closeTime in seconds as bucket)
-    state.candles = klines.slice(0, -1).map(k => ({
-      time:  Math.floor(Number(k[0]) / 1000),
-      open:  parseFloat(k[1]),
-      high:  parseFloat(k[2]),
-      low:   parseFloat(k[3]),
-      close: parseFloat(k[4]),
-      ticks: 1,
-    }));
-
-    // Seed currentCandle from the last (still-open) kline
-    const last = klines[klines.length - 1];
-    const lastPrice = parseFloat(last[4]);
-    state.currentCandle = {
-      time:  Math.floor(Number(last[0]) / 1000),
-      open:  parseFloat(last[1]),
-      high:  parseFloat(last[2]),
-      low:   parseFloat(last[3]),
-      close: lastPrice,
-      ticks: 1,
-    };
+    // NOTE: do NOT seed state.candles here — those are 1m intervals and would
+    // conflict with the 5s live candles built by updateCandle() from Binance WS.
+    // The chart will show live candles as soon as Binance WS connects.
 
     // Set current price + 24h change
-    state.btcPrice = lastPrice;
+    state.btcPrice = parseFloat(klines[klines.length - 1][4]);
     const { data: ticker } = await axios.get(`${BINANCE_REST}/ticker/24hr`, {
       params: { symbol: 'BTCUSDT' }, timeout: 8000,
     });
