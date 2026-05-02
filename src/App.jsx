@@ -849,7 +849,7 @@ function TradesBody({ trades }) {
         <table style={{ width: '100%', borderCollapse: 'collapse' }}>
           <thead>
             <tr style={{ fontSize: 8, color: 'var(--t2)', textTransform: 'uppercase', letterSpacing: '0.08em', position: 'sticky', top: 0, background: 'var(--s1)' }}>
-              {['HORA', 'DIR', 'EDGE', 'TAMANHO', 'P&L', 'MOTIVO'].map(h => (
+              {['HORA', 'DIR', 'EDGE', 'TAMANHO', 'SPREAD', 'P&L', 'MOTIVO'].map(h => (
                 <th key={h} style={{ textAlign: h === 'HORA' ? 'left' : 'right', padding: '6px 4px 4px', borderBottom: '1px solid var(--border)' }}>{h}</th>
               ))}
             </tr>
@@ -862,7 +862,13 @@ function TradesBody({ trades }) {
                   {t.side === 'BUY_YES' ? '▲' : '▼'}
                 </td>
                 <td style={{ padding: '5px 4px', textAlign: 'right', color: 'var(--blue)', fontVariantNumeric: 'tabular-nums' }}>{fmtEdge(t.edge)}</td>
-                <td style={{ padding: '5px 4px', textAlign: 'right', color: 'var(--amber)', fontVariantNumeric: 'tabular-nums' }}>{fmt$(t.betSize, 1)}</td>
+                <td style={{ padding: '5px 4px', textAlign: 'right', color: 'var(--amber)', fontVariantNumeric: 'tabular-nums' }}>
+                  {fmt$(t.betSize, 1)}
+                  {t.partialFill && <span style={{ color: 'var(--amber)', fontSize: 7, marginLeft: 2 }} title={`Pedido: $${t.requestedSize}`}>P</span>}
+                </td>
+                <td style={{ padding: '5px 4px', textAlign: 'right', fontVariantNumeric: 'tabular-nums', color: 'var(--t3)', fontSize: 8 }}>
+                  {t.spread != null ? `${(t.spread * 100).toFixed(1)}¢` : '—'}
+                </td>
                 <td style={{ padding: '5px 4px', textAlign: 'right', fontWeight: 700, fontVariantNumeric: 'tabular-nums', color: t.pnl >= 0 ? 'var(--green)' : 'var(--red)' }}>
                   {fmt$(t.pnl, 2)}
                 </td>

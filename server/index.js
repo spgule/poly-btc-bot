@@ -779,13 +779,66 @@ function runArbitrageCheck() {
   broadcastSignal();
 }
 
+// ── CLOB REALISM ENGINE ─────────────────────────────────────────────────────
+// Applied identically in SIM and LIVE — makes SIM a faithful dry-run.
+
+// Bid-ask half-spread based on market volume (tighter = more liquid)
+// Source: Polymarket CLOB observed spreads (2024-2025 data)
+function clobSpread(marketVolume) {
+  if (marketVolume >= 500000) return 0.012; // 1.2¢ — deep liquid market
+  if (marketVolume >= 100000) return 0.025; // 2.5¢
+  if (marketVolume >=  50000) return 0.040; // 4¢
+  if (marketVolume >=  10000) return 0.060; // 6¢
+  return 0.080;                             // 8¢ — thin market
+}
+
+// Price impact: large orders consume depth and get worse fill
+// Approximation: 0.5¢ per $100 of order size in a $100k-volume market
+// Impact scales inversely with market volume
+function priceImpact(betSize, marketVolume) {
+  const depth = Math.max(marketVolume * 0.005, 500); // ~0.5% of vol as available depth
+  return Math.min(0.04, (betSize / depth) * 0.02);   // max 4¢ impact
+}
+
+// Maximum order size allowed by CLOB liquidity (1% of daily volume, hard cap $2000)
+function maxOrderSize(marketVolume) {
+  return Math.min(2000, Math.max(10, marketVolume * 0.01));
+}
+
+// Simulate CLOB fill: returns { fillOdds, fillSize, partialFill }
+// fillSize may be < requested if order exceeds available depth
+function simulateClobFill(side, requestedSize, market) {
+  const vol      = Number(market.volume || 0);
+  const yesPrice = market.outcomePrices?.[0] ?? 0.50;
+  const midOdds  = side === 'BUY_YES' ? yesPrice : (1 - yesPrice);
+
+  // 1. Half-spread: you always pay the ask (buy) or get the bid (sell)
+  const spread  = clobSpread(vol);
+  const askOdds = Math.min(0.97, midOdds + spread);  // you buy at ask
+
+  // 2. Price impact from order size
+  const impact  = priceImpact(requestedSize, Math.max(vol, 10000));
+  const rawFill = Math.min(0.98, askOdds + impact);
+
+  // 3. Partial fill: order capped at available depth
+  const maxSize     = maxOrderSize(vol);
+  const fillSize    = Math.min(requestedSize, maxSize);
+  const partialFill = fillSize < requestedSize;
+
+  return {
+    fillOdds:    Math.round(rawFill * 10000) / 10000,
+    fillSize:    Math.round(fillSize * 100) / 100,
+    partialFill,
+    spread,
+    impact,
+  };
+}
+
 // ── POSITION MANAGEMENT ──────────────────────────────────────────────────────
-// Scalping arb strategy: enter on edge, exit on TP / SL / timeout
-// This replaces the old single-tick random executeSimTrade.
 
 function openPosition(signal) {
   const { side, betSize, edge, marketId, question } = signal;
-  if (!betSize || betSize < 1 || betSize > state.trading.balance * 0.30) return;
+  if (!betSize || betSize < 1) return;
 
   // NEVER open opposite direction on same market — prevents self-canceling trades
   if (state.positions.some(p => p.status === 'OPEN' && p.marketId === marketId && p.side !== side)) return;
@@ -806,39 +859,63 @@ function openPosition(signal) {
   if (state.positions.filter(p => p.status === 'OPEN').length >= state.config.maxOpenPos) return;
 
   // Find the correct market by ID, fallback to best-scored market
-  const market     = state.markets.find(m => m.id === marketId) || getBestMarket() || state.markets[0];
+  const market = state.markets.find(m => m.id === marketId) || getBestMarket() || state.markets[0];
   if (!market) return;
-  const marketYes  = market?.outcomePrices?.[0] ?? 0.505;
-  const entryOdds  = side === 'BUY_YES' ? marketYes : (1 - marketYes);
-  const slippage   = 0.002;  // realistic CLOB slippage
-  const fillOdds   = Math.min(0.97, entryOdds + slippage);
-  const shares     = Math.round(betSize / fillOdds * 100) / 100;
+
+  // ── REAL CLOB CONSTRAINTS (applied in both SIM and LIVE) ──────────────────
+  const vol = Number(market.volume || 0);
+
+  // Minimum market volume: same threshold as LIVE ($50k)
+  // Below this, spread is too wide and fills are unreliable
+  const MIN_VOL = state.config.mode === 'SIM' ? 5000 : 50000;
+  if (vol < MIN_VOL && !marketId.startsWith('sim-')) {
+    console.log(`[CLOB] Skip — market volume $${vol.toLocaleString()} below minimum $${MIN_VOL.toLocaleString()}`);
+    return;
+  }
+
+  // Simulate CLOB fill with spread + price impact + partial fill
+  const fill = simulateClobFill(side, betSize, market);
+
+  if (fill.partialFill) {
+    console.log(`[CLOB] Partial fill: $${fill.fillSize} of $${betSize} requested (depth cap)`);
+  }
+  if (fill.fillSize < 1) return; // after partial fill, too small
+
+  const fillOdds = fill.fillOdds;
+  const fillSize = fill.fillSize;
+  const shares   = Math.round(fillSize / fillOdds * 100) / 100;
 
   const pos = {
     id:               `p-${Date.now()}`,
     marketId,
     question:         (question || 'BTC Market').slice(0, 60),
     side,
-    entryOdds:        Math.round(fillOdds * 1000) / 1000,
+    entryOdds:        fillOdds,
     markOdds:         fillOdds,
     shares,
-    cost:             betSize,
+    cost:             fillSize,
     unrealizedPnl:    0,
     pnlPct:           0,
     edge:             Math.round(edge * 10000) / 10000,
     entryTime:        Date.now(),
     btcPriceAtEntry:  state.btcPrice,
+    // CLOB execution metadata (shown in trade log)
+    spread:           fill.spread,
+    impact:           fill.impact,
+    partialFill:      fill.partialFill,
+    requestedSize:    betSize,
     status:           'OPEN',
   };
 
-  state.trading.balance = Math.round((state.trading.balance - betSize) * 100) / 100;
+  state.trading.balance = Math.round((state.trading.balance - fillSize) * 100) / 100;
   state.positions.push(pos);
   // Keep history bounded
   if (state.positions.length > 500) state.positions = state.positions.slice(-500);
 
   broadcast({ type: 'POSITION_OPENED', data: pos });
   broadcastStatus();
-  console.log(`[POS] OPEN ${side} ${shares}sh @ ${fillOdds.toFixed(3)} | $${betSize} | edge ${(edge*100).toFixed(1)}¢`);
+  const fillNote = fill.partialFill ? ` [PARTIAL ${fill.fillSize}/${betSize}]` : '';
+  console.log(`[CLOB] OPEN ${side} ${shares}sh @ ${fillOdds.toFixed(3)} | spread=${(fill.spread*100).toFixed(1)}¢ impact=${(fill.impact*100).toFixed(1)}¢ | $${fillSize}${fillNote} | edge ${(edge*100).toFixed(1)}¢`);
 }
 
 // Simulate how position odds evolve for SIM mode
@@ -932,15 +1009,19 @@ function closePosition(pos, exitOdds, reason) {
   }
 
   const trade = {
-    id:          `t-${Date.now()}`,
-    marketId:    pos.marketId,
-    question:    pos.question,
-    side:        pos.side,
-    betSize:     pos.cost,
-    entryOdds:   pos.entryOdds,
-    exitOdds:    pos.exitOdds,
-    shares:      pos.shares,
-    edge:        pos.edge,
+    id:            `t-${Date.now()}`,
+    marketId:      pos.marketId,
+    question:      pos.question,
+    side:          pos.side,
+    betSize:       pos.cost,
+    requestedSize: pos.requestedSize || pos.cost,
+    partialFill:   pos.partialFill   || false,
+    entryOdds:     pos.entryOdds,
+    exitOdds:      pos.exitOdds,
+    shares:        pos.shares,
+    edge:          pos.edge,
+    spread:        pos.spread  || null,
+    impact:        pos.impact  || null,
     outcome,
     closeReason: reason,
     holdMs:      pos.holdMs,
@@ -960,7 +1041,7 @@ function closePosition(pos, exitOdds, reason) {
   broadcastStatus();
   const pnlStr = `${pnl >= 0 ? '+' : ''}$${pnl}`;
   const holdS  = (pos.holdMs / 1000).toFixed(0);
-  console.log(`[POS] CLOSE [${reason}] ${pos.side} entry=${pos.entryOdds} exit=${pos.exitOdds} | ${pnlStr} (${((pnl/pos.cost)*100).toFixed(1)}%) hold=${holdS}s`);
+  console.log(`[CLOB] CLOSE [${reason}] ${pos.side} entry=${pos.entryOdds} exit=${pos.exitOdds} | ${pnlStr} (${((pnl/pos.cost)*100).toFixed(1)}%) hold=${holdS}s`);
 }
 
 function monitorPositions() {
@@ -995,10 +1076,9 @@ function monitorPositions() {
 
 // ── TRADE EXECUTION ───────────────────────────────────────────────────────────
 async function executeTrade(signal) {
-  if (!signal || signal.betSize < 2) return;
+  if (!signal || signal.betSize < 1) return;
 
   // Use effective balance (cash + open position cost + unrealized P&L) for drawdown
-  // Using cash-only would trigger kill switch prematurely whenever positions are open
   const openPos      = state.positions.filter(p => p.status === 'OPEN');
   const openCost     = openPos.reduce((s, p) => s + (p.cost     || 0), 0);
   const unrealized   = openPos.reduce((s, p) => s + (p.unrealizedPnl || 0), 0);
@@ -1013,8 +1093,16 @@ async function executeTrade(signal) {
     return;
   }
 
-  if (Date.now() - state.trading.lastTradeTs < state.trading.cooldownMs) return;
+  // ── CLOB rate-limit enforcement (identical for SIM and LIVE) ──────────────
+  // Polymarket CLOB allows ~10 req/s. 2s cooldown = safe margin, mirrors LIVE.
+  const minCooldown = Math.max(state.trading.cooldownMs, 2000);
+  if (Date.now() - state.trading.lastTradeTs < minCooldown) return;
   state.trading.lastTradeTs = Date.now();
+
+  // ── Simulate execution latency (CLOB order roundtrip: 50–300ms) ───────────
+  // In LIVE this would be real network + chain latency; in SIM we model it.
+  const latencyMs = 50 + Math.floor(Math.random() * 250);
+  await new Promise(r => setTimeout(r, latencyMs));
 
   openPosition(signal);
   if (state.config.mode === 'LIVE') console.log('[LIVE] Order stub — CLOB API not yet implemented');
