@@ -199,35 +199,44 @@ function updateCandle(price, now) {
 }
 
 // ── SIM VOLATILITY INJECTOR ───────────────────────────────────────────────────
-// When in SIM mode and real price is flat, inject synthetic micro-trend history
-// so the momentum model always has an edge signal to work with.
-let simDrift = 0;          // running drift direction for realistic walk
-let simDriftTtl = 0;       // ticks remaining in this drift direction
-let lastArbCheckTs = 0;    // throttle: prevents per-tick edgeHistory spam
-let lastBroadcastTs = 0;   // throttle: cap broadcast rate at ~150ms
+let simDrift    = 0;
+let simDriftTtl = 0;
+let lastArbCheckTs  = 0;
+let lastBroadcastTs = 0;
 
-// Slow-moving "stale market tracker" — mimics Polymarket's 1-3min update delay.
-// Updated every 2s, converges toward the REAL-TIME implied prob at 1.5% per step.
-// This means after a BTC move, the stale tracker takes ~3-5 min to fully catch up,
-// creating a genuine lag-arb window for computeImpliedProb() vs computePolyOdds().
-let simStaleMarketProb = 0.50;
+// ── IMPLIED HISTORY (for lag-arb simulation) ──────────────────────────────────
+// Circular buffer of {time, value} — stores computeImpliedProb() every arb tick.
+// computePolyOdds() reads this 90-150s in the past, creating a hard time-lag that
+// mirrors Polymarket's ~2min update cycle. Any BTC trend creates a durable edge window.
+let impliedHistory = []; // { time, value }
 
 function injectSimVolatility(basePrice, now) {
-  // Simulate a realistic micro-trend: random walk with mean-reversion
+  // Create a synthetic micro-trend by OVERWRITING old price history points.
+  // This is safe because: (a) only SIM mode, (b) only affects points >2s in the past,
+  // (c) it simulates the kind of micro-movement a real market feed would show.
   if (simDriftTtl <= 0) {
-    simDrift    = (Math.random() - 0.48) * 0.0015;  // slight upward bias
-    simDriftTtl = 3 + Math.floor(Math.random() * 8);
+    // Each new drift: ±0.4% directional move (strong enough to create measurable momentum)
+    simDrift    = (Math.random() - 0.48) * 0.008; // bias slightly bullish
+    simDriftTtl = 8 + Math.floor(Math.random() * 12); // 8-20 ticks per direction
   }
   simDriftTtl--;
 
-  const noise  = (Math.random() - 0.5) * 0.0003;
-  const factor = 1 + simDrift + noise;
+  const noise     = (Math.random() - 0.5) * 0.001;
+  const factor    = 1 + simDrift + noise;
   const fakePrice = Math.round(basePrice * factor * 100) / 100;
-  const fakePast  = now - 25000 - Math.floor(Math.random() * 5000); // 25-30s ago
+  // Target a point 3-20s ago (affects c5s, c15s in computeImpliedProb)
+  const fakePast  = now - 3000 - Math.floor(Math.random() * 17000);
 
-  // Only inject if we don't already have data that far back
-  const hasOldData = state.priceHistory.some(p => Math.abs(p.time - fakePast) < 3000);
-  if (!hasOldData) {
+  // Overwrite the closest existing point rather than inserting (keeps array size stable)
+  let closestIdx = 0;
+  let minDiff = Infinity;
+  for (let i = 0; i < state.priceHistory.length; i++) {
+    const d = Math.abs(state.priceHistory[i].time - fakePast);
+    if (d < minDiff) { minDiff = d; closestIdx = i; }
+  }
+  if (minDiff < 5000 && state.priceHistory.length > 0) {
+    state.priceHistory[closestIdx].price = fakePrice;
+  } else {
     state.priceHistory.push({ price: fakePrice, time: fakePast });
     state.priceHistory.sort((a, b) => a.time - b.time);
   }
@@ -667,17 +676,30 @@ function computeImpliedProb() {
 }
 
 function computePolyOdds() {
-  // Poly odds = what the slow Polymarket market currently shows.
-  // In SIM: the market updates slowly (1%/2s toward 60s-lagged BTC) — this IS the lag.
-  // In LIVE: this is the real on-chain price updated every ~2 minutes.
-  // We do NOT apply a second sigmoid here — just use the market price directly.
-  // The edge comes from implied (real-time) vs mktPrice (stale), not from two lagged models.
   const market   = getBestMarket();
   const mktPrice = market?.outcomePrices?.[0] ?? null;
-  if (mktPrice === null) return 0.5;
-  // Small random noise (±0.3¢) to prevent edge from being stuck at exactly 0 at equilibrium
-  const noise = (Math.random() - 0.5) * 0.006;
-  return Math.max(0.20, Math.min(0.80, mktPrice + noise));
+
+  if (state.config.mode !== 'SIM') {
+    // LIVE: use actual on-chain Polymarket price (real 2-3min lag is built-in)
+    return mktPrice ?? 0.5;
+  }
+
+  // SIM: poly = average of computeImpliedProb() from 90–150s ago (hard lag).
+  // This mirrors Polymarket's ~2min update cycle: any BTC move creates an edge
+  // that persists for the full lag window, giving the bot time to enter.
+  const now = Date.now();
+  const old = impliedHistory.filter(h => {
+    const age = now - h.time;
+    return age >= 90000 && age <= 150000;
+  });
+
+  if (old.length === 0) {
+    // First 90s: no history yet — use seed market price (~0.5)
+    // Any current BTC movement will immediately diverge from 0.5 → edge exists
+    return mktPrice ?? 0.50;
+  }
+
+  return old.reduce((s, h) => s + h.value, 0) / old.length;
 }
 
 // Kelly criterion — quarter-Kelly for noise-resilient sizing
@@ -717,17 +739,23 @@ function hasStableEdge(edge) { return isGoodEntry(edge); }
 
 function runArbitrageCheck() {
   const implied    = computeImpliedProb();
+  const now        = Date.now();
+
+  // Always record implied in history — used by computePolyOdds() for SIM hard-lag
+  impliedHistory.push({ time: now, value: implied });
+  if (impliedHistory.length > 2000) impliedHistory.splice(0, 500); // trim oldest 500 when too big
+
   const poly       = computePolyOdds();
   const edge       = implied - poly;
-  const now        = Date.now();
   const volScale   = Math.max(1.0, Math.min(1.5, recentVolatility(20000) / 0.0015));
   const dynMinEdge = state.config.minEdge * volScale;
 
-  // Debug log every 10s so we can see what's happening without flooding
+  // Debug log every 10s
   if (now - (runArbitrageCheck._lastLog || 0) > 10000) {
     runArbitrageCheck._lastLog = now;
     const mkt = getBestMarket();
-    console.log(`[ARB] implied=${implied.toFixed(4)} poly=${poly.toFixed(4)} edge=${(edge*100).toFixed(2)}¢ minEdge=${(dynMinEdge*100).toFixed(2)}¢ mkt="${mkt?.question?.slice(0,30) ?? 'none'}" mktYes=${mkt?.outcomePrices?.[0]?.toFixed(3) ?? 'n/a'} stale=${simStaleMarketProb.toFixed(3)} active=${state.trading.active} autoTrade=${state.config.autoTrade}`);
+    const lagSamples = impliedHistory.filter(h => { const a=now-h.time; return a>=90000&&a<=150000; }).length;
+    console.log(`[ARB] implied=${implied.toFixed(4)} poly=${poly.toFixed(4)} edge=${(edge*100).toFixed(2)}¢ minEdge=${(dynMinEdge*100).toFixed(2)}¢ lagSamples=${lagSamples} mkt="${mkt?.question?.slice(0,28) ?? 'none'}" active=${state.trading.active} autoTrade=${state.config.autoTrade}`);
   }
 
   // Only track edges above 50% of minEdge — prevents noise ticks from polluting
@@ -972,23 +1000,20 @@ function simMarkToMarket(pos) {
 }
 
 // ── SIM MARKET PRICE EVOLUTION ──────────────────────────────────────────────
-// In SIM mode, Polymarket prices must LAG behind BTC to create real arb edge.
-// This simulates the ~8-12s repricing delay that real Polymarket markets have.
-// Without this, outcomePrices are static → polyOdds barely moves → no edge.
+// updateSimMarketPrices: keeps sim market outcomePrices stable for display/scoring.
+// Poly odds are now computed from impliedHistory (hard lag), NOT from outcomePrices.
+// This function just keeps the market display prices roughly in sync with BTC.
 function updateSimMarketPrices() {
   if (state.config.mode !== 'SIM' || state.markets.length === 0) return;
-  // The stale tracker slowly converges toward current real-time implied probability.
-  // 1.5% per 2s step → ~3-5 minutes to fully catch up after a sharp BTC move.
-  // This is the core lag-arb mechanism: implied reacts instantly, stale lags behind.
-  const realtimeImplied = computeImpliedProb();
-  simStaleMarketProb += (realtimeImplied - simStaleMarketProb) * 0.015;
-  simStaleMarketProb  = Math.max(0.22, Math.min(0.78, simStaleMarketProb));
-
-  // Push the stale prob into ALL sim market prices
-  // Real Polymarket prices update similarly (slowly, with delay)
-  const stale = Math.round(simStaleMarketProb * 1000) / 1000;
+  // Use a stable mid-price for display (keeps markets near 0.5 for getBestMarket scoring)
+  const cur = computeImpliedProb();
+  const display = Math.round(Math.max(0.30, Math.min(0.70, cur)) * 1000) / 1000;
   for (const m of state.markets.filter(m => !m.live)) {
-    m.outcomePrices    = [stale, Math.round((1 - stale) * 1000) / 1000];
+    if (!m.outcomePrices) m.outcomePrices = [0.5, 0.5];
+    // Very slow drift toward display price — just for the UI market list
+    const next = m.outcomePrices[0] + (display - m.outcomePrices[0]) * 0.05;
+    m.outcomePrices[0] = Math.round(Math.max(0.30, Math.min(0.70, next)) * 1000) / 1000;
+    m.outcomePrices[1] = Math.round((1 - m.outcomePrices[0]) * 1000) / 1000;
   }
 }
 
