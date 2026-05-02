@@ -623,8 +623,8 @@ function getBestMarket() {
 // Used by: computeImpliedProb() (signal), monitorPositions() (mark-to-market),
 //          updateSimMarketPrices() (display prices for sim markets).
 // All three use the SAME formula — ensuring signal, mark and display are consistent.
-function computeBinaryMid(market) {
-  const btc = state.btcPrice;
+function computeBinaryMid(market, btcOverride) {
+  const btc = btcOverride ?? state.btcPrice;
   if (!btc || btc <= 0 || !market) return 0.5;
 
   // Parse strike from question: "Will BTC be above $97,000 in 15 min?"
@@ -928,12 +928,18 @@ function openPosition(signal) {
 function updateSimMarketPrices() {
   if (state.markets.length === 0) return;
   if (!state.btcPrice || state.btcPrice <= 0) return;
+
+  // Sim markets must mirror the same ~90s lag as the Gamma API has for live markets.
+  // Use the real BTC price from 90s ago (from priceHistory) — not the current price.
+  // This way: implied(BTC now) vs poly(BTC 90s ago) → edge is non-zero when BTC moved.
+  const btcLagged = getPriceAt(90000); // real historical BTC price, 90s ago
+
   for (const m of state.markets) {
     if (m.live) continue; // real markets updated by fetchBTCMarkets every 90s
     if (!m.outcomePrices) m.outcomePrices = [0.5, 0.5];
-    // Use shared binary option formula — consistent with signal and mark-to-market
-    const rawProb = computeBinaryMid(m);
-    // Add tiny microstructure noise (±0.3¢) — real markets have bid/ask noise
+    // Price with lagged BTC — mirrors Gamma API poll cadence
+    const rawProb = computeBinaryMid(m, btcLagged);
+    // Add tiny microstructure noise (\u00b10.3\u00a2)
     const noise = (Math.random() - 0.5) * 0.003;
     const newYes = Math.max(0.03, Math.min(0.97, rawProb + noise));
     m.outcomePrices[0] = Math.round(newYes * 1000) / 1000;
