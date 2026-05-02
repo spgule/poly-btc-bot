@@ -1,8 +1,15 @@
 // In production (Railway) the frontend is served by the same Express process,
-// so API calls go to the same origin. BASE is always empty for same-origin requests.
-const BASE = (typeof __VITE_API_URL__ !== 'undefined' && __VITE_API_URL__)
-  ? __VITE_API_URL__
-  : '';
+// so API calls use same-origin (empty BASE). If VITE_API_URL is set, ensure it
+// has a protocol prefix — without it the browser treats it as a relative path
+// and duplicates the hostname in the URL.
+function sanitizeBase(raw) {
+  if (!raw) return '';
+  if (/^https?:\/\//.test(raw)) return raw.replace(/\/$/, ''); // already has protocol
+  return `https://${raw.replace(/\/$/, '')}`; // add missing https://
+}
+const BASE = sanitizeBase(
+  typeof __VITE_API_URL__ !== 'undefined' ? __VITE_API_URL__ : ''
+);
 
 // WebSocket URL derived from BASE (https → wss, http → ws, empty → same host)
 export function getWsUrl() {
