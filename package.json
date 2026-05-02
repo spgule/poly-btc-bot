@@ -9,7 +9,7 @@
   "scripts": {
     "dev": "vite",
     "server": "node server/index.js",
-    "build": "npm install --prefix server && vite build",
+    "build": "npx vite build",
     "start": "NODE_ENV=production node server/index.js",
     "lint": "eslint .",
     "preview": "vite preview"
