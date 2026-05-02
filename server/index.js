@@ -456,9 +456,19 @@ async function fetchBTCMarkets() {
 
       if (btc.length > 0) {
         const mapped = btc.map(m => {
-          const prices = m.outcomePrices
-            ? (Array.isArray(m.outcomePrices) ? m.outcomePrices.map(Number) : [0.5, 0.5])
-            : [0.5, 0.5];
+          // Gamma API returns outcomePrices as a JSON string (e.g. '["0.97","0.03"]'),
+          // NOT as a real JS array. Must parse it explicitly.
+          let prices;
+          try {
+            if (Array.isArray(m.outcomePrices)) {
+              prices = m.outcomePrices.map(Number);
+            } else if (typeof m.outcomePrices === 'string') {
+              prices = JSON.parse(m.outcomePrices).map(Number);
+            } else {
+              prices = [0.5, 0.5];
+            }
+            if (!prices.every(p => isFinite(p))) prices = [0.5, 0.5];
+          } catch { prices = [0.5, 0.5]; }
           const q = (m.question || m.title || '').toLowerCase();
           // Score: short-term "up or down" markets first (best for momentum arb)
           const shortTerm = /up or down|5 min|10 min|15 min|1 hour|today|\bday\b/.test(q);
@@ -1017,11 +1027,12 @@ function monitorPositions() {
     // Update mark price from real Polymarket market odds (re-polled every 90s from Gamma API).
     // Identical for SIM and LIVE: mark = current YES or NO mid-price from the market.
     const mktForPos = state.markets.find(m => m.id === pos.marketId);
-    // Real-time mark: recompute P(BTC_T > strike) using current BTC price every 150ms.
-    // This gives smooth P&L that updates with every BTC tick, identical for SIM and LIVE.
-    // For real markets this is MORE accurate than the stale 90s Gamma price.
-    const midYes  = mktForPos ? computeBinaryMid(mktForPos) : pos.markOdds;
-    const midOdds = pos.side === 'BUY_YES' ? midYes : (1 - midYes);
+    // Mark = current CLOB mid price from the market object.
+    // For sim markets: updated every 2s by updateSimMarketPrices() via binary option model.
+    // For live markets: updated every 90s by fetchBTCMarkets() from Gamma API.
+    // This is the price at which the CLOB currently quotes — the only price you can exit at.
+    const yesOdds = mktForPos?.outcomePrices?.[0] ?? pos.markOdds;
+    const midOdds = pos.side === 'BUY_YES' ? yesOdds : (1 - yesOdds);
     const newMark = Math.max(0.03, Math.min(0.97, midOdds));
     pos.markOdds   = newMark;
     pos.pnlPct     = Math.round(((newMark - pos.entryOdds) / pos.entryOdds) * 10000) / 100;
