@@ -1011,7 +1011,7 @@ if (process.env.NODE_ENV === 'production') {
 }
 
 const server = http.createServer(app);
-const wss    = new WebSocket.Server({ server, path: '/ws' });
+const wss    = new WebSocket.Server({ server });
 
 // Keep WS connections alive through Railway/Nginx proxies (25s < typical 30s idle timeout)
 const WS_PING_INTERVAL = 25000;

@@ -1,6 +1,5 @@
 // In production (Railway) the frontend is served by the same Express process,
-// so API calls go to the same origin. In local dev, Vite proxies /api and /ws
-// to localhost:3001, so we also use same origin (empty BASE).
+// so API calls go to the same origin. BASE is always empty for same-origin requests.
 const BASE = (typeof __VITE_API_URL__ !== 'undefined' && __VITE_API_URL__)
   ? __VITE_API_URL__
   : '';
@@ -10,7 +9,7 @@ export function getWsUrl() {
   const base = !BASE
     ? `${location.protocol === 'https:' ? 'wss' : 'ws'}://${location.host}`
     : BASE.replace(/^https/, 'wss').replace(/^http/, 'ws');
-  return `${base}/ws`;
+  return base;
 }
 
 async function post(path, body = {}) {

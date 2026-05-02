@@ -102,9 +102,10 @@ function useBot() {
   const [markets, setMarkets]     = useState([]);
   const [positions, setPositions] = useState([]);
   const [actionPending, setActionPending] = useState(false);
+  const [botError, setBotError]           = useState(null);
 
   // ── HTTP polling fallback when WS is down ──────────────────────────────────
-  // Every 4s when disconnected, every 30s when connected (safety net)
+  // Every 2s when disconnected, every 30s when connected (safety net)
   useEffect(() => {
     async function poll() {
       try {
@@ -127,12 +128,10 @@ function useBot() {
       } catch (_) { /* ignore */ }
     }
     poll(); // immediate on mount
-    const id = setInterval(poll, connected ? 30000 : 4000);
+    const id = setInterval(poll, connected ? 30000 : 2000);
     return () => clearInterval(id);
   }, [connected]);
 
-  // Sync actionPending with status.active from polling ──────────────────────
-  useEffect(() => { setActionPending(false); }, [status.active]);
 
   useEffect(() => {
     let destroyed = false;
@@ -174,24 +173,32 @@ function useBot() {
 
   const startBot      = () => {
     if (actionPending) return;
+    setBotError(null);
     setActionPending(true);
     api.startBot()
-      .then(r => { if (r) setStatus(d => ({ ...d, active: r.active ?? true })); })
-      .catch(e => console.error(e))
+      .then(r => {
+        if (r && r.active !== undefined) setStatus(d => ({ ...d, active: r.active }));
+        else setStatus(d => ({ ...d, active: true }));
+      })
+      .catch(e => { setBotError(e.message || 'Erro ao iniciar o bot'); console.error(e); })
       .finally(() => setActionPending(false));
   };
   const stopBot       = () => {
     if (actionPending) return;
+    setBotError(null);
     setActionPending(true);
     api.stopBot()
-      .then(r => { if (r) setStatus(d => ({ ...d, active: r.active ?? false })); })
-      .catch(e => console.error(e))
+      .then(r => {
+        if (r && r.active !== undefined) setStatus(d => ({ ...d, active: r.active }));
+        else setStatus(d => ({ ...d, active: false }));
+      })
+      .catch(e => { setBotError(e.message || 'Erro ao parar o bot'); console.error(e); })
       .finally(() => setActionPending(false));
   };
   const manualTrade   = () => api.manualTrade().catch(console.error);
   const closePosition = (id) => api.closePosition(id).catch(console.error);
 
-  return { connected, market, candles, currentCandle, signal, status, trades, markets, positions, startBot, stopBot, manualTrade, closePosition, actionPending };
+  return { connected, market, candles, currentCandle, signal, status, trades, markets, positions, startBot, stopBot, manualTrade, closePosition, actionPending, botError, setBotError };
 }
 
 // ─── CHART TOOLTIP ────────────────────────────────────────────────────────────
@@ -1007,7 +1014,7 @@ function HistoryBody({ trades }) {
 // ─── APP ─────────────────────────────────────────────────────────────────────
 export default function App() {
   const { connected, market, candles, currentCandle, signal, status, trades, markets, positions,
-          startBot, stopBot, manualTrade, closePosition, actionPending } = useBot();
+          startBot, stopBot, manualTrade, closePosition, actionPending, botError, setBotError } = useBot();
   const [showConfig, setShowConfig] = useState(false);
   const [showLayout, setShowLayout] = useState(false);
   const [clock, setClock]           = useState(fmtClock());
@@ -1127,6 +1134,21 @@ export default function App() {
         onLayout={() => setShowLayout(v => !v)}
         actionPending={actionPending}
       />
+
+      {botError && (
+        <div style={{
+          position: 'fixed', top: 48, left: '50%', transform: 'translateX(-50%)',
+          zIndex: 999, background: 'var(--red)', color: '#fff',
+          padding: '8px 18px', borderRadius: 6, fontSize: 11, fontWeight: 600,
+          boxShadow: '0 4px 16px rgba(0,0,0,.5)', display: 'flex', alignItems: 'center', gap: 10,
+        }}>
+          <AlertTriangle size={13} />
+          {botError}
+          <button onClick={() => setBotError(null)} style={{ background: 'none', border: 'none', color: '#fff', cursor: 'pointer', padding: 0, marginLeft: 4 }}>
+            <X size={12} />
+          </button>
+        </div>
+      )}
 
       <div style={{ flex: 1, overflowY: 'auto', overflowX: 'hidden', position: 'relative' }}>
         <RGL
