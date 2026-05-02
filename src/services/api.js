@@ -6,11 +6,11 @@ const BASE = (typeof __VITE_API_URL__ !== 'undefined' && __VITE_API_URL__)
 
 // WebSocket URL derived from BASE (https → wss, http → ws, empty → same host)
 export function getWsUrl() {
-  if (!BASE) {
-    const proto = location.protocol === 'https:' ? 'wss' : 'ws';
-    return `${proto}://${location.host}`;
-  }
-  return BASE.replace(/^https/, 'wss').replace(/^http/, 'ws');
+  const base = !BASE
+    ? `${location.protocol === 'https:' ? 'wss' : 'ws'}://${location.host}`
+    : BASE.replace(/^https/, 'wss').replace(/^http/, 'ws');
+  // Use explicit /ws path so Railway proxy forwards cleanly
+  return `${base}/ws`;
 }
 
 async function post(path, body = {}) {

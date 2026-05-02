@@ -140,8 +140,21 @@ function useBot() {
     return () => { destroyed = true; wsRef.current?.close(); };
   }, []);
 
-  const startBot      = () => { if (actionPending) return; setActionPending(true); api.startBot().catch(e => { console.error(e); setActionPending(false); }); };
-  const stopBot       = () => { if (actionPending) return; setActionPending(true); api.stopBot().catch(e => { console.error(e); setActionPending(false); }); };
+  const startBot      = () => {
+    if (actionPending) return;
+    setActionPending(true);
+    api.startBot()
+      .catch(e => { console.error(e); setActionPending(false); });
+    // Safety: if WS is slow/disconnected, unblock button after 8s
+    setTimeout(() => setActionPending(false), 8000);
+  };
+  const stopBot       = () => {
+    if (actionPending) return;
+    setActionPending(true);
+    api.stopBot()
+      .catch(e => { console.error(e); setActionPending(false); });
+    setTimeout(() => setActionPending(false), 8000);
+  };
   const manualTrade   = () => api.manualTrade().catch(console.error);
   const closePosition = (id) => api.closePosition(id).catch(console.error);
 

@@ -1011,10 +1011,20 @@ if (process.env.NODE_ENV === 'production') {
 }
 
 const server = http.createServer(app);
-const wss    = new WebSocket.Server({ server });
+const wss    = new WebSocket.Server({ server, path: '/ws' });
+
+// Keep WS connections alive through Railway/Nginx proxies (25s < typical 30s idle timeout)
+const WS_PING_INTERVAL = 25000;
+setInterval(() => {
+  wss.clients.forEach(ws => {
+    if (ws.readyState === WebSocket.OPEN) ws.ping();
+  });
+}, WS_PING_INTERVAL);
 
 wss.on('connection', (ws) => {
   console.log('[WS] Client connected');
+  ws.isAlive = true;
+  ws.on('pong', () => { ws.isAlive = true; });
   // Burst initial state
   ws.send(JSON.stringify({ type: 'STATUS',  data: buildStatusPayload() }));
   ws.send(JSON.stringify({ type: 'MARKETS', data: state.markets }));
