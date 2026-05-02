@@ -670,11 +670,25 @@ function computeImpliedProb() {
 }
 
 function computePolyOdds() {
-  // Both SIM and LIVE: use actual Polymarket market price (re-polled every 90s from Gamma API).
-  // The natural 90s polling interval creates realistic lag between BTC moves and
-  // Polymarket odds updates — identical behaviour to LIVE, no artificial lag needed.
+  // Edge MUST be model-vs-model (same formula, different BTC timestamps):
+  //   implied = computeBinaryMid(market, BTC_now)
+  //   poly    = computeBinaryMid(market, BTC_90s_ago)
+  //   edge    = implied - poly
+  //
+  // Using outcomePrices[0] (Gamma API price) here causes a permanent directional
+  // bias: the model and Gamma use different pricing frameworks → the gap is always
+  // in the same direction → always BUY_YES or always BUY_NO depending on the market.
+  //
+  // With model-vs-model: edge is purely the change in fair value driven by BTC moves.
+  //   BTC rose last 90s → implied > poly → edge > 0 → BUY_YES
+  //   BTC fell last 90s → implied < poly → edge < 0 → BUY_NO
+  //   BTC flat           → edge ≈ 0      → no trade
+  // Symmetric by construction. Works identically for SIM and LIVE markets.
+  // NOTE: entry/exit prices still use outcomePrices[0] (actual CLOB price).
   const market = getBestMarket();
-  return market?.outcomePrices?.[0] ?? 0.5;
+  if (!market) return 0.5;
+  const btcLagged = getPriceAt(90000);
+  return computeBinaryMid(market, btcLagged);
 }
 
 // Kelly criterion — quarter-Kelly for noise-resilient sizing
