@@ -291,7 +291,7 @@ function PanelShell({ id, label, badge, onHide, children }) {
 }
 
 // ─── TOP BAR ─────────────────────────────────────────────────────────────────
-function TopBar({ status, market, connected, clock, onStart, onStop, onSettings, onLayout, actionPending, hiddenCount }) {
+function TopBar({ status, market, connected, clock, onStart, onStop, onSettings, onLayout, actionPending }) {
   const up    = (market.btcChange24h ?? 0) >= 0;
   const stats = status.stats || {};
   const wr    = stats.totalTrades > 0 ? Math.round(stats.wins / stats.totalTrades * 100) : 0;
@@ -346,17 +346,8 @@ function TopBar({ status, market, connected, clock, onStart, onStop, onSettings,
           <span className="tb-clock-time">{clock}</span>
           <span className="tb-clock-tz">BRT</span>
         </div>
-        <button className="btn btn-ghost btn-sm" onClick={onLayout} title="Gerenciar painéis" style={{ position: 'relative' }}>
+        <button className="btn btn-ghost btn-sm" onClick={onLayout} title="Gerenciar painéis">
           <LayoutDashboard size={12} />
-          {hiddenCount > 0 && (
-            <span style={{
-              position: 'absolute', top: -3, right: -3,
-              background: 'var(--amber)', color: '#000',
-              borderRadius: '50%', width: 12, height: 12,
-              fontSize: 7, fontWeight: 900, display: 'flex',
-              alignItems: 'center', justifyContent: 'center',
-            }}>{hiddenCount}</span>
-          )}
         </button>
         <button className="btn btn-ghost btn-sm" onClick={onSettings} title="Configurações">
           <Settings size={12} />
@@ -1190,7 +1181,6 @@ export default function App() {
         onStart={startBot} onStop={stopBot}
         onSettings={() => setShowConfig(true)}
         onLayout={() => setShowLayout(v => !v)}
-        hiddenCount={hidden.size}
         actionPending={actionPending}
       />
 
