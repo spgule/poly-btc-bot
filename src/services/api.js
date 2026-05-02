@@ -9,8 +9,7 @@ export function getWsUrl() {
   const base = !BASE
     ? `${location.protocol === 'https:' ? 'wss' : 'ws'}://${location.host}`
     : BASE.replace(/^https/, 'wss').replace(/^http/, 'ws');
-  // Use explicit /ws path so Railway proxy forwards cleanly
-  return `${base}/ws`;
+  return base;
 }
 
 async function post(path, body = {}) {

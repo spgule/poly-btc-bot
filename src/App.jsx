@@ -103,6 +103,35 @@ function useBot() {
   const [positions, setPositions] = useState([]);
   const [actionPending, setActionPending] = useState(false);
 
+  // ── HTTP polling fallback when WS is down ──────────────────────────────────
+  // Every 4s when disconnected, every 30s when connected (safety net)
+  useEffect(() => {
+    async function poll() {
+      try {
+        const [st, mkts, prices] = await Promise.all([
+          api.getStatus(),
+          api.getMarkets(),
+          fetch('/api/prices').then(r => r.json()).catch(() => null),
+        ]);
+        if (st)     setStatus(st);
+        if (mkts)   setMarkets(mkts);
+        if (prices) {
+          setMarket(d => ({
+            ...d,
+            btcPrice:     prices.current    ?? d.btcPrice,
+            btcChange24h: prices.change24h  ?? d.btcChange24h,
+            priceSource:  prices.source     ?? d.priceSource,
+            priceChart:   prices.chart      ?? d.priceChart,
+          }));
+        }
+      } catch (_) { /* ignore */ }
+    }
+    poll(); // immediate on mount
+    const id = setInterval(poll, connected ? 30000 : 4000);
+    return () => clearInterval(id);
+  }, [connected]);
+
+  // Sync actionPending with status.active from polling ──────────────────────
   useEffect(() => { setActionPending(false); }, [status.active]);
 
   useEffect(() => {
@@ -122,6 +151,9 @@ function useBot() {
             setMarket(d => ({ ...d, ...msg.data }));
             if (msg.data.candles?.length) setCandles(msg.data.candles);
             if (msg.data.currentCandle)   setCurrentCandle(msg.data.currentCandle);
+            break;
+          case 'CONNECTION':
+            setStatus(d => ({ ...d, binanceConnected: msg.data.binanceConnected, priceSource: msg.data.priceSource }));
             break;
           case 'SIGNAL':         setSignal(msg.data); break;
           case 'STATUS':         setStatus(msg.data); break;
@@ -144,16 +176,17 @@ function useBot() {
     if (actionPending) return;
     setActionPending(true);
     api.startBot()
-      .catch(e => { console.error(e); setActionPending(false); });
-    // Safety: if WS is slow/disconnected, unblock button after 8s
-    setTimeout(() => setActionPending(false), 8000);
+      .then(r => { if (r) setStatus(d => ({ ...d, active: r.active ?? true })); })
+      .catch(e => console.error(e))
+      .finally(() => setActionPending(false));
   };
   const stopBot       = () => {
     if (actionPending) return;
     setActionPending(true);
     api.stopBot()
-      .catch(e => { console.error(e); setActionPending(false); });
-    setTimeout(() => setActionPending(false), 8000);
+      .then(r => { if (r) setStatus(d => ({ ...d, active: r.active ?? false })); })
+      .catch(e => console.error(e))
+      .finally(() => setActionPending(false));
   };
   const manualTrade   = () => api.manualTrade().catch(console.error);
   const closePosition = (id) => api.closePosition(id).catch(console.error);
