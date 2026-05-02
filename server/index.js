@@ -659,36 +659,39 @@ function computeBinaryMid(market, btcOverride) {
   return Math.max(0.03, Math.min(0.97, 1 / (1 + Math.exp(-1.7 * d2))));
 }
 
-// computeImpliedProb: real-time fair value for the best current market.
-// Compared against computePolyOdds() (stale 90s Gamma API price) to detect mispricing.
-// Edge > 0 → market underprices YES → BUY_YES
-// Edge < 0 → market overprices YES → BUY_NO
-function computeImpliedProb() {
-  const market = getBestMarket();
-  if (!market) return 0.5;
-  return computeBinaryMid(market);
+// computeEdge: computes implied, poly and edge for a GIVEN market.
+// Both sides use the same market and the same formula (computeBinaryMid),
+// with different BTC timestamps:
+//   implied = f(BTC_now)      — real-time fair value
+//   poly    = f(BTC_lagMs_ago) — stale price (mirrors Gamma API lag)
+//   edge    = implied - poly  — purely driven by BTC moves, symmetric
+//
+// BTC rose last lagMs ms → implied > poly → edge > 0 → BUY_YES
+// BTC fell last lagMs ms → implied < poly → edge < 0 → BUY_NO
+// BTC flat               → edge ≈ 0       → no trade
+//
+// IMPORTANT: entry/exit prices still use outcomePrices[0] (real CLOB price).
+function computeEdge(market) {
+  if (!market) return { implied: 0.5, poly: 0.5, edge: 0 };
+  // Lag window: use all available history up to 90s.
+  // getPriceAt finds the closest real data point — safe even at boot.
+  const LAG_EDGE_MS = Math.min(90000, Math.max(5000, (state.priceHistory.length > 0
+    ? Date.now() - state.priceHistory[0].time
+    : 0) * 0.8));
+  const implied = computeBinaryMid(market);                       // BTC_now
+  const poly    = computeBinaryMid(market, getPriceAt(LAG_EDGE_MS)); // BTC_lagMs_ago
+  return { implied, poly, edge: implied - poly };
 }
 
-function computePolyOdds() {
-  // Edge MUST be model-vs-model (same formula, different BTC timestamps):
-  //   implied = computeBinaryMid(market, BTC_now)
-  //   poly    = computeBinaryMid(market, BTC_90s_ago)
-  //   edge    = implied - poly
-  //
-  // Using outcomePrices[0] (Gamma API price) here causes a permanent directional
-  // bias: the model and Gamma use different pricing frameworks → the gap is always
-  // in the same direction → always BUY_YES or always BUY_NO depending on the market.
-  //
-  // With model-vs-model: edge is purely the change in fair value driven by BTC moves.
-  //   BTC rose last 90s → implied > poly → edge > 0 → BUY_YES
-  //   BTC fell last 90s → implied < poly → edge < 0 → BUY_NO
-  //   BTC flat           → edge ≈ 0      → no trade
-  // Symmetric by construction. Works identically for SIM and LIVE markets.
-  // NOTE: entry/exit prices still use outcomePrices[0] (actual CLOB price).
+// Legacy wrappers used by broadcastMarketData — always consistent because
+// they call computeEdge with the same single getBestMarket() result.
+function computeImpliedProb() {
   const market = getBestMarket();
-  if (!market) return 0.5;
-  const btcLagged = getPriceAt(90000);
-  return computeBinaryMid(market, btcLagged);
+  return computeEdge(market).implied;
+}
+function computePolyOdds() {
+  const market = getBestMarket();
+  return computeEdge(market).poly;
 }
 
 // Kelly criterion — quarter-Kelly for noise-resilient sizing
@@ -727,19 +730,24 @@ function isGoodEntry(edge) {
 function hasStableEdge(edge) { return isGoodEntry(edge); }
 
 function runArbitrageCheck() {
-  const implied    = computeImpliedProb();
-  const now        = Date.now();
+  // ── Single getBestMarket() call per tick ─────────────────────────────────
+  // CRITICAL: getBestMarket() must be called ONCE here. Calling it separately
+  // inside computeImpliedProb() and computePolyOdds() can return different
+  // markets on consecutive calls (scoring is time-dependent), making the edge
+  // meaningless (difference between two unrelated markets' model prices).
+  const market = getBestMarket();
+  if (!market) return;
 
-  const poly       = computePolyOdds();
-  const edge       = implied - poly;
+  const { implied, poly, edge } = computeEdge(market);
+  const now        = Date.now();
   const volScale   = Math.max(1.0, Math.min(1.5, recentVolatility(20000) / 0.0015));
   const dynMinEdge = state.config.minEdge * volScale;
 
   // Debug log every 10s
   if (now - (runArbitrageCheck._lastLog || 0) > 10000) {
     runArbitrageCheck._lastLog = now;
-    const mkt = getBestMarket();
-    console.log(`[ARB] implied=${implied.toFixed(4)} poly=${poly.toFixed(4)} edge=${(edge*100).toFixed(2)}¢ minEdge=${(dynMinEdge*100).toFixed(2)}¢ mkt="${mkt?.question?.slice(0,28) ?? 'none'}" active=${state.trading.active} autoTrade=${state.config.autoTrade}`);  }
+    console.log(`[ARB] implied=${implied.toFixed(4)} poly=${poly.toFixed(4)} edge=${(edge*100).toFixed(2)}¢ minEdge=${(dynMinEdge*100).toFixed(2)}¢ mkt="${market.question?.slice(0,28)}" active=${state.trading.active} autoTrade=${state.config.autoTrade}`);
+  }
 
   // Only track edges above 50% of minEdge — prevents noise ticks from polluting
   // the stability window and breaking hasStableEdge between valid signals
@@ -755,8 +763,6 @@ function runArbitrageCheck() {
 
   const side       = edge > 0 ? 'BUY_YES' : 'BUY_NO';
   const winProb    = edge > 0 ? implied : (1 - implied);
-  const market     = getBestMarket();
-  if (!market) return;
 
   const marketYes  = market.outcomePrices?.[0] ?? 0.5;
   const entryPrice = side === 'BUY_YES' ? marketYes : (1 - marketYes);
@@ -1134,8 +1140,8 @@ function _legacySimTrade_unused(signal) {
 
 // ── BROADCASTS ────────────────────────────────────────────────────────────────
 function broadcastMarketData() {
-  const implied = computeImpliedProb();
-  const poly    = computePolyOdds();
+  const mkt            = getBestMarket();
+  const { implied, poly, edge } = computeEdge(mkt);
   broadcast({
     type: 'MARKET_DATA',
     data: {
@@ -1144,7 +1150,7 @@ function broadcastMarketData() {
       laggedPrice:  getPriceAt(LAG_MS),
       impliedProb:  implied,
       polyOdds:     poly,
-      edge:         implied - poly,
+      edge,
       edgeHistory:  state.edgeHistory.slice(-80),
       priceChart:   state.priceChart.slice(-100),
       candles:      state.candles.slice(-300),
