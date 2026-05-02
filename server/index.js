@@ -206,6 +206,12 @@ let simDriftTtl = 0;       // ticks remaining in this drift direction
 let lastArbCheckTs = 0;    // throttle: prevents per-tick edgeHistory spam
 let lastBroadcastTs = 0;   // throttle: cap broadcast rate at ~150ms
 
+// Slow-moving "stale market tracker" — mimics Polymarket's 1-3min update delay.
+// Updated every 2s, converges toward the REAL-TIME implied prob at 1.5% per step.
+// This means after a BTC move, the stale tracker takes ~3-5 min to fully catch up,
+// creating a genuine lag-arb window for computeImpliedProb() vs computePolyOdds().
+let simStaleMarketProb = 0.50;
+
 function injectSimVolatility(basePrice, now) {
   // Simulate a realistic micro-trend: random walk with mean-reversion
   if (simDriftTtl <= 0) {
@@ -618,7 +624,10 @@ function getBestMarket() {
     // cause permanent one-directional signals because implied is capped at [0.26, 0.74].
     const yesPrice  = m.outcomePrices?.[0] ?? 0.5;
     const priceDist = Math.abs(yesPrice - 0.5);
-    if (priceDist > 0.30) return { m, score: -1 }; // YES < 0.20 or > 0.80 → skip (too certain)
+    // In SIM mode the stale tracker is bounded to [0.22, 0.78] so this filter never blocks.
+    // In LIVE mode, real Polymarket prices can be extreme — filter those out.
+    if (!m.live && priceDist > 0.28) return { m, score: -1 };
+    if ( m.live && priceDist > 0.30) return { m, score: -1 };
     const priceScore = priceDist < 0.08 ? 2 : priceDist < 0.20 ? 1 : 0;
     return { m, score: timeScore + volScore + priceScore };
   }).filter(x => x.score >= 0).sort((a, b) => b.score - a.score);
@@ -658,19 +667,17 @@ function computeImpliedProb() {
 }
 
 function computePolyOdds() {
-  if (state.priceHistory.length < 5) return 0.5;
-  const lag   = getPriceAt(LAG_MS);
-  const cl2s  = pctChange(lag, getPriceAt(2000  + LAG_MS));
-  const cl5s  = pctChange(lag, getPriceAt(5000  + LAG_MS));
-  const cl15s = pctChange(lag, getPriceAt(15000 + LAG_MS));
-  const lagSignal  = cl2s * 0.50 + cl5s * 0.30 + cl15s * 0.20;
-  const vol        = recentVolatility(20000);
-  const k          = vol < 0.0008 ? 1400 : vol < 0.0015 ? 1200 : vol < 0.003 ? 950 : 800;
-  const laggedProb = Math.max(0.26, Math.min(0.74, sigmoid(lagSignal, k)));
-  // 70% market price (ground truth), 30% lagged model (lag exploitation)
-  const market     = getBestMarket();
-  const mktPrice   = market?.outcomePrices?.[0] ?? null;
-  return mktPrice !== null ? laggedProb * 0.30 + mktPrice * 0.70 : laggedProb;
+  // Poly odds = what the slow Polymarket market currently shows.
+  // In SIM: the market updates slowly (1%/2s toward 60s-lagged BTC) — this IS the lag.
+  // In LIVE: this is the real on-chain price updated every ~2 minutes.
+  // We do NOT apply a second sigmoid here — just use the market price directly.
+  // The edge comes from implied (real-time) vs mktPrice (stale), not from two lagged models.
+  const market   = getBestMarket();
+  const mktPrice = market?.outcomePrices?.[0] ?? null;
+  if (mktPrice === null) return 0.5;
+  // Small random noise (±0.3¢) to prevent edge from being stuck at exactly 0 at equilibrium
+  const noise = (Math.random() - 0.5) * 0.006;
+  return Math.max(0.20, Math.min(0.80, mktPrice + noise));
 }
 
 // Kelly criterion — quarter-Kelly for noise-resilient sizing
@@ -715,6 +722,13 @@ function runArbitrageCheck() {
   const now        = Date.now();
   const volScale   = Math.max(1.0, Math.min(1.5, recentVolatility(20000) / 0.0015));
   const dynMinEdge = state.config.minEdge * volScale;
+
+  // Debug log every 10s so we can see what's happening without flooding
+  if (now - (runArbitrageCheck._lastLog || 0) > 10000) {
+    runArbitrageCheck._lastLog = now;
+    const mkt = getBestMarket();
+    console.log(`[ARB] implied=${implied.toFixed(4)} poly=${poly.toFixed(4)} edge=${(edge*100).toFixed(2)}¢ minEdge=${(dynMinEdge*100).toFixed(2)}¢ mkt="${mkt?.question?.slice(0,30) ?? 'none'}" mktYes=${mkt?.outcomePrices?.[0]?.toFixed(3) ?? 'n/a'} stale=${simStaleMarketProb.toFixed(3)} active=${state.trading.active} autoTrade=${state.config.autoTrade}`);
+  }
 
   // Only track edges above 50% of minEdge — prevents noise ticks from polluting
   // the stability window and breaking hasStableEdge between valid signals
@@ -963,23 +977,18 @@ function simMarkToMarket(pos) {
 // Without this, outcomePrices are static → polyOdds barely moves → no edge.
 function updateSimMarketPrices() {
   if (state.config.mode !== 'SIM' || state.markets.length === 0) return;
-  // Use 60s lagged BTC as proxy for what a slow Polymarket maker currently prices.
-  // Real Polymarket updates take 1–3 minutes → this creates genuine lag-arb opportunity:
-  // implied (real-time BTC) diverges from mktPrice (60s stale) for 5–10 minutes after a move.
-  const lag60 = getPriceAt(60000);
-  const lag75 = getPriceAt(75000);
-  const lagChange = pctChange(lag60, lag75);
-  const lagProb = Math.max(0.28, Math.min(0.72, sigmoid(lagChange, 1200)));
-  // Only update sim (non-live) markets — never overwrite real Polymarket prices
+  // The stale tracker slowly converges toward current real-time implied probability.
+  // 1.5% per 2s step → ~3-5 minutes to fully catch up after a sharp BTC move.
+  // This is the core lag-arb mechanism: implied reacts instantly, stale lags behind.
+  const realtimeImplied = computeImpliedProb();
+  simStaleMarketProb += (realtimeImplied - simStaleMarketProb) * 0.015;
+  simStaleMarketProb  = Math.max(0.22, Math.min(0.78, simStaleMarketProb));
+
+  // Push the stale prob into ALL sim market prices
+  // Real Polymarket prices update similarly (slowly, with delay)
+  const stale = Math.round(simStaleMarketProb * 1000) / 1000;
   for (const m of state.markets.filter(m => !m.live)) {
-    if (!m.outcomePrices) m.outcomePrices = [0.5, 0.5];
-    const cur  = m.outcomePrices[0] ?? 0.5;
-    // Very slow convergence: 1% per 2s step → ~10 min to fully catch up after a BTC move.
-    // This preserves the lag-arb window (implied sees move now, market sees it 5-10 min later).
-    const step = (lagProb - cur) * 0.010 + (Math.random() - 0.5) * 0.004;
-    const next = Math.max(0.22, Math.min(0.78, cur + step));
-    m.outcomePrices[0] = Math.round(next * 1000) / 1000;
-    m.outcomePrices[1] = Math.round((1 - next) * 1000) / 1000;
+    m.outcomePrices    = [stale, Math.round((1 - stale) * 1000) / 1000];
   }
 }
 
