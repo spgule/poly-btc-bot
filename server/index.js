@@ -495,12 +495,52 @@ function getPriceAt(msAgo) {
 function sigmoid(x, k) { return 1 / (1 + Math.exp(-k * x)); }
 
 // ── VOLATILITY & MOMENTUM HELPERS ────────────────────────────────────────────
-// Clipped percentage change between two prices
-// Clip prevents single outlier ticks (e.g. flash crashes) from dominating the signal
 function pctChange(cur, ref, clipPct = 0.008) {
   if (!ref || ref === 0) return 0;
   const raw = (cur - ref) / ref;
   return Math.max(-clipPct, Math.min(clipPct, raw));
+}
+
+// Recent realised volatility: stdev of 1s returns over msWindow.
+// Used to scale sigmoid sensitivity and dynamic edge threshold.
+function recentVolatility(msWindow = 30000) {
+  const now = Date.now();
+  const pts  = state.priceHistory.filter(p => now - p.time <= msWindow);
+  if (pts.length < 4) return 0.0010; // default ~10bps/s
+  const returns = [];
+  for (let i = 1; i < pts.length; i++) {
+    if (pts[i - 1].price > 0)
+      returns.push((pts[i].price - pts[i - 1].price) / pts[i - 1].price);
+  }
+  if (returns.length === 0) return 0.0010;
+  const mean = returns.reduce((a, b) => a + b, 0) / returns.length;
+  const variance = returns.reduce((s, r) => s + (r - mean) ** 2, 0) / returns.length;
+  return Math.sqrt(variance) || 0.0001;
+}
+
+// Edge velocity: is the edge currently OPENING (positive) or CLOSING (negative)?
+// Only enter when edge is expanding — avoids chasing edges that already peaked.
+function edgeVelocity() {
+  if (state.edgeHistory.length < 4) return 0;
+  const now    = Date.now();
+  const recent = state.edgeHistory.filter(e => now - e.time <=  800);
+  const older  = state.edgeHistory.filter(e => now - e.time >   800 && now - e.time <= 2000);
+  if (recent.length === 0 || older.length === 0) return 0;
+  const rAvg = recent.reduce((s, e) => s + Math.abs(e.edge), 0) / recent.length;
+  const oAvg = older.reduce((s, e)  => s + Math.abs(e.edge), 0) / older.length;
+  return rAvg - oAvg; // positive = edge growing, negative = edge shrinking
+}
+
+// Edge quality: ratio of consistent-direction samples in recent window.
+// 1.0 = all samples agree, 0.5 = random noise.
+function edgeQuality(edge) {
+  const now    = Date.now();
+  const recent = state.edgeHistory.filter(e => now - e.time <= 2000 && Math.abs(e.edge) > 0.005);
+  if (recent.length < 3) return 0.5;
+  const bull   = recent.filter(e => e.edge > 0).length;
+  const bear   = recent.filter(e => e.edge < 0).length;
+  const dominant = Math.max(bull, bear);
+  return dominant / recent.length; // 0.5–1.0
 }
 
 // Best market to trade: prefer short-term + highest edge potential
@@ -538,83 +578,76 @@ function getBestMarket() {
 function computeImpliedProb() {
   if (state.priceHistory.length < 5) return 0.5;
   const cur  = state.btcPrice;
-
-  // Pure percentage changes from reference points, clipped to prevent outliers
-  // Clip at ±0.8% prevents micro-ATR amplification bug from previous version
   const c2s  = pctChange(cur, getPriceAt(2000));
   const c5s  = pctChange(cur, getPriceAt(5000));
   const c15s = pctChange(cur, getPriceAt(15000));
   const c30s = pctChange(cur, getPriceAt(30000));
   const c60s = pctChange(cur, getPriceAt(60000));
-
-  // Weighted momentum: recent ticks weighted more heavily for short-term binary
-  const momentum = c2s * 0.38 + c5s * 0.28 + c15s * 0.18 + c30s * 0.10 + c60s * 0.06;
-
-  // Acceleration: if 2s velocity is accelerating vs 5s, it’s a stronger signal
-  const c2s_old = pctChange(getPriceAt(2000), getPriceAt(4000));
-  const accel   = (c2s - c2s_old) * 0.12;
-
-  // Trend alignment bonus: if short-term and mid-term agree, boost signal 20%
-  const shortDir = c2s + c5s;
-  const midDir   = c15s + c30s;
-  const aligned  = (shortDir > 0) === (midDir > 0) && Math.abs(midDir) > 0.0002;
-  const composite = (momentum + accel) * (aligned ? 1.20 : 0.85);
-
-  // k=1200: a 0.1% cumulative move maps to sigmoid(0.001 * 1200) = sigmoid(1.2) ≈ 77%
-  // Hard cap 28–72%: realistic for short-term binary “up or down” markets
-  // Real binary markets almost never trade above 72¢ or below 28¢ intraday
-  const raw = sigmoid(composite, 1200);
-  return Math.max(0.28, Math.min(0.72, raw));
+  const momentum  = c2s * 0.38 + c5s * 0.28 + c15s * 0.18 + c30s * 0.10 + c60s * 0.06;
+  const c2s_old   = pctChange(getPriceAt(2000), getPriceAt(4000));
+  const accel     = (c2s - c2s_old) * 0.12;
+  // Mean-reversion damper: fade signal when 30s move already large
+  const revDamp   = Math.abs(c30s) > 0.003 ? 0.75 : 1.0;
+  const shortDir  = c2s + c5s;
+  const midDir    = c15s + c30s;
+  const aligned   = (shortDir > 0) === (midDir > 0) && Math.abs(midDir) > 0.0002;
+  const composite = (momentum + accel) * revDamp * (aligned ? 1.20 : 0.85);
+  // Volatility-adaptive k: low vol = sharper signal, high vol = softer
+  const vol = recentVolatility(20000);
+  const k   = vol < 0.0008 ? 1400 : vol < 0.0015 ? 1200 : vol < 0.003 ? 950 : 800;
+  return Math.max(0.26, Math.min(0.74, sigmoid(composite, k)));
 }
 
 function computePolyOdds() {
   if (state.priceHistory.length < 5) return 0.5;
-  // Poly sees BTC with LAG_MS delay
   const lag   = getPriceAt(LAG_MS);
   const cl2s  = pctChange(lag, getPriceAt(2000  + LAG_MS));
-  const cl10s = pctChange(lag, getPriceAt(10000 + LAG_MS));
-  const cl30s = pctChange(lag, getPriceAt(30000 + LAG_MS));
-  const lagSignal  = cl2s * 0.45 + cl10s * 0.35 + cl30s * 0.20;
-  const laggedProb = Math.max(0.28, Math.min(0.72, sigmoid(lagSignal, 1200)));
-
-  // Ground truth: 75% actual market price, 25% lagged model
-  // High market-price weight = edge only fires on real mispricing gaps
-  const market   = getBestMarket();
-  const mktPrice = market?.outcomePrices?.[0] ?? null;
-  return mktPrice !== null ? laggedProb * 0.25 + mktPrice * 0.75 : laggedProb;
+  const cl5s  = pctChange(lag, getPriceAt(5000  + LAG_MS));
+  const cl15s = pctChange(lag, getPriceAt(15000 + LAG_MS));
+  const lagSignal  = cl2s * 0.50 + cl5s * 0.30 + cl15s * 0.20;
+  const vol        = recentVolatility(20000);
+  const k          = vol < 0.0008 ? 1400 : vol < 0.0015 ? 1200 : vol < 0.003 ? 950 : 800;
+  const laggedProb = Math.max(0.26, Math.min(0.74, sigmoid(lagSignal, k)));
+  // 70% market price (ground truth), 30% lagged model (lag exploitation)
+  const market     = getBestMarket();
+  const mktPrice   = market?.outcomePrices?.[0] ?? null;
+  return mktPrice !== null ? laggedProb * 0.30 + mktPrice * 0.70 : laggedProb;
 }
 
 // Kelly criterion — quarter-Kelly for noise-resilient sizing
 // entryPrice = cost per share; netOdds = (1 - entryPrice) / entryPrice
 function kellySize(edge, winProb, entryPrice, balance, maxBetPct) {
   if (edge <= 0 || winProb <= 0 || entryPrice <= 0 || entryPrice >= 1) return 0;
-  const netOdds    = (1 - entryPrice) / entryPrice;
-  const fullKelly  = (netOdds * winProb - (1 - winProb)) / netOdds;
-  // Use 1/4 Kelly: further reduces over-bet risk when edge estimate has noise
-  const qKelly     = Math.max(0, fullKelly * 0.25);
-  // Streak penalty: reduce size per consecutive loss, capped at -50% max
-  const streak     = state.stats.streak;
-  const streakMult = streak < -1 ? Math.max(0.5, Math.pow(0.80, Math.abs(streak) - 1)) : 1.0;
-  const capped     = Math.min(qKelly, maxBetPct / 100) * streakMult;
-  const raw        = Math.round(balance * capped * 100) / 100;
-  // Minimum meaningful bet: $2
+  const netOdds   = (1 - entryPrice) / entryPrice;
+  const fullKelly = (netOdds * winProb - (1 - winProb)) / netOdds;
+  // Quality-scaled Kelly fraction: 1/5 at low quality, up to 1/3 at perfect quality
+  const quality   = edgeQuality(edge);
+  const kFrac     = 0.20 + (quality - 0.5) * 0.267;
+  const scaled    = Math.max(0, fullKelly * kFrac);
+  const streak    = state.stats.streak;
+  const sMult     = streak < -1 ? Math.max(0.5, Math.pow(0.80, Math.abs(streak) - 1)) : 1.0;
+  const vol       = recentVolatility(20000);
+  const vMult     = vol > 0.003 ? 0.70 : vol > 0.0015 ? 0.85 : 1.0;
+  const capped    = Math.min(scaled, maxBetPct / 100) * sMult * vMult;
+  const raw       = Math.round(balance * capped * 100) / 100;
   return raw >= 2 ? raw : 0;
 }
 
-// Edge stability: edge must persist in same direction for 3 consecutive checks
-// Reduced from 4 to 3 for faster entry into genuine edges
-function hasStableEdge(edge) {
-  const now = Date.now();
-  // Time-window approach: require at least 2 significant-edge samples in last 1.5s,
-  // all in the same direction. Immune to single counter-ticks between polls.
-  const recent = state.edgeHistory.filter(e =>
-    now - e.time <= 1500 &&
-    Math.abs(e.edge) >= state.config.minEdge
+function isGoodEntry(edge) {
+  const vel   = edgeVelocity();
+  const qual  = edgeQuality(edge);
+  // Fast path: very strong edge + quality → enter immediately
+  if (Math.abs(edge) >= state.config.minEdge * 2.0 && qual >= 0.65) return true;
+  const now     = Date.now();
+  const recent  = state.edgeHistory.filter(e =>
+    now - e.time <= 1200 && Math.abs(e.edge) >= state.config.minEdge * 0.5
   );
-  if (recent.length < 2) return false;
   const bullish = edge > 0;
-  return recent.every(e => (e.edge > 0) === bullish);
+  const sameDir = recent.length > 0 && recent.every(e => (e.edge > 0) === bullish);
+  // Enter when edge is opening or holding (vel >= -0.002), quality >= 60%, 2+ recent samples
+  return vel >= -0.002 && qual >= 0.60 && recent.length >= 2 && sameDir;
 }
+function hasStableEdge(edge) { return isGoodEntry(edge); }
 
 function runArbitrageCheck() {
   const implied = computeImpliedProb();
@@ -624,12 +657,12 @@ function runArbitrageCheck() {
 
   // Only track edges above 50% of minEdge — prevents noise ticks from polluting
   // the stability window and breaking hasStableEdge between valid signals
-  if (Math.abs(edge) >= state.config.minEdge * 0.5) {
+  if (Math.abs(edge) >= dynMinEdge * 0.5) {
     state.edgeHistory.push({ time: now, edge, implied, poly });
     if (state.edgeHistory.length > 80) state.edgeHistory.shift();
   }
 
-  if (Math.abs(edge) < state.config.minEdge) {
+  if (Math.abs(edge) < dynMinEdge) {
     state.currentSignal = null;
     return broadcastSignal();
   }
@@ -665,7 +698,7 @@ function runArbitrageCheck() {
   const openCount = state.positions.filter(p => p.status === 'OPEN').length;
   const canTrade  = openCount < state.config.maxOpenPos;
   // Stability check is optional — disable for high-frequency scalping
-  const stableOk  = !state.config.requireStableEdge || hasStableEdge(edge);
+  const stableOk  = !state.config.requireStableEdge || isGoodEntry(edge);
   // Guard: NEVER open a position in the opposite direction to an existing open one
   // (self-canceling trades destroy edge and stack losses)
   const hasOpposite = state.positions.some(p =>
@@ -778,7 +811,7 @@ function simMarkToMarket(pos) {
 
   // Smooth approach: mark moves 20% toward absolute target each 500ms tick
   // This prevents jumps and allows SL/TP to trigger at correct levels
-  const smoothed   = pos.markOdds + (decayedTgt - pos.markOdds) * 0.35;
+  const smoothed   = pos.markOdds + (decayedTgt - pos.markOdds) * 0.55;
 
   // Tiny noise: ±0.15¢ per tick (realistic price discovery)
   const noise = (Math.random() - 0.5) * 0.003;
