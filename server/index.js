@@ -947,13 +947,17 @@ const app = express();
 app.use(cors({ origin: '*' }));
 app.use(express.json());
 
-// In production (Railway), serve the built frontend from ../dist
-if (process.env.NODE_ENV === 'production') {
-  const distPath = path.join(__dirname, '..', 'dist');
+// Serve the built frontend from ../dist if it exists (Railway production)
+const distPath = path.join(__dirname, '..', 'dist');
+const hasDistFolder = fs.existsSync(distPath);
+if (hasDistFolder) {
   app.use(express.static(distPath));
-  // Health check for Railway
-  app.get('/health', (_req, res) => res.json({ status: 'ok', ts: Date.now() }));
+  console.log('[Server] Serving frontend from', distPath);
+} else {
+  console.log('[Server] No dist/ folder — API-only mode (run npm run build first)');
 }
+// Health check always available (Railway healthcheckPath: /health)
+app.get('/health', (_req, res) => res.json({ status: 'ok', ts: Date.now() }));
 
 app.post('/api/bot/start', (req, res) => {
   if (state.trading.active) return res.json({ success: true, active: true }); // idempotent
@@ -1060,9 +1064,8 @@ app.get('/api/candles', (req, res) => res.json({
 }));
 
 // ── WEBSOCKET ─────────────────────────────────────────────────────────────────
-// SPA catch-all: in production serve index.html for any non-API route
-if (process.env.NODE_ENV === 'production') {
-  const distPath = path.join(__dirname, '..', 'dist');
+// SPA catch-all: serve index.html for any non-API route when dist exists
+if (hasDistFolder) {
   app.get('/{*path}', (_req, res) => res.sendFile(path.join(distPath, 'index.html')));
 }
 
