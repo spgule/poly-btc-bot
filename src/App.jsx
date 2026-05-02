@@ -95,8 +95,15 @@ function useBot() {
     balance: 1000, startBalance: 1000, peakBalance: 1000, drawdown: 0,
     binanceConnected: false, priceSource: 'binance',
     stats: { totalTrades: 0, wins: 0, losses: 0, totalPnl: 0, todayPnl: 0, streak: 0 },
-    config: { mode: 'SIM', capital: 1000, maxBetPct: 10, minEdge: 0.05,
-              killThreshold: 20, autoTrade: false, hasPrivateKey: false },
+    config: {
+      mode: 'SIM', capital: 1000,
+      entryMode: 'kelly', fixedAmount: 30,
+      maxBetPct: 6, minEdge: 0.03,
+      killThreshold: 20, autoTrade: false, hasPrivateKey: false,
+      takeProfitPct: 14, stopLossPct: 16, posTimeoutMs: 150000,
+      maxOpenPos: 10, requireStableEdge: false, allowDuplicateMarkets: true,
+      cooldownMs: 500,
+    },
   });
   const [trades, setTrades]       = useState([]);
   const [markets, setMarkets]     = useState([]);
@@ -1198,7 +1205,7 @@ export default function App() {
       )}
 
       {showConfig && (
-        <ConfigModal initialConfig={status.config} onClose={() => setShowConfig(false)} />
+        <ConfigModal key={JSON.stringify(status.config)} initialConfig={status.config} onClose={() => setShowConfig(false)} />
       )}
     </div>
   );

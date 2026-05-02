@@ -7,7 +7,9 @@ const axios   = require('axios');
 const fs      = require('fs');
 const path    = require('path');
 
-const CONFIG_FILE = path.join(__dirname, 'bot-config.json');
+const CONFIG_FILE  = path.join(__dirname, 'bot-config.json');
+const TRADES_FILE  = path.join(__dirname, 'bot-trades.json');
+const SESSION_FILE = path.join(__dirname, 'bot-session.json');
 
 function loadSavedConfig() {
   try {
@@ -21,6 +23,60 @@ function loadSavedConfig() {
     console.warn('[Config] Failed to load saved config:', e.message);
   }
   return null;
+}
+
+function saveTrades() {
+  try {
+    fs.writeFileSync(TRADES_FILE, JSON.stringify(state.trading.trades.slice(0, 500), null, 2), 'utf8');
+  } catch (e) { console.warn('[Trades] Failed to save trades:', e.message); }
+}
+
+function loadSavedTrades() {
+  try {
+    if (fs.existsSync(TRADES_FILE)) {
+      const trades = JSON.parse(fs.readFileSync(TRADES_FILE, 'utf8'));
+      if (Array.isArray(trades) && trades.length > 0) {
+        state.trading.trades = trades;
+        // Recompute stats from saved trades
+        state.stats.totalTrades = trades.length;
+        state.stats.wins        = trades.filter(t => t.outcome === 'WIN').length;
+        state.stats.losses      = trades.filter(t => t.outcome === 'LOSS').length;
+        state.stats.totalPnl    = Math.round(trades.reduce((s, t) => s + (t.pnl || 0), 0) * 100) / 100;
+        // Today PnL: trades closed today UTC
+        const todayStart = new Date().setUTCHours(0, 0, 0, 0);
+        state.stats.todayPnl = Math.round(
+          trades.filter(t => t.timestamp >= todayStart).reduce((s, t) => s + (t.pnl || 0), 0) * 100
+        ) / 100;
+        console.log(`[Trades] Loaded ${trades.length} trades from disk`);
+      }
+    }
+  } catch (e) { console.warn('[Trades] Failed to load trades:', e.message); }
+}
+
+function saveSession() {
+  try {
+    const s = {
+      balance:      state.trading.balance,
+      startBalance: state.trading.startBalance,
+      peakBalance:  state.trading.peakBalance,
+      stats:        state.stats,
+    };
+    fs.writeFileSync(SESSION_FILE, JSON.stringify(s, null, 2), 'utf8');
+  } catch (e) { console.warn('[Session] Failed to save session:', e.message); }
+}
+
+function loadSavedSession() {
+  try {
+    if (fs.existsSync(SESSION_FILE)) {
+      const s = JSON.parse(fs.readFileSync(SESSION_FILE, 'utf8'));
+      if (s.balance      !== undefined) state.trading.balance      = s.balance;
+      if (s.startBalance !== undefined) state.trading.startBalance = s.startBalance;
+      if (s.peakBalance  !== undefined) state.trading.peakBalance  = s.peakBalance;
+      // Stats overridden by loadSavedTrades — only apply if no trades file
+      if (!fs.existsSync(TRADES_FILE) && s.stats) Object.assign(state.stats, s.stats);
+      console.log(`[Session] Restored balance: $${state.trading.balance}`);
+    }
+  } catch (e) { console.warn('[Session] Failed to load session:', e.message); }
 }
 
 function saveConfig() {
@@ -75,7 +131,7 @@ const state = {
     maxBetPct: 6,
     minEdge: 0.03,
     killThreshold: 20,
-    autoTrade: true,
+    autoTrade: false,
     privateKey: null,
     takeProfitPct: 14,
     stopLossPct:   16,
@@ -896,7 +952,9 @@ function closePosition(pos, exitOdds, reason) {
   };
 
   state.trading.trades.unshift(trade);
-  if (state.trading.trades.length > 200) state.trading.trades.pop();
+  if (state.trading.trades.length > 500) state.trading.trades.pop();
+  saveTrades();
+  saveSession();
 
   broadcastTrade(trade);
   broadcastStatus();
@@ -1155,7 +1213,7 @@ app.post('/api/positions/:id/close', (req, res) => {
 });
 
 app.get('/api/status',    (req, res) => res.json(buildStatusPayload()));
-app.get('/api/trades',    (req, res) => res.json(state.trading.trades.slice(0, 60)));
+app.get('/api/trades',    (req, res) => res.json(state.trading.trades.slice(0, 200)));
 app.get('/api/markets',   (req, res) => res.json(state.markets));
 app.get('/api/positions', (req, res) => res.json(state.positions.filter(p => p.status === 'OPEN')));
 app.get('/api/prices',  (req, res) => res.json({
@@ -1197,7 +1255,7 @@ wss.on('connection', (ws) => {
   // Burst initial state
   ws.send(JSON.stringify({ type: 'STATUS',  data: buildStatusPayload() }));
   ws.send(JSON.stringify({ type: 'MARKETS', data: state.markets }));
-  ws.send(JSON.stringify({ type: 'TRADES_HISTORY', data: state.trading.trades.slice(0, 50) }));
+  ws.send(JSON.stringify({ type: 'TRADES_HISTORY', data: state.trading.trades.slice(0, 200) }));
   ws.send(JSON.stringify({ type: 'POSITIONS', data: state.positions.filter(p => p.status === 'OPEN') }));
   ws.send(JSON.stringify({ type: 'MARKET_DATA', data: {
     btcPrice: state.btcPrice, btcChange24h: state.btcChange24h,
@@ -1217,12 +1275,13 @@ wss.on('connection', (ws) => {
 server.listen(PORT, async () => {
   console.log(`[Server] Poly-BTC-Bot on port ${PORT}`);
 
-  // Load saved config from disk (persists across restarts)
+  // Load saved config, trades and session from disk
   const saved = loadSavedConfig();
+  loadSavedTrades();
   if (saved) {
     const c = state.config;
     if (saved.mode                  !== undefined) c.mode                  = saved.mode;
-    if (saved.capital               !== undefined) { c.capital = saved.capital; state.trading.balance = saved.capital; state.trading.startBalance = saved.capital; state.trading.peakBalance = saved.capital; }
+    if (saved.capital               !== undefined) { c.capital = saved.capital; }
     if (saved.entryMode             !== undefined) c.entryMode             = saved.entryMode;
     if (saved.fixedAmount           !== undefined) c.fixedAmount           = saved.fixedAmount;
     if (saved.maxBetPct             !== undefined) c.maxBetPct             = saved.maxBetPct;
@@ -1237,6 +1296,8 @@ server.listen(PORT, async () => {
     if (saved.allowDuplicateMarkets !== undefined) c.allowDuplicateMarkets = saved.allowDuplicateMarkets;
     if (saved.cooldownMs            !== undefined) state.trading.cooldownMs = saved.cooldownMs;
   }
+  // Session restores balance/stats AFTER config applied — saved progress wins over default capital
+  loadSavedSession();
   await loadBinanceHistory();
   connectBinance();
   await fetchBTCMarkets();
