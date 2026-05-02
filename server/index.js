@@ -50,7 +50,8 @@ function saveConfig() {
 
 // ── CONSTANTS ─────────────────────────────────────────────────────────────────
 const PORT           = process.env.PORT || 3001;
-const BINANCE_WS     = 'wss://stream.binance.com:9443/ws/btcusdt@trade';
+// Port 443 works through Railway's proxy; port 9443 is blocked
+const BINANCE_WS     = 'wss://stream.binance.com:443/ws/btcusdt@trade';
 const BINANCE_REST   = 'https://api.binance.com/api/v3';
 const POLY_GAMMA     = 'https://gamma-api.polymarket.com';
 const LAG_MS         = 2700;   // Polymarket average update lag
@@ -223,65 +224,101 @@ function connectBinance() {
   });
 }
 
-// ── BINANCE REST FALLBACK (replaces CoinGecko — no API key required) ─────────
+// ── BINANCE REST FALLBACK (no API key required) ─────────────────────────────
+// Uses /ticker/price (lightweight endpoint) — runs every 2s to keep
+// priceHistory dense enough for the sub-10s momentum model
 async function pollBinanceRest() {
   if (state.binanceConnected) return;
   try {
-    const { data } = await axios.get(`${BINANCE_REST}/ticker/24hr`, {
+    const { data } = await axios.get(`${BINANCE_REST}/ticker/price`, {
       params: { symbol: 'BTCUSDT' },
-      timeout: 8000,
+      timeout: 5000,
     });
-    const price = parseFloat(data.lastPrice);
-    const chg24 = parseFloat(data.priceChangePercent);
+    const price = parseFloat(data.price);
     if (!price || isNaN(price)) return;
-    state.btcPrice     = price;
-    state.btcChange24h = chg24;
+    state.btcPrice = price;
     const now = Date.now();
     state.priceHistory.push({ price, time: now });
     state.priceHistory = state.priceHistory.filter(p => now - p.time <= PRICE_HIST_MS);
     addChartPoint(price, now);
     updateCandle(price, now);
     state.priceSource = 'binance-rest';
-    if (state.trading.active) runArbitrageCheck();
-    broadcastMarketData();
+    if (state.trading.active && now - lastArbCheckTs >= 500) {
+      lastArbCheckTs = now;
+      runArbitrageCheck();
+    }
+    if (now - lastBroadcastTs >= 500) {
+      lastBroadcastTs = now;
+      broadcastMarketData();
+    }
   } catch (e) {
     console.warn('[Binance REST] Fallback error:', e.message);
   }
 }
 
-// ── BINANCE KLINES HISTORY (boot-time, replaces CoinGecko) ───────────────────
+// ── BINANCE KLINES HISTORY (boot-time) ────────────────────────────────────────────────
 async function loadBinanceHistory() {
   try {
-    // Use 1m klines (valid interval) — last 300 minutes for price chart
-    const { data: klines } = await axios.get(`${BINANCE_REST}/klines`, {
+    // 1s klines for last 300s = dense priceHistory the momentum model needs
+    const { data: klines1s } = await axios.get(`${BINANCE_REST}/klines`, {
+      params: { symbol: 'BTCUSDT', interval: '1s', limit: 300 },
+      timeout: 12000,
+    });
+    // 1m klines for priceChart (longer view)
+    const { data: klines1m } = await axios.get(`${BINANCE_REST}/klines`, {
       params: { symbol: 'BTCUSDT', interval: '1m', limit: 300 },
       timeout: 12000,
     });
-    // klines: [openTime, open, high, low, close, volume, closeTime, ...]
-    if (!Array.isArray(klines) || klines.length === 0) throw new Error('empty response');
-
-    // Build priceChart (1 point per minute)
-    state.priceChart = klines.map(k => ({ t: Number(k[0]), p: parseFloat(k[4]) }));
-
-    // Build priceHistory from last 5 minutes (for momentum model)
-    const fiveMinAgo = Date.now() - PRICE_HIST_MS;
-    state.priceHistory = klines
-      .filter(k => Number(k[0]) >= fiveMinAgo)
-      .map(k => ({ time: Number(k[0]), price: parseFloat(k[4]) }));
-
-    // NOTE: do NOT seed state.candles here — those are 1m intervals and would
-    // conflict with the 5s live candles built by updateCandle() from Binance WS.
-    // The chart will show live candles as soon as Binance WS connects.
-
-    // Set current price + 24h change
-    state.btcPrice = parseFloat(klines[klines.length - 1][4]);
+    // 24h stats for btcChange24h
     const { data: ticker } = await axios.get(`${BINANCE_REST}/ticker/24hr`, {
       params: { symbol: 'BTCUSDT' }, timeout: 8000,
     });
+
+    if (Array.isArray(klines1s) && klines1s.length > 0) {
+      // Seed priceHistory with 1-second resolution (critical for momentum model)
+      state.priceHistory = klines1s.map(k => ({
+        time:  Number(k[0]),
+        price: parseFloat(k[4]),
+      }));
+      // Build 5s candles from 1s klines
+      const buckets = new Map();
+      for (const k of klines1s) {
+        const ts    = Number(k[0]);
+        const price = parseFloat(k[4]);
+        const bucket = Math.floor(ts / (CANDLE_SEC * 1000)) * CANDLE_SEC;
+        if (!buckets.has(bucket)) {
+          buckets.set(bucket, { time: bucket, open: parseFloat(k[1]), high: parseFloat(k[2]), low: parseFloat(k[3]), close: price, ticks: 1 });
+        } else {
+          const c = buckets.get(bucket);
+          c.high  = Math.max(c.high,  parseFloat(k[2]));
+          c.low   = Math.min(c.low,   parseFloat(k[3]));
+          c.close = price;
+          c.ticks++;
+        }
+      }
+      const sortedBuckets = [...buckets.values()].sort((a, b) => a.time - b.time);
+      state.candles       = sortedBuckets.slice(0, -1); // all closed
+      state.currentCandle = sortedBuckets[sortedBuckets.length - 1] || null;
+      state.btcPrice      = parseFloat(klines1s[klines1s.length - 1][4]);
+      console.log(`[Binance] Seeded ${state.priceHistory.length} price points, ${state.candles.length} candles`);
+    }
+
+    if (Array.isArray(klines1m) && klines1m.length > 0) {
+      state.priceChart = klines1m.map(k => ({ t: Number(k[0]), p: parseFloat(k[4]) }));
+    }
+
     state.btcChange24h = parseFloat(ticker.priceChangePercent) || 0;
-    console.log(`[Binance] Loaded ${klines.length} klines, price=$${state.btcPrice}`);
+    console.log(`[Binance] History loaded, price=$${state.btcPrice}, change=${state.btcChange24h.toFixed(2)}%`);
   } catch (e) {
     console.warn('[Binance] History load failed:', e.message);
+    // Hard fallback: fetch at least current price so UI isn't stuck at default
+    try {
+      const { data } = await axios.get(`${BINANCE_REST}/ticker/price`, {
+        params: { symbol: 'BTCUSDT' }, timeout: 5000,
+      });
+      state.btcPrice = parseFloat(data.price) || state.btcPrice;
+      console.log(`[Binance] Fallback price: $${state.btcPrice}`);
+    } catch (_) { /* leave default */ }
   }
 }
 
@@ -1094,8 +1131,8 @@ server.listen(PORT, async () => {
   setInterval(fetchBTCMarkets, 90 * 1000);
   // SIM mode: evolve market prices every 2s to simulate Polymarket's repricing lag
   setInterval(updateSimMarketPrices, 2000);
-  // Binance REST fallback every 10s when Binance WS is down
-  setInterval(pollBinanceRest, 10000);
+  // Binance REST fallback every 2s when WS is down — keeps priceHistory dense
+  setInterval(pollBinanceRest, 2000);
   // Position monitor — 150ms for fast TP/SL response
   setInterval(monitorPositions, 150);
   // Fallback arbitrage timer — 400ms when Binance tick is slow/quiet (was 800ms)
