@@ -23,7 +23,7 @@ const COLS      = 36;
 const ROW_H     = 18;
 const MARGIN    = [6, 6];
 const LS_LAYOUT = 'ptb-layout-v3';
-const LS_HIDDEN = 'ptb-hidden-v3';
+const LS_HIDDEN = 'ptb-hidden-v4';
 
 const DEFAULT_LAYOUT = [
   { i: 'signal',    x: 0,  y: 0,  w: 8,  h: 16, minW: 6,  minH: 10 },
@@ -238,6 +238,20 @@ const ChartTip = ({ active, payload, formatter }) => {
 
 // ─── PANEL SHELL ──────────────────────────────────────────────────────────────
 function PanelShell({ id, label, badge, onHide, children }) {
+  const [confirmHide, setConfirmHide] = React.useState(false);
+  const confirmTimer = React.useRef(null);
+
+  const handleHideClick = () => {
+    if (confirmHide) {
+      clearTimeout(confirmTimer.current);
+      setConfirmHide(false);
+      onHide(id);
+    } else {
+      setConfirmHide(true);
+      confirmTimer.current = setTimeout(() => setConfirmHide(false), 2000);
+    }
+  };
+
   return (
     <div style={{
       height: '100%', display: 'flex', flexDirection: 'column',
@@ -254,15 +268,19 @@ function PanelShell({ id, label, badge, onHide, children }) {
           {badge}
         </div>
         <button
-          onClick={() => onHide(id)}
+          onClick={handleHideClick}
           style={{
-            background: 'none', border: 'none', padding: '2px 4px',
-            cursor: 'pointer', color: 'var(--t3)', display: 'flex',
-            alignItems: 'center', borderRadius: 3,
+            background: confirmHide ? 'var(--amber)' : 'none',
+            border: 'none', padding: '2px 6px',
+            cursor: 'pointer',
+            color: confirmHide ? '#000' : 'var(--t3)',
+            display: 'flex', alignItems: 'center', gap: 3,
+            borderRadius: 3, fontSize: 8, fontWeight: confirmHide ? 700 : 400,
+            transition: 'all .15s',
           }}
-          title="Ocultar painel"
+          title={confirmHide ? 'Clique novamente para confirmar' : 'Ocultar painel'}
         >
-          <EyeOff size={9} />
+          {confirmHide ? <><EyeOff size={9} /> confirmar?</> : <EyeOff size={9} />}
         </button>
       </div>
       <div style={{ flex: 1, minHeight: 0, overflow: 'hidden', display: 'flex', flexDirection: 'column' }}>
@@ -273,7 +291,7 @@ function PanelShell({ id, label, badge, onHide, children }) {
 }
 
 // ─── TOP BAR ─────────────────────────────────────────────────────────────────
-function TopBar({ status, market, connected, clock, onStart, onStop, onSettings, onLayout, actionPending }) {
+function TopBar({ status, market, connected, clock, onStart, onStop, onSettings, onLayout, actionPending, hiddenCount }) {
   const up    = (market.btcChange24h ?? 0) >= 0;
   const stats = status.stats || {};
   const wr    = stats.totalTrades > 0 ? Math.round(stats.wins / stats.totalTrades * 100) : 0;
@@ -328,8 +346,17 @@ function TopBar({ status, market, connected, clock, onStart, onStop, onSettings,
           <span className="tb-clock-time">{clock}</span>
           <span className="tb-clock-tz">BRT</span>
         </div>
-        <button className="btn btn-ghost btn-sm" onClick={onLayout} title="Gerenciar painéis">
+        <button className="btn btn-ghost btn-sm" onClick={onLayout} title="Gerenciar painéis" style={{ position: 'relative' }}>
           <LayoutDashboard size={12} />
+          {hiddenCount > 0 && (
+            <span style={{
+              position: 'absolute', top: -3, right: -3,
+              background: 'var(--amber)', color: '#000',
+              borderRadius: '50%', width: 12, height: 12,
+              fontSize: 7, fontWeight: 900, display: 'flex',
+              alignItems: 'center', justifyContent: 'center',
+            }}>{hiddenCount}</span>
+          )}
         </button>
         <button className="btn btn-ghost btn-sm" onClick={onSettings} title="Configurações">
           <Settings size={12} />
@@ -1163,6 +1190,7 @@ export default function App() {
         onStart={startBot} onStop={stopBot}
         onSettings={() => setShowConfig(true)}
         onLayout={() => setShowLayout(v => !v)}
+        hiddenCount={hidden.size}
         actionPending={actionPending}
       />
 
