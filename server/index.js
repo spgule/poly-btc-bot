@@ -1007,7 +1007,7 @@ app.get('/api/prices',  (req, res) => res.json({
 // SPA catch-all: in production serve index.html for any non-API route
 if (process.env.NODE_ENV === 'production') {
   const distPath = path.join(__dirname, '..', 'dist');
-  app.get('/{*path}', (_req, res) => res.sendFile(path.join(distPath, 'index.html')));
+  app.get('/{*splat}', (_req, res) => res.sendFile(path.join(distPath, 'index.html')));
 }
 
 const server = http.createServer(app);
