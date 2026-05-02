@@ -474,12 +474,16 @@ async function fetchBTCMarkets() {
           const shortTerm = /up or down|5 min|10 min|15 min|1 hour|today|\bday\b/.test(q);
           const midTerm   = /this week|week|\bmonth\b|may |june|july/.test(q);
           const score     = shortTerm ? 3 : midTerm ? 2 : 1;
+          // Volume: Gamma API sometimes omits the volume field even for high-volume markets.
+          // Try all known field names to maximise coverage.
+          const rawVol = m.volume ?? m.volumeNum ?? m.volumeClob ?? m.usdcSize ?? m.liquidity ?? 0;
+          const parsedVol = typeof rawVol === 'string' ? parseFloat(rawVol) : Number(rawVol);
           return {
             id: m.conditionId || m.id || m.slug,
             question: m.question || m.title || 'BTC Market',
             outcomes: m.outcomes || ['Yes', 'No'],
             outcomePrices: prices,
-            volume: Number(m.volume || m.volumeNum || 0),
+            volume: (isFinite(parsedVol) && parsedVol > 0) ? Math.round(parsedVol) : 0,
             endDate: m.endDateIso || m.endDate || m.end_date_iso,
             clobTokenIds: m.clobTokenIds || [],
             live: true,
@@ -488,8 +492,10 @@ async function fetchBTCMarkets() {
         });
         // Sort: short-term first, then by volume
         mapped.sort((a, b) => b._score - a._score || b.volume - a.volume);
-        state.markets = mapped;
-        console.log(`[Polymarket] Loaded ${state.markets.length} real BTC markets | top: "${mapped[0].question}"`);
+        // Preserve existing sim markets — they serve as fallback when real markets have low/missing volume
+        const existingSim = state.markets.filter(m => m.id && m.id.startsWith('sim-'));
+        state.markets = [...mapped, ...existingSim];
+        console.log(`[Polymarket] Loaded ${mapped.length} real BTC markets | top: "${mapped[0].question}" vol=$${mapped[0].volume.toLocaleString()}`);
         broadcast({ type: 'MARKETS', data: state.markets });
         return;
       }
@@ -504,15 +510,17 @@ async function fetchBTCMarkets() {
 }
 
 function seedSimMarkets() {
-  const now  = new Date();
   const base = Math.round(state.btcPrice / 1000) * 1000;
+  // Keep real (live) markets intact — only replace/refresh sim markets
+  const liveMarkets = state.markets.filter(m => m.live);
   state.markets = [
+    ...liveMarkets,
     { id: 'sim-1', question: `Will BTC be above $${base.toLocaleString()} in 15 min?`, outcomes: ['Yes','No'], outcomePrices: [0.52, 0.48], volume: 185000, endDate: new Date(Date.now() + 15 * 60000).toISOString(), live: false },
     { id: 'sim-2', question: `Will BTC reach $${(base + 500).toLocaleString()} today?`,  outcomes: ['Yes','No'], outcomePrices: [0.44, 0.56], volume: 442000, endDate: new Date(Date.now() + 8 * 3600000).toISOString(), live: false },
     { id: 'sim-3', question: 'Will BTC end the week above last week\'s close?',            outcomes: ['Yes','No'], outcomePrices: [0.55, 0.45], volume: 930000, endDate: new Date(Date.now() + 5 * 86400000).toISOString(), live: false },
     { id: 'sim-4', question: `Will BTC make a new ATH this month?`,                        outcomes: ['Yes','No'], outcomePrices: [0.48, 0.52], volume: 2100000, endDate: new Date(Date.now() + 25 * 86400000).toISOString(), live: false },
   ];
-  console.log('[Polymarket] Using simulated markets');
+  console.log('[Polymarket] Sim markets seeded (fallback)');
 }
 
 // ── PRICE HELPERS ─────────────────────────────────────────────────────────────
@@ -601,6 +609,9 @@ function getBestMarket() {
     const yesPrice  = m.outcomePrices?.[0] ?? 0.5;
     const priceDist = Math.abs(yesPrice - 0.5);
     if (priceDist > 0.42) return { m, score: -1 }; // YES > 0.92 or < 0.08 — exclude
+    // Real markets must have adequate volume — ensures CLOB fills are feasible.
+    // Sim markets (live:false) bypass this check and serve as automatic fallback.
+    if (m.live && Number(m.volume || 0) < 50000) return { m, score: -1 };
     // Prefer markets nearer to 0.5 (more uncertainty = larger edge swings possible)
     const priceScore = priceDist < 0.10 ? 3 : priceDist < 0.25 ? 2 : priceDist < 0.40 ? 1 : 0;
     return { m, score: timeScore + volScore + priceScore };
@@ -926,8 +937,14 @@ function openPosition(signal) {
 // This mimics how a real Polymarket market maker reprices based on the underlying asset.
 // Real markets (live:true) are updated via fetchBTCMarkets() every 90s — same as LIVE mode.
 function updateSimMarketPrices() {
-  if (state.markets.length === 0) return;
   if (!state.btcPrice || state.btcPrice <= 0) return;
+
+  // Auto-refresh sim markets if none are valid (expired or never seeded).
+  // This ensures the engine always has a fallback market to trade in SIM mode.
+  const nowMs = Date.now();
+  const activeSims = state.markets.filter(m => !m.live && m.endDate && new Date(m.endDate).getTime() > nowMs + 60000);
+  if (activeSims.length === 0) seedSimMarkets();
+  if (state.markets.length === 0) return;
 
   // Sim markets must mirror the same ~90s lag as the Gamma API has for live markets.
   // Use the real BTC price from 90s ago (from priceHistory) — not the current price.
