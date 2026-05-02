@@ -1,0 +1,443 @@
+@import url('https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;700&family=Inter:wght@400;500;600;700&display=swap');
+
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+/* ── DESIGN TOKENS ─────────────────────────────────────────────────────────── */
+@layer base {
+  :root {
+    --bg:        #07070d;
+    --s1:        #0d0d18;
+    --s2:        #131320;
+    --s3:        #191928;
+    --s4:        #1f1f30;
+    --border:    #252540;
+    --border2:   #303055;
+    --t1:        #dcdcf4;
+    --t2:        #686898;
+    --t3:        #373760;
+    --green:     #00e082;
+    --green-bg:  rgba(0,224,130,.08);
+    --green-b:   rgba(0,224,130,.28);
+    --red:       #ff4466;
+    --red-bg:    rgba(255,68,102,.08);
+    --red-b:     rgba(255,68,102,.28);
+    --blue:      #4899ff;
+    --blue-bg:   rgba(72,153,255,.08);
+    --blue-b:    rgba(72,153,255,.28);
+    --amber:     #ffb030;
+    --amber-bg:  rgba(255,176,48,.08);
+    --amber-b:   rgba(255,176,48,.28);
+    --purple:    #9966ff;
+    --purple-bg: rgba(153,102,255,.08);
+    --purple-b:  rgba(153,102,255,.28);
+  }
+
+  *, *::before, *::after { box-sizing: border-box; }
+
+  html, body, #root { height: 100%; overflow: hidden; }
+
+  body {
+    background: var(--bg);
+    color: var(--t1);
+    font-family: 'JetBrains Mono', 'Fira Code', 'Cascadia Code', monospace;
+    font-size: 12px;
+    line-height: 1.5;
+    -webkit-font-smoothing: antialiased;
+  }
+
+  ::-webkit-scrollbar { width: 4px; height: 4px; }
+  ::-webkit-scrollbar-track { background: transparent; }
+  ::-webkit-scrollbar-thumb { background: var(--border2); border-radius: 2px; }
+  ::-webkit-scrollbar-thumb:hover { background: var(--t3); }
+}
+
+/* ── LAYOUT ────────────────────────────────────────────────────────────────── */
+@layer components {
+  .app-shell {
+    display: flex;
+    flex-direction: column;
+    height: 100vh;
+    overflow: hidden;
+  }
+
+  /* ── REACT-GRID-LAYOUT overrides ────────────────────────────────────────── */
+  .react-grid-layout {
+    position: relative;
+  }
+  .react-grid-item {
+    transition: none !important;
+    box-sizing: border-box;
+  }
+  .react-grid-item.cssTransforms {
+    transition-property: none;
+  }
+  .react-grid-item.react-grid-placeholder {
+    background: var(--blue-bg);
+    border: 1px dashed var(--blue-b);
+    border-radius: 6px;
+    opacity: 1 !important;
+    z-index: 2;
+  }
+  /* Resize handle — bottom-right corner of each panel */
+  .react-resizable-handle {
+    opacity: 0;
+    transition: opacity 0.15s;
+  }
+  .react-grid-item:hover .react-resizable-handle {
+    opacity: 1;
+  }
+  .react-resizable-handle::after {
+    border-color: var(--t3) !important;
+    width: 7px !important;
+    height: 7px !important;
+    border-width: 0 2px 2px 0 !important;
+  }
+  /* Dragging cursor */
+  .drag-handle:active {
+    cursor: grabbing !important;
+  }
+
+  /* Top navigation bar */
+  .top-bar {
+    display: flex;
+    align-items: center;
+    height: 52px;
+    background: var(--s1);
+    border-bottom: 1px solid var(--border);
+    flex-shrink: 0;
+    padding: 0 16px;
+    gap: 0;
+  }
+
+  /* Scrolling ticker below top bar — hidden in new layout, kept for compat */
+  .ticker-strip {
+    display: none;
+  }
+
+  /* 3-column main grid */
+  .main-grid {
+    display: grid;
+    grid-template-columns: 270px 1fr 310px;
+    gap: 8px;
+    padding: 8px;
+    flex: 1;
+    min-height: 0;
+    overflow: hidden;
+  }
+
+  /* Each scrollable column (left & right) */
+  .col {
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+    min-height: 0;
+    overflow-y: auto;
+    overflow-x: hidden;
+  }
+
+  /* Center column: no scroll — charts fill the space */
+  .col-center {
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+    min-height: 0;
+    overflow: hidden;
+  }
+
+  /* BTC candlestick chart: hero, takes ~65% of center height */
+  .chart-hero {
+    flex: 3;
+    min-height: 0;
+    display: flex;
+    flex-direction: column;
+    overflow: hidden;
+  }
+
+  /* Edge chart: takes ~35% of center height */
+  .col-center > .card:not(.chart-hero) {
+    flex: 2;
+    min-height: 0;
+    display: flex;
+    flex-direction: column;
+    overflow: hidden;
+  }
+
+  /* ── CARDS ────────────────────────────────────────────────────────────────── */
+  .card {
+    background: var(--s1);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    overflow: hidden;
+    flex-shrink: 0;
+  }
+
+  .card-header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: 7px 12px;
+    background: var(--s2);
+    border-bottom: 1px solid var(--border);
+  }
+
+  .card-label {
+    font-size: 9px;
+    font-weight: 700;
+    letter-spacing: 0.12em;
+    text-transform: uppercase;
+    color: var(--t2);
+    font-family: 'Inter', sans-serif;
+  }
+
+  .card-body { padding: 12px; }
+
+  /* ── BADGES ──────────────────────────────────────────────────────────────── */
+  .badge {
+    display: inline-flex;
+    align-items: center;
+    gap: 3px;
+    padding: 2px 7px;
+    border-radius: 3px;
+    font-size: 9px;
+    font-weight: 700;
+    letter-spacing: 0.07em;
+    text-transform: uppercase;
+    border: 1px solid;
+    line-height: 1.4;
+  }
+  .badge-green  { color: var(--green);  border-color: var(--green-b);  background: var(--green-bg); }
+  .badge-red    { color: var(--red);    border-color: var(--red-b);    background: var(--red-bg);   }
+  .badge-blue   { color: var(--blue);   border-color: var(--blue-b);   background: var(--blue-bg);  }
+  .badge-amber  { color: var(--amber);  border-color: var(--amber-b);  background: var(--amber-bg); }
+  .badge-purple { color: var(--purple); border-color: var(--purple-b); background: var(--purple-bg);}
+  .badge-gray   { color: var(--t2);     border-color: var(--border);   background: var(--s3);       }
+
+  /* ── BUTTONS ─────────────────────────────────────────────────────────────── */
+  .btn {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    gap: 6px;
+    border: 1px solid;
+    border-radius: 5px;
+    font-size: 11px;
+    font-weight: 700;
+    letter-spacing: 0.06em;
+    text-transform: uppercase;
+    cursor: pointer;
+    transition: all 0.15s;
+    padding: 7px 16px;
+    font-family: 'JetBrains Mono', monospace;
+    white-space: nowrap;
+  }
+  .btn:disabled { opacity: 0.4; cursor: not-allowed; }
+
+  .btn-green {
+    color: var(--green); border-color: var(--green-b); background: var(--green-bg);
+  }
+  .btn-green:not(:disabled):hover {
+    background: rgba(0,224,130,.16); box-shadow: 0 0 16px rgba(0,224,130,.2);
+  }
+  .btn-red {
+    color: var(--red); border-color: var(--red-b); background: var(--red-bg);
+  }
+  .btn-red:not(:disabled):hover {
+    background: rgba(255,68,102,.16); box-shadow: 0 0 16px rgba(255,68,102,.2);
+  }
+  .btn-ghost {
+    color: var(--t2); border-color: var(--border); background: transparent;
+  }
+  .btn-ghost:hover { color: var(--t1); border-color: var(--border2); }
+
+  .btn-lg { padding: 10px 22px; font-size: 12px; }
+  .btn-sm { padding: 4px 10px;  font-size: 10px; }
+
+  /* ── TOP BAR INTERNALS ───────────────────────────────────────────────────── */
+  .tb-brand {
+    display: flex; align-items: center; gap: 7px;
+    margin-right: 0; flex-shrink: 0;
+  }
+  .tb-logo {
+    font-weight: 800; font-size: 13px; letter-spacing: 0.13em; color: var(--t1);
+  }
+  .tb-conn {
+    display: flex; align-items: center; gap: 3px;
+    font-size: 8px; font-weight: 700; letter-spacing: 0.07em;
+  }
+  .tb-conn-ok  { color: var(--green); }
+  .tb-conn-err { color: var(--red); }
+  .tb-divider {
+    width: 1px; height: 26px; background: var(--border); margin: 0 16px; flex-shrink: 0;
+  }
+  .tb-price {
+    display: flex; flex-direction: column; gap: 1px; flex-shrink: 0; margin-right: 0;
+  }
+  .tb-price-val { font-size: 20px; font-weight: 800; letter-spacing: -0.5px; line-height: 1; }
+  .tb-price-chg { font-size: 9px; line-height: 1; }
+  .tb-stats {
+    display: flex; align-items: center; gap: 0; flex-shrink: 0; margin-left: 16px;
+  }
+  .tb-stat {
+    display: flex; flex-direction: column; gap: 1px; margin-right: 18px; flex-shrink: 0;
+  }
+  .tb-stat-label { font-size: 7px; color: var(--t3); text-transform: uppercase; letter-spacing: 0.1em; font-family: Inter; }
+  .tb-stat-val   { font-size: 11px; font-weight: 700; line-height: 1.2; }
+  .tb-controls {
+    display: flex; align-items: center; gap: 8px; flex-shrink: 0;
+  }
+  .tb-clock { text-align: right; }
+  .tb-clock-time { display: block; font-size: 14px; font-weight: 700; color: var(--t1); letter-spacing: 0.04em; line-height: 1.1; }
+  .tb-clock-tz   { display: block; font-size: 7px; color: var(--t2); text-transform: uppercase; font-family: Inter; }
+
+  /* ── SIGNAL CARD INTERNALS ────────────────────────────────────────────────── */
+  .signal-card .card-body { display: flex; flex-direction: column; gap: 12px; }
+
+  .direction-block {
+    display: flex; align-items: center; gap: 12px;
+    padding: 16px 14px; border-radius: 7px; border: 1px solid;
+  }
+  .direction-up   { border-color: var(--green-b); background: var(--green-bg); color: var(--green); }
+  .direction-down { border-color: var(--red-b);   background: var(--red-bg);   color: var(--red);   }
+  .direction-idle {
+    display: flex; align-items: center; justify-content: center; gap: 10px;
+    padding: 16px; border-radius: 7px;
+    background: var(--s2); border: 1px solid var(--border);
+  }
+
+  .odds-pair {
+    display: flex; align-items: center; gap: 6px;
+  }
+  .odds-box {
+    flex: 1; background: var(--s2); border: 1px solid var(--border);
+    border-radius: 5px; padding: 8px 10px;
+    display: flex; flex-direction: column; gap: 2px;
+  }
+  .odds-label { font-size: 8px; color: var(--t2); text-transform: uppercase; font-family: Inter; letter-spacing: 0.08em; }
+  .odds-val   { font-size: 16px; font-weight: 800; line-height: 1; }
+  .odds-sep   { font-size: 9px; color: var(--t3); flex-shrink: 0; padding: 0 2px; }
+
+  .signal-detail {
+    background: var(--s2); border: 1px solid var(--border);
+    border-radius: 5px; padding: 9px 11px;
+    display: flex; flex-direction: column; gap: 6px;
+  }
+  .signal-detail-row {
+    display: flex; justify-content: space-between; align-items: flex-start; font-size: 10px;
+  }
+
+  .auto-badge {
+    display: flex; align-items: center; justify-content: center; gap: 6px;
+    border: 1px solid var(--green-b); background: var(--green-bg);
+    border-radius: 5px; padding: 9px; font-size: 10px; font-weight: 700; color: var(--green);
+  }
+
+  /* ── STATS GRID ───────────────────────────────────────────────────────────── */
+  .stats-grid {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 6px;
+    flex-shrink: 0;
+  }
+  .stat-tile {
+    background: var(--s1);
+    border: 1px solid var(--border);
+    border-radius: 5px;
+    padding: 10px 11px;
+    display: flex; flex-direction: column; gap: 2px;
+    min-width: 0;
+  }
+  .stat-label { font-size: 8px; color: var(--t3); text-transform: uppercase; letter-spacing: 0.09em; font-family: Inter; }
+  .stat-val   { font-size: 14px; font-weight: 800; color: var(--t1); line-height: 1.1; }
+  .stat-sub   { font-size: 9px; color: var(--t2); margin-top: 1px; }
+
+  /* ── PROGRESS BAR ────────────────────────────────────────────────────────── */
+  .progress-track {
+    height: 3px;
+    background: var(--s4);
+    border-radius: 2px;
+    overflow: hidden;
+    margin-top: 5px;
+  }
+  .progress-fill {
+    height: 100%;
+    border-radius: 2px;
+    transition: width .5s ease;
+  }
+
+  /* ── MARKET ROW ──────────────────────────────────────────────────────────── */
+  .market-row {
+    padding: 9px 0;
+    border-bottom: 1px solid var(--border);
+  }
+  .market-row:last-child { border-bottom: none; }
+
+  /* ── ODDS BAR ────────────────────────────────────────────────────────────── */
+  .odds-bar {
+    height: 3px;
+    border-radius: 2px;
+    overflow: hidden;
+    display: flex;
+    margin-top: 5px;
+  }
+  .odds-yes { background: var(--green); transition: width .4s; }
+  .odds-no  { background: var(--red);   flex: 1; }
+
+  /* ── TRADE TABLE ─────────────────────────────────────────────────────────── */
+  .trade-row {
+    display: grid;
+    grid-template-columns: 52px 20px 44px 50px 52px;
+    gap: 4px;
+    align-items: center;
+    padding: 5px 0;
+    border-bottom: 1px solid var(--border);
+    font-size: 10px;
+  }
+  .trade-row:last-child { border-bottom: none; }
+
+  /* ── EDGE METER ──────────────────────────────────────────────────────────── */
+  .edge-track {
+    height: 6px;
+    border-radius: 3px;
+    background: var(--s4);
+    overflow: hidden;
+    position: relative;
+  }
+  .edge-fill-green { background: var(--green); }
+  .edge-fill-red   { background: var(--red); }
+
+  /* ── DIVIDER ─────────────────────────────────────────────────────────────── */
+  .divider {
+    height: 1px;
+    background: var(--border);
+    margin: 8px 0;
+  }
+
+  /* ── DOT MATRIX BG ───────────────────────────────────────────────────────── */
+  .dot-grid {
+    background-image: radial-gradient(rgba(255,255,255,.05) 1px, transparent 1px);
+    background-size: 20px 20px;
+  }
+
+  /* ── GLOW HELPERS ────────────────────────────────────────────────────────── */
+  .glow-green { box-shadow: 0 0 16px rgba(0,224,130,.25); }
+  .glow-red   { box-shadow: 0 0 16px rgba(255,68,102,.25); }
+  .glow-blue  { box-shadow: 0 0 16px rgba(72,153,255,.20); }
+
+  /* ── ANIMATIONS ──────────────────────────────────────────────────────────── */
+  @keyframes blink    { 0%,100%{opacity:1} 50%{opacity:0} }
+  @keyframes flash-g  { 0%{color:var(--green)} 60%{color:inherit} }
+  @keyframes flash-r  { 0%{color:var(--red)}   60%{color:inherit} }
+  @keyframes slide-in { from{opacity:0;transform:translateY(-5px)} to{opacity:1;transform:translateY(0)} }
+  @keyframes pulse-glow {
+    0%,100% { box-shadow: 0 0 6px rgba(0,224,130,.15); }
+    50%     { box-shadow: 0 0 18px rgba(0,224,130,.35); }
+  }
+
+  .blink      { animation: blink 1.3s infinite; }
+  .flash-g    { animation: flash-g .5s ease; }
+  .flash-r    { animation: flash-r .5s ease; }
+  .slide-in   { animation: slide-in .2s ease; }
+  .pulse-glow { animation: pulse-glow 2s infinite; }
+}
