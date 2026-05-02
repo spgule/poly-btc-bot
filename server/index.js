@@ -594,16 +594,15 @@ function getBestMarket() {
     // Prefer short-term (5–30 min window) for momentum arb
     const timeScore = minLeft <= 30 ? 3 : minLeft <= 60 ? 2 : minLeft <= 1440 ? 1 : 0;
     const volScore  = m.volume >= 100000 ? 2 : m.volume >= 20000 ? 1 : 0;
-    // Prefer markets NEAR 0.5: that's where genuine uncertainty exists and both BUY_YES and BUY_NO
-    // signals are reachable. Markets with YES far from 0.5 (>0.80 or <0.20) are near-certain and
-    // cause permanent one-directional signals because implied is capped at [0.26, 0.74].
+    // Filter out near-certain markets (YES > 0.92 or YES < 0.08).
+    // These are essentially resolved — tiny NO/YES price means extreme leverage,
+    // minimal liquidity, and the binary model has no meaningful edge to detect.
+    // Markets between 0.08–0.92 are valid for both BUY_YES and BUY_NO.
     const yesPrice  = m.outcomePrices?.[0] ?? 0.5;
     const priceDist = Math.abs(yesPrice - 0.5);
-    // In SIM mode the stale tracker is bounded to [0.22, 0.78] so this filter never blocks.
-    // In LIVE mode, real Polymarket prices can be extreme — filter those out.
-    if (!m.live && priceDist > 0.28) return { m, score: -1 };
-    if ( m.live && priceDist > 0.30) return { m, score: -1 };
-    const priceScore = priceDist < 0.08 ? 2 : priceDist < 0.20 ? 1 : 0;
+    if (priceDist > 0.42) return { m, score: -1 }; // YES > 0.92 or < 0.08 — exclude
+    // Prefer markets nearer to 0.5 (more uncertainty = larger edge swings possible)
+    const priceScore = priceDist < 0.10 ? 3 : priceDist < 0.25 ? 2 : priceDist < 0.40 ? 1 : 0;
     return { m, score: timeScore + volScore + priceScore };
   }).filter(x => x.score >= 0).sort((a, b) => b.score - a.score);
 
