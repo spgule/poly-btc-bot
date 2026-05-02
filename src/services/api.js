@@ -1,15 +1,16 @@
 // In production (Railway) the frontend is served by the same Express process,
-// so API calls go to the same origin. In local dev, proxy to localhost:3001.
+// so API calls go to the same origin. In local dev, Vite proxies /api and /ws
+// to localhost:3001, so we also use same origin (empty BASE).
 const BASE = (typeof __VITE_API_URL__ !== 'undefined' && __VITE_API_URL__)
   ? __VITE_API_URL__
-  : (import.meta.env.PROD ? '' : 'http://localhost:3001');
+  : '';
 
 // WebSocket URL derived from BASE (https → wss, http → ws, empty → same host)
 export function getWsUrl() {
   const base = !BASE
     ? `${location.protocol === 'https:' ? 'wss' : 'ws'}://${location.host}`
     : BASE.replace(/^https/, 'wss').replace(/^http/, 'ws');
-  return base;
+  return `${base}/ws`;
 }
 
 async function post(path, body = {}) {

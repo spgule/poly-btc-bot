@@ -7,7 +7,7 @@ export default defineConfig({
   define: {
     // VITE_API_URL can be set in Railway env vars to point to the same service
     // e.g. VITE_API_URL=https://your-app.railway.app
-    // Falls back to localhost for local dev
+    // Leave empty to use same-origin (default for Railway)
     __VITE_API_URL__: JSON.stringify(process.env.VITE_API_URL || ''),
   },
 })
