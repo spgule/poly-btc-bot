@@ -608,27 +608,45 @@ function getBestMarket() {
   return scored[0].m;
 }
 
+// ── BINARY OPTION PRICING ───────────────────────────────────────────────────
+// Computes P(BTC_T > strike) using current real-time BTC price, realized vol, and time-to-expiry.
+// This is the correct real-time fair value for a Polymarket binary question.
+// Used by: computeImpliedProb() (signal), monitorPositions() (mark-to-market),
+//          updateSimMarketPrices() (display prices for sim markets).
+// All three use the SAME formula — ensuring signal, mark and display are consistent.
+function computeBinaryMid(market) {
+  const btc = state.btcPrice;
+  if (!btc || btc <= 0 || !market) return 0.5;
+
+  // Parse strike from question: "Will BTC be above $97,000 in 15 min?"
+  const strikeMatch = market.question?.match(/\$([0-9,]+)/);
+  const strike = strikeMatch ? parseFloat(strikeMatch[1].replace(/,/g, '')) : btc;
+
+  const now       = Date.now();
+  const msLeft    = market.endDate ? new Date(market.endDate).getTime() - now : 15 * 60000;
+  const hoursLeft = Math.max(1 / 3600, msLeft / 3600000); // min 1 second
+
+  // Realized vol (1-min window) scaled to per-hour
+  const realizedVol = recentVolatility(60000);
+  const volPerHour  = Math.max(0.001, realizedVol * Math.sqrt(3600));
+
+  // Black-Scholes d2: ln(S/K) / (σ√T)
+  // Positive when BTC is above strike, negative when below.
+  const sigmaT = volPerHour * Math.sqrt(hoursLeft);
+  const d2     = Math.log(btc / strike) / Math.max(0.001, sigmaT);
+
+  // Logistic CDF ≈ normal CDF Φ(d2)
+  return Math.max(0.03, Math.min(0.97, 1 / (1 + Math.exp(-1.7 * d2))));
+}
+
+// computeImpliedProb: real-time fair value for the best current market.
+// Compared against computePolyOdds() (stale 90s Gamma API price) to detect mispricing.
+// Edge > 0 → market underprices YES → BUY_YES
+// Edge < 0 → market overprices YES → BUY_NO
 function computeImpliedProb() {
-  if (state.priceHistory.length < 5) return 0.5;
-  const cur  = state.btcPrice;
-  const c2s  = pctChange(cur, getPriceAt(2000));
-  const c5s  = pctChange(cur, getPriceAt(5000));
-  const c15s = pctChange(cur, getPriceAt(15000));
-  const c30s = pctChange(cur, getPriceAt(30000));
-  const c60s = pctChange(cur, getPriceAt(60000));
-  const momentum  = c2s * 0.38 + c5s * 0.28 + c15s * 0.18 + c30s * 0.10 + c60s * 0.06;
-  const c2s_old   = pctChange(getPriceAt(2000), getPriceAt(4000));
-  const accel     = (c2s - c2s_old) * 0.12;
-  // Mean-reversion damper: fade signal when 30s move already large
-  const revDamp   = Math.abs(c30s) > 0.003 ? 0.75 : 1.0;
-  const shortDir  = c2s + c5s;
-  const midDir    = c15s + c30s;
-  const aligned   = (shortDir > 0) === (midDir > 0) && Math.abs(midDir) > 0.0002;
-  const composite = (momentum + accel) * revDamp * (aligned ? 1.20 : 0.85);
-  // Volatility-adaptive k: low vol = sharper signal, high vol = softer
-  const vol = recentVolatility(20000);
-  const k   = vol < 0.0008 ? 1400 : vol < 0.0015 ? 1200 : vol < 0.003 ? 950 : 800;
-  return Math.max(0.26, Math.min(0.74, sigmoid(composite, k)));
+  const market = getBestMarket();
+  if (!market) return 0.5;
+  return computeBinaryMid(market);
 }
 
 function computePolyOdds() {
@@ -900,36 +918,15 @@ function openPosition(signal) {
 // Real markets (live:true) are updated via fetchBTCMarkets() every 90s — same as LIVE mode.
 function updateSimMarketPrices() {
   if (state.markets.length === 0) return;
-  const btc = state.btcPrice;
-  if (!btc || btc <= 0) return;
-  const now = Date.now();
-  // Realized vol (1-min window), annualized per hour for the binary model
-  const realizedVol = recentVolatility(60000); // stdev of 1s returns
-  const volPerHour  = realizedVol * Math.sqrt(3600); // scale to per-hour
-
+  if (!state.btcPrice || state.btcPrice <= 0) return;
   for (const m of state.markets) {
-    if (m.live) continue; // real markets updated by fetchBTCMarkets only
+    if (m.live) continue; // real markets updated by fetchBTCMarkets every 90s
     if (!m.outcomePrices) m.outcomePrices = [0.5, 0.5];
-
-    // Parse strike from question: "Will BTC be above $97,000 in 15 min?"
-    const strikeMatch = m.question.match(/\$([0-9,]+)/);
-    const strike = strikeMatch ? parseFloat(strikeMatch[1].replace(/,/g, '')) : btc;
-
-    const msLeft    = m.endDate ? new Date(m.endDate).getTime() - now : 15 * 60000;
-    const hoursLeft = Math.max(1 / 3600, msLeft / 3600000); // min 1s
-
-    // Binary call option: P(BTC_T > strike) ≈ Φ(d1)
-    // d1 = ln(S/K) / (σ * sqrt(T)), where σ is realized hourly vol
-    const lnRatio   = Math.log(btc / strike);
-    const sigmaT    = Math.max(0.001, volPerHour * Math.sqrt(hoursLeft));
-    const d1        = lnRatio / sigmaT;
-    // Standard normal CDF approximation
-    const rawProb   = 1 / (1 + Math.exp(-1.7 * d1)); // logistic CDF ≈ normal CDF
-
-    // Add tiny microstructure noise (±0.5¢) — real markets have bid/ask noise
-    const noise     = (Math.random() - 0.5) * 0.005;
-    const newYes    = Math.max(0.03, Math.min(0.97, rawProb + noise));
-
+    // Use shared binary option formula — consistent with signal and mark-to-market
+    const rawProb = computeBinaryMid(m);
+    // Add tiny microstructure noise (±0.3¢) — real markets have bid/ask noise
+    const noise = (Math.random() - 0.5) * 0.003;
+    const newYes = Math.max(0.03, Math.min(0.97, rawProb + noise));
     m.outcomePrices[0] = Math.round(newYes * 1000) / 1000;
     m.outcomePrices[1] = Math.round((1 - m.outcomePrices[0]) * 1000) / 1000;
   }
@@ -1020,9 +1017,12 @@ function monitorPositions() {
     // Update mark price from real Polymarket market odds (re-polled every 90s from Gamma API).
     // Identical for SIM and LIVE: mark = current YES or NO mid-price from the market.
     const mktForPos = state.markets.find(m => m.id === pos.marketId);
-    const yesOdds   = mktForPos?.outcomePrices?.[0] ?? pos.markOdds;
-    const midOdds   = pos.side === 'BUY_YES' ? yesOdds : (1 - yesOdds);
-    const newMark   = Math.max(0.03, Math.min(0.97, midOdds));
+    // Real-time mark: recompute P(BTC_T > strike) using current BTC price every 150ms.
+    // This gives smooth P&L that updates with every BTC tick, identical for SIM and LIVE.
+    // For real markets this is MORE accurate than the stale 90s Gamma price.
+    const midYes  = mktForPos ? computeBinaryMid(mktForPos) : pos.markOdds;
+    const midOdds = pos.side === 'BUY_YES' ? midYes : (1 - midYes);
+    const newMark = Math.max(0.03, Math.min(0.97, midOdds));
     pos.markOdds   = newMark;
     pos.pnlPct     = Math.round(((newMark - pos.entryOdds) / pos.entryOdds) * 10000) / 100;
     pos.unrealizedPnl = Math.round((newMark - pos.entryOdds) * pos.shares * 100) / 100;
