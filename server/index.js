@@ -129,7 +129,7 @@ const state = {
     entryMode: 'kelly',
     fixedAmount: 30,
     maxBetPct: 6,
-    minEdge: 0.03,
+    minEdge: 0.02,
     killThreshold: 20,
     autoTrade: false,
     privateKey: null,
@@ -963,19 +963,21 @@ function simMarkToMarket(pos) {
 // Without this, outcomePrices are static → polyOdds barely moves → no edge.
 function updateSimMarketPrices() {
   if (state.config.mode !== 'SIM' || state.markets.length === 0) return;
-  // Use 10s lagged BTC as proxy for what a slow market maker currently prices
-  const lag10 = getPriceAt(10000);
-  const lag25 = getPriceAt(25000);
-  const lagChange = pctChange(lag10, lag25);
-  // Lagged probability the market would show (damped, slow to move)
-  const lagProb = Math.max(0.30, Math.min(0.70, sigmoid(lagChange, 1200)));
-  // Apply to ALL active markets so getBestMarket always has dynamic prices
-  for (const m of state.markets) {
+  // Use 60s lagged BTC as proxy for what a slow Polymarket maker currently prices.
+  // Real Polymarket updates take 1–3 minutes → this creates genuine lag-arb opportunity:
+  // implied (real-time BTC) diverges from mktPrice (60s stale) for 5–10 minutes after a move.
+  const lag60 = getPriceAt(60000);
+  const lag75 = getPriceAt(75000);
+  const lagChange = pctChange(lag60, lag75);
+  const lagProb = Math.max(0.28, Math.min(0.72, sigmoid(lagChange, 1200)));
+  // Only update sim (non-live) markets — never overwrite real Polymarket prices
+  for (const m of state.markets.filter(m => !m.live)) {
     if (!m.outcomePrices) m.outcomePrices = [0.5, 0.5];
     const cur  = m.outcomePrices[0] ?? 0.5;
-    // Market mean-reverts toward lagged signal slowly (8% per 2s step)
-    const step = (lagProb - cur) * 0.08 + (Math.random() - 0.5) * 0.006;
-    const next = Math.max(0.20, Math.min(0.80, cur + step));
+    // Very slow convergence: 1% per 2s step → ~10 min to fully catch up after a BTC move.
+    // This preserves the lag-arb window (implied sees move now, market sees it 5-10 min later).
+    const step = (lagProb - cur) * 0.010 + (Math.random() - 0.5) * 0.004;
+    const next = Math.max(0.22, Math.min(0.78, cur + step));
     m.outcomePrices[0] = Math.round(next * 1000) / 1000;
     m.outcomePrices[1] = Math.round((1 - next) * 1000) / 1000;
   }
