@@ -650,10 +650,12 @@ function isGoodEntry(edge) {
 function hasStableEdge(edge) { return isGoodEntry(edge); }
 
 function runArbitrageCheck() {
-  const implied = computeImpliedProb();
-  const poly    = computePolyOdds();
-  const edge    = implied - poly;
-  const now     = Date.now();
+  const implied    = computeImpliedProb();
+  const poly       = computePolyOdds();
+  const edge       = implied - poly;
+  const now        = Date.now();
+  const volScale   = Math.max(1.0, Math.min(1.5, recentVolatility(20000) / 0.0015));
+  const dynMinEdge = state.config.minEdge * volScale;
 
   // Only track edges above 50% of minEdge — prevents noise ticks from polluting
   // the stability window and breaking hasStableEdge between valid signals
@@ -679,9 +681,10 @@ function runArbitrageCheck() {
     ? Math.min(state.config.fixedAmount, state.trading.balance)
     : kellySize(Math.abs(edge), winProb, entryPrice, state.trading.balance, state.config.maxBetPct);
 
-  // Confidence: scaled from edge magnitude + stability
-  const stableBonus = hasStableEdge(edge) ? 15 : 0;
-  const confidence  = Math.min(99, 50 + Math.abs(edge) * 250 + stableBonus);
+  // Confidence: scaled from edge magnitude + velocity + quality
+  const velBonus   = edgeVelocity() > 0.003 ? 10 : 0;
+  const qualBonus  = Math.round(edgeQuality(edge) * 20);
+  const confidence = Math.min(99, 50 + Math.abs(edge) * 250 + velBonus + qualBonus);
 
   state.currentSignal = {
     marketId:    market.id,
