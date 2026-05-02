@@ -132,6 +132,22 @@ function useBot() {
     return () => clearInterval(id);
   }, [connected]);
 
+  // ── Candles + edge polling (independent of WS) ────────────────────────────
+  // Runs every 3s always — ensures chart shows data even when WS is glitchy
+  useEffect(() => {
+    async function pollCandles() {
+      try {
+        const data = await api.getCandles();
+        if (data?.candles?.length)  setCandles(data.candles);
+        if (data?.currentCandle)    setCurrentCandle(data.currentCandle);
+        if (data?.edgeHistory)      setMarket(d => ({ ...d, edgeHistory: data.edgeHistory, impliedProb: data.impliedProb, polyOdds: data.polyOdds, edge: data.edge }));
+      } catch (_) { /* ignore */ }
+    }
+    pollCandles();
+    const id = setInterval(pollCandles, 3000);
+    return () => clearInterval(id);
+  }, []);
+
 
   useEffect(() => {
     let destroyed = false;

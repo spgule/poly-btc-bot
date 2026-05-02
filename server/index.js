@@ -252,38 +252,52 @@ async function pollBinanceRest() {
 // ── BINANCE KLINES HISTORY (boot-time, replaces CoinGecko) ───────────────────
 async function loadBinanceHistory() {
   try {
-    // Load last 5 min of 5s candles (60 candles) for chart seed
+    // Use 1m klines (valid interval) — last 300 minutes for price chart
     const { data: klines } = await axios.get(`${BINANCE_REST}/klines`, {
-      params: { symbol: 'BTCUSDT', interval: '5s', limit: 300 },
+      params: { symbol: 'BTCUSDT', interval: '1m', limit: 300 },
       timeout: 12000,
     });
     // klines: [openTime, open, high, low, close, volume, closeTime, ...]
-    if (!Array.isArray(klines) || klines.length === 0) throw new Error('empty');
-    // Build priceChart from close prices
-    state.priceChart = klines.map(k => ({ t: k[0], p: parseFloat(k[4]) }));
-    // Build priceHistory from last 5 minutes
+    if (!Array.isArray(klines) || klines.length === 0) throw new Error('empty response');
+
+    // Build priceChart (1 point per minute)
+    state.priceChart = klines.map(k => ({ t: Number(k[0]), p: parseFloat(k[4]) }));
+
+    // Build priceHistory from last 5 minutes (for momentum model)
     const fiveMinAgo = Date.now() - PRICE_HIST_MS;
     state.priceHistory = klines
-      .filter(k => k[0] >= fiveMinAgo)
-      .map(k => ({ time: k[0], price: parseFloat(k[4]) }));
-    // Build closed candles
+      .filter(k => Number(k[0]) >= fiveMinAgo)
+      .map(k => ({ time: Number(k[0]), price: parseFloat(k[4]) }));
+
+    // Build closed candles from 1m klines (use closeTime in seconds as bucket)
     state.candles = klines.slice(0, -1).map(k => ({
-      time:  Math.floor(k[0] / 1000),
+      time:  Math.floor(Number(k[0]) / 1000),
       open:  parseFloat(k[1]),
       high:  parseFloat(k[2]),
       low:   parseFloat(k[3]),
       close: parseFloat(k[4]),
       ticks: 1,
     }));
-    // Set current price + 24h change from last candle
+
+    // Seed currentCandle from the last (still-open) kline
     const last = klines[klines.length - 1];
-    state.btcPrice = parseFloat(last[4]);
-    // Fetch 24h stats for change%
+    const lastPrice = parseFloat(last[4]);
+    state.currentCandle = {
+      time:  Math.floor(Number(last[0]) / 1000),
+      open:  parseFloat(last[1]),
+      high:  parseFloat(last[2]),
+      low:   parseFloat(last[3]),
+      close: lastPrice,
+      ticks: 1,
+    };
+
+    // Set current price + 24h change
+    state.btcPrice = lastPrice;
     const { data: ticker } = await axios.get(`${BINANCE_REST}/ticker/24hr`, {
       params: { symbol: 'BTCUSDT' }, timeout: 8000,
     });
     state.btcChange24h = parseFloat(ticker.priceChangePercent) || 0;
-    console.log(`[Binance] Loaded ${klines.length} historical candles, price=$${state.btcPrice}`);
+    console.log(`[Binance] Loaded ${klines.length} klines, price=$${state.btcPrice}`);
   } catch (e) {
     console.warn('[Binance] History load failed:', e.message);
   }
@@ -1016,6 +1030,14 @@ app.get('/api/prices',  (req, res) => res.json({
   current: state.btcPrice,
   change24h: state.btcChange24h,
   source:  state.priceSource,
+}));
+app.get('/api/candles', (req, res) => res.json({
+  candles:       state.candles.slice(-300),
+  currentCandle: state.currentCandle,
+  edgeHistory:   state.edgeHistory.slice(-80),
+  impliedProb:   computeImpliedProb(),
+  polyOdds:      computePolyOdds(),
+  edge:          computeImpliedProb() - computePolyOdds(),
 }));
 
 // ── WEBSOCKET ─────────────────────────────────────────────────────────────────
