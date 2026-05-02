@@ -527,9 +527,9 @@ function seedSimMarkets() {
   const base = Math.round(state.btcPrice / 1000) * 1000;
   state.markets = [
     { id: 'sim-1', question: `Will BTC be above $${base.toLocaleString()} in 15 min?`, outcomes: ['Yes','No'], outcomePrices: [0.52, 0.48], volume: 185000, endDate: new Date(Date.now() + 15 * 60000).toISOString(), live: false },
-    { id: 'sim-2', question: `Will BTC reach $${(base + 1000).toLocaleString()} today?`,  outcomes: ['Yes','No'], outcomePrices: [0.28, 0.72], volume: 442000, endDate: new Date(Date.now() + 8 * 3600000).toISOString(), live: false },
-    { id: 'sim-3', question: 'Will BTC end the week above last week\'s close?',            outcomes: ['Yes','No'], outcomePrices: [0.61, 0.39], volume: 930000, endDate: new Date(Date.now() + 5 * 86400000).toISOString(), live: false },
-    { id: 'sim-4', question: `Will BTC make a new ATH this month?`,                        outcomes: ['Yes','No'], outcomePrices: [0.35, 0.65], volume: 2100000, endDate: new Date(Date.now() + 25 * 86400000).toISOString(), live: false },
+    { id: 'sim-2', question: `Will BTC reach $${(base + 500).toLocaleString()} today?`,  outcomes: ['Yes','No'], outcomePrices: [0.44, 0.56], volume: 442000, endDate: new Date(Date.now() + 8 * 3600000).toISOString(), live: false },
+    { id: 'sim-3', question: 'Will BTC end the week above last week\'s close?',            outcomes: ['Yes','No'], outcomePrices: [0.55, 0.45], volume: 930000, endDate: new Date(Date.now() + 5 * 86400000).toISOString(), live: false },
+    { id: 'sim-4', question: `Will BTC make a new ATH this month?`,                        outcomes: ['Yes','No'], outcomePrices: [0.48, 0.52], volume: 2100000, endDate: new Date(Date.now() + 25 * 86400000).toISOString(), live: false },
   ];
   console.log('[Polymarket] Using simulated markets');
 }
@@ -613,10 +613,13 @@ function getBestMarket() {
     // Prefer short-term (5–30 min window) for momentum arb
     const timeScore = minLeft <= 30 ? 3 : minLeft <= 60 ? 2 : minLeft <= 1440 ? 1 : 0;
     const volScore  = m.volume >= 100000 ? 2 : m.volume >= 20000 ? 1 : 0;
-    // Prefer markets where YES price is away from 0.5 (mispricing opportunity)
-    const yesPrice = m.outcomePrices?.[0] ?? 0.5;
+    // Prefer markets NEAR 0.5: that's where genuine uncertainty exists and both BUY_YES and BUY_NO
+    // signals are reachable. Markets with YES far from 0.5 (>0.80 or <0.20) are near-certain and
+    // cause permanent one-directional signals because implied is capped at [0.26, 0.74].
+    const yesPrice  = m.outcomePrices?.[0] ?? 0.5;
     const priceDist = Math.abs(yesPrice - 0.5);
-    const priceScore = priceDist > 0.1 ? 2 : priceDist > 0.05 ? 1 : 0;
+    if (priceDist > 0.30) return { m, score: -1 }; // YES < 0.20 or > 0.80 → skip (too certain)
+    const priceScore = priceDist < 0.08 ? 2 : priceDist < 0.20 ? 1 : 0;
     return { m, score: timeScore + volScore + priceScore };
   }).filter(x => x.score >= 0).sort((a, b) => b.score - a.score);
 
