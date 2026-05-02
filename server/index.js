@@ -198,49 +198,9 @@ function updateCandle(price, now) {
   }
 }
 
-// ── SIM VOLATILITY INJECTOR ───────────────────────────────────────────────────
-let simDrift    = 0;
-let simDriftTtl = 0;
+// ── ARBITRAGE TICK TRACKING ───────────────────────────────────────────────────
 let lastArbCheckTs  = 0;
 let lastBroadcastTs = 0;
-
-// ── IMPLIED HISTORY (for lag-arb simulation) ──────────────────────────────────
-// Circular buffer of {time, value} — stores computeImpliedProb() every arb tick.
-// computePolyOdds() reads this 90-150s in the past, creating a hard time-lag that
-// mirrors Polymarket's ~2min update cycle. Any BTC trend creates a durable edge window.
-let impliedHistory = []; // { time, value }
-
-function injectSimVolatility(basePrice, now) {
-  // Create a synthetic micro-trend by OVERWRITING old price history points.
-  // This is safe because: (a) only SIM mode, (b) only affects points >2s in the past,
-  // (c) it simulates the kind of micro-movement a real market feed would show.
-  if (simDriftTtl <= 0) {
-    // Each new drift: ±0.4% directional move (strong enough to create measurable momentum)
-    simDrift    = (Math.random() - 0.48) * 0.008; // bias slightly bullish
-    simDriftTtl = 8 + Math.floor(Math.random() * 12); // 8-20 ticks per direction
-  }
-  simDriftTtl--;
-
-  const noise     = (Math.random() - 0.5) * 0.001;
-  const factor    = 1 + simDrift + noise;
-  const fakePrice = Math.round(basePrice * factor * 100) / 100;
-  // Target a point 3-20s ago (affects c5s, c15s in computeImpliedProb)
-  const fakePast  = now - 3000 - Math.floor(Math.random() * 17000);
-
-  // Overwrite the closest existing point rather than inserting (keeps array size stable)
-  let closestIdx = 0;
-  let minDiff = Infinity;
-  for (let i = 0; i < state.priceHistory.length; i++) {
-    const d = Math.abs(state.priceHistory[i].time - fakePast);
-    if (d < minDiff) { minDiff = d; closestIdx = i; }
-  }
-  if (minDiff < 5000 && state.priceHistory.length > 0) {
-    state.priceHistory[closestIdx].price = fakePrice;
-  } else {
-    state.priceHistory.push({ price: fakePrice, time: fakePast });
-    state.priceHistory.sort((a, b) => a.time - b.time);
-  }
-}
 
 // ── BINANCE WS FEED ───────────────────────────────────────────────────────────
 let binanceTimer = null;
@@ -270,7 +230,6 @@ function connectBinance() {
       state.priceHistory = state.priceHistory.filter(p => now - p.time <= PRICE_HIST_MS);
       addChartPoint(price, now);
       updateCandle(price, now);
-      if (state.config.mode === 'SIM') injectSimVolatility(price, now);
       if (state.trading.active && now - lastArbCheckTs >= 100) {
         lastArbCheckTs = now;
         runArbitrageCheck();
@@ -325,8 +284,6 @@ async function pollBinanceRest() {
     state.priceHistory = state.priceHistory.filter(p => now - p.time <= PRICE_HIST_MS);
     addChartPoint(price, now);
     updateCandle(price, now);
-    // SIM mode: inject synthetic micro-volatility so momentum model has enough spread
-    if (state.config.mode === 'SIM') injectSimVolatility(price, now);
     state.priceSource = 'binance-rest';
     if (state.trading.active && now - lastArbCheckTs >= 500) {
       lastArbCheckTs = now;
@@ -346,7 +303,6 @@ async function pollBinanceRest() {
       state.priceHistory.push({ price: state.btcPrice, time: now });
       state.priceHistory = state.priceHistory.filter(p => now - p.time <= PRICE_HIST_MS);
       updateCandle(state.btcPrice, now);
-      if (state.config.mode === 'SIM') injectSimVolatility(state.btcPrice, now);
       state.priceSource = 'sim';
       if (state.trading.active && now - lastArbCheckTs >= 500) {
         lastArbCheckTs = now;
@@ -676,30 +632,11 @@ function computeImpliedProb() {
 }
 
 function computePolyOdds() {
-  const market   = getBestMarket();
-  const mktPrice = market?.outcomePrices?.[0] ?? null;
-
-  if (state.config.mode !== 'SIM') {
-    // LIVE: use actual on-chain Polymarket price (real 2-3min lag is built-in)
-    return mktPrice ?? 0.5;
-  }
-
-  // SIM: poly = average of computeImpliedProb() from 90–150s ago (hard lag).
-  // This mirrors Polymarket's ~2min update cycle: any BTC move creates an edge
-  // that persists for the full lag window, giving the bot time to enter.
-  const now = Date.now();
-  const old = impliedHistory.filter(h => {
-    const age = now - h.time;
-    return age >= 90000 && age <= 150000;
-  });
-
-  if (old.length === 0) {
-    // First 90s: no history yet — use seed market price (~0.5)
-    // Any current BTC movement will immediately diverge from 0.5 → edge exists
-    return mktPrice ?? 0.50;
-  }
-
-  return old.reduce((s, h) => s + h.value, 0) / old.length;
+  // Both SIM and LIVE: use actual Polymarket market price (re-polled every 90s from Gamma API).
+  // The natural 90s polling interval creates realistic lag between BTC moves and
+  // Polymarket odds updates — identical behaviour to LIVE, no artificial lag needed.
+  const market = getBestMarket();
+  return market?.outcomePrices?.[0] ?? 0.5;
 }
 
 // Kelly criterion — quarter-Kelly for noise-resilient sizing
@@ -741,10 +678,6 @@ function runArbitrageCheck() {
   const implied    = computeImpliedProb();
   const now        = Date.now();
 
-  // Always record implied in history — used by computePolyOdds() for SIM hard-lag
-  impliedHistory.push({ time: now, value: implied });
-  if (impliedHistory.length > 2000) impliedHistory.splice(0, 500); // trim oldest 500 when too big
-
   const poly       = computePolyOdds();
   const edge       = implied - poly;
   const volScale   = Math.max(1.0, Math.min(1.5, recentVolatility(20000) / 0.0015));
@@ -754,9 +687,7 @@ function runArbitrageCheck() {
   if (now - (runArbitrageCheck._lastLog || 0) > 10000) {
     runArbitrageCheck._lastLog = now;
     const mkt = getBestMarket();
-    const lagSamples = impliedHistory.filter(h => { const a=now-h.time; return a>=90000&&a<=150000; }).length;
-    console.log(`[ARB] implied=${implied.toFixed(4)} poly=${poly.toFixed(4)} edge=${(edge*100).toFixed(2)}¢ minEdge=${(dynMinEdge*100).toFixed(2)}¢ lagSamples=${lagSamples} mkt="${mkt?.question?.slice(0,28) ?? 'none'}" active=${state.trading.active} autoTrade=${state.config.autoTrade}`);
-  }
+    console.log(`[ARB] implied=${implied.toFixed(4)} poly=${poly.toFixed(4)} edge=${(edge*100).toFixed(2)}¢ minEdge=${(dynMinEdge*100).toFixed(2)}¢ mkt="${mkt?.question?.slice(0,28) ?? 'none'}" active=${state.trading.active} autoTrade=${state.config.autoTrade}`);  }
 
   // Only track edges above 50% of minEdge — prevents noise ticks from polluting
   // the stability window and breaking hasStableEdge between valid signals
@@ -912,7 +843,7 @@ function openPosition(signal) {
 
   // Minimum market volume: same threshold as LIVE ($50k)
   // Below this, spread is too wide and fills are unreliable
-  const MIN_VOL = state.config.mode === 'SIM' ? 5000 : 50000;
+  const MIN_VOL = 50000; // same threshold in SIM and LIVE — below $50k spread is too wide
   if (vol < MIN_VOL && !marketId.startsWith('sim-')) {
     console.log(`[CLOB] Skip — market volume $${vol.toLocaleString()} below minimum $${MIN_VOL.toLocaleString()}`);
     return;
@@ -963,59 +894,7 @@ function openPosition(signal) {
   console.log(`[CLOB] OPEN ${side} ${shares}sh @ ${fillOdds.toFixed(3)} | spread=${(fill.spread*100).toFixed(1)}¢ impact=${(fill.impact*100).toFixed(1)}¢ | $${fillSize}${fillNote} | edge ${(edge*100).toFixed(1)}¢`);
 }
 
-// Simulate how position odds evolve for SIM mode
-// KEY FIX: computes ABSOLUTE target from entry, then smoothly moves toward it.
-// Previous bug: added priceImpact to pos.markOdds every tick → mark drifted
-// indefinitely even when BTC price was FLAT, causing massive fake losses.
-function simMarkToMarket(pos) {
-  const elapsed   = Date.now() - pos.entryTime;
-  const progress  = Math.min(1, elapsed / state.config.posTimeoutMs);
-
-  // Cumulative BTC move from entry, capped at ±1.2% (beyond that binary is near 0/1)
-  const rawChange  = pos.btcPriceAtEntry > 0
-    ? (state.btcPrice - pos.btcPriceAtEntry) / pos.btcPriceAtEntry
-    : 0;
-  const cappedChg  = Math.max(-0.02, Math.min(0.02, rawChange));
-  const directional = pos.side === 'BUY_YES' ? cappedChg : -cappedChg;
-
-  // ABSOLUTE target: entry odds + BTC impact
-  // Calibrated for short-term ATM binary (10-15 min): 0.1% BTC → ~5.5¢ binary move
-  // (binary delta near ATM/expiry is ~50, so 0.001 fractional move × 55 = 5.5¢)
-  // Previously was ×12 which needed 0.58% BTC move to hit 14% TP — almost never happened
-  const absTarget  = pos.entryOdds + directional * 55;
-  const clampedTgt = Math.max(0.04, Math.min(0.96, absTarget));
-
-  // Time decay: odds converge toward likely resolution based on directional momentum
-  // Use directional (not target vs entry) so flat BTC doesn't cause false decay loss
-  const resolution = directional >= 0.002 ? 0.68 : directional <= -0.002 ? 0.32 : 0.50;
-  const decayedTgt = clampedTgt + (resolution - clampedTgt) * progress * 0.12;
-
-  // Smooth approach: mark moves 20% toward absolute target each 500ms tick
-  // This prevents jumps and allows SL/TP to trigger at correct levels
-  const smoothed   = pos.markOdds + (decayedTgt - pos.markOdds) * 0.55;
-
-  // Tiny noise: ±0.15¢ per tick (realistic price discovery)
-  const noise = (Math.random() - 0.5) * 0.003;
-  return Math.max(0.03, Math.min(0.97, smoothed + noise));
-}
-
-// ── SIM MARKET PRICE EVOLUTION ──────────────────────────────────────────────
-// updateSimMarketPrices: keeps sim market outcomePrices stable for display/scoring.
-// Poly odds are now computed from impliedHistory (hard lag), NOT from outcomePrices.
-// This function just keeps the market display prices roughly in sync with BTC.
-function updateSimMarketPrices() {
-  if (state.config.mode !== 'SIM' || state.markets.length === 0) return;
-  // Use a stable mid-price for display (keeps markets near 0.5 for getBestMarket scoring)
-  const cur = computeImpliedProb();
-  const display = Math.round(Math.max(0.30, Math.min(0.70, cur)) * 1000) / 1000;
-  for (const m of state.markets.filter(m => !m.live)) {
-    if (!m.outcomePrices) m.outcomePrices = [0.5, 0.5];
-    // Very slow drift toward display price — just for the UI market list
-    const next = m.outcomePrices[0] + (display - m.outcomePrices[0]) * 0.05;
-    m.outcomePrices[0] = Math.round(Math.max(0.30, Math.min(0.70, next)) * 1000) / 1000;
-    m.outcomePrices[1] = Math.round((1 - m.outcomePrices[0]) * 1000) / 1000;
-  }
-}
+// ── POSITION CLOSE ───────────────────────────────────────────────────────────────
 
 function closePosition(pos, exitOdds, reason) {
   pos.status      = 'CLOSED';
@@ -1024,11 +903,20 @@ function closePosition(pos, exitOdds, reason) {
   pos.closeTime   = Date.now();
   pos.holdMs      = pos.closeTime - pos.entryTime;
 
-  // P&L = (exitOdds - entryOdds) × shares
-  const rawPnl   = (exitOdds - pos.entryOdds) * pos.shares;
+  // Apply CLOB exit spread (selling at BID = mid − half-spread) — identical in SIM and LIVE.
+  // clobSpread() returns the half-spread (distance from mid to ask/bid).
+  const market = state.markets.find(m => m.id === pos.marketId);
+  const exitSpread    = clobSpread(Number(market?.volume || 0));
+  const effectiveExit = Math.max(0.01, exitOdds - exitSpread);
+
+  // P&L = (effectiveExit − entryOdds) × shares
+  const rawPnl   = (effectiveExit - pos.entryOdds) * pos.shares;
   const grossPnl = Math.round(rawPnl * 100) / 100;
-  // Polymarket 2% protocol fee on gross winnings only (losses are never charged)
-  const fee      = grossPnl > 0 ? Math.round(grossPnl * POLY_FEE_RATE * 100) / 100 : 0;
+  // Polymarket 2% protocol fee is ONLY deducted at settlement (market resolves to 0 or 1).
+  // TP / SL / MANUAL are CLOB early-sells — no settlement fee applies.
+  // A TIMEOUT is treated as a settlement only when odds confirm resolution (≥0.95 or ≤0.05).
+  const isSettlement = reason === 'TIMEOUT' && (exitOdds >= 0.95 || exitOdds <= 0.05);
+  const fee = (grossPnl > 0 && isSettlement) ? Math.round(grossPnl * POLY_FEE_RATE * 100) / 100 : 0;
   const pnl      = Math.round((grossPnl - fee) * 100) / 100;
   const outcome  = pnl >= 0 ? 'WIN' : 'LOSS';
 
@@ -1088,8 +976,12 @@ function monitorPositions() {
   if (open.length === 0) return;
 
   for (const pos of open) {
-    // Update mark price
-    const newMark  = state.config.mode === 'SIM' ? simMarkToMarket(pos) : pos.markOdds;
+    // Update mark price from real Polymarket market odds (re-polled every 90s from Gamma API).
+    // Identical for SIM and LIVE: mark = current YES or NO mid-price from the market.
+    const mktForPos = state.markets.find(m => m.id === pos.marketId);
+    const yesOdds   = mktForPos?.outcomePrices?.[0] ?? pos.markOdds;
+    const midOdds   = pos.side === 'BUY_YES' ? yesOdds : (1 - yesOdds);
+    const newMark   = Math.max(0.03, Math.min(0.97, midOdds));
     pos.markOdds   = newMark;
     pos.pnlPct     = Math.round(((newMark - pos.entryOdds) / pos.entryOdds) * 10000) / 100;
     pos.unrealizedPnl = Math.round((newMark - pos.entryOdds) * pos.shares * 100) / 100;
@@ -1428,10 +1320,9 @@ server.listen(PORT, async () => {
   await loadBinanceHistory();
   connectBinance();
   await fetchBTCMarkets();
-  // Refresh markets every 90s — ensures fresh prices and valid expiry windows
+  // Refresh markets every 90s — ensures fresh Polymarket prices and valid expiry windows.
+  // This natural polling lag (90s) mirrors Polymarket's real update cycle for both SIM and LIVE.
   setInterval(fetchBTCMarkets, 90 * 1000);
-  // SIM mode: evolve market prices every 2s to simulate Polymarket's repricing lag
-  setInterval(updateSimMarketPrices, 2000);
   // Binance REST fallback every 2s when WS is down — keeps priceHistory dense
   setInterval(pollBinanceRest, 2000);
   // Position monitor — 150ms for fast TP/SL response
