@@ -296,23 +296,10 @@ async function pollBinanceRest() {
       broadcastMarketData();
     }
   } catch (e) {
-    // REST also failing — generate synthetic price movement so bot keeps running
-    const now = Date.now();
-    if (state.btcPrice > 0 && now - lastBroadcastTs >= 2000) {
-      const drift  = (Math.random() - 0.499) * 0.0008;
-      const noise  = (Math.random() - 0.5)   * 0.0002;
-      state.btcPrice = Math.round(state.btcPrice * (1 + drift + noise) * 100) / 100;
-      state.priceHistory.push({ price: state.btcPrice, time: now });
-      state.priceHistory = state.priceHistory.filter(p => now - p.time <= PRICE_HIST_MS);
-      updateCandle(state.btcPrice, now);
-      state.priceSource = 'sim';
-      if (state.trading.active && now - lastArbCheckTs >= 500) {
-        lastArbCheckTs = now;
-        runArbitrageCheck();
-      }
-      lastBroadcastTs = now;
-      broadcastMarketData();
-    }
+    // REST also failing — do NOT generate synthetic prices; keep last known price stale
+    // (trading will not advance without a real price tick, preserving SIM fidelity)
+    state.priceSource = 'unavailable';
+    console.warn('[Binance REST] Both WS and REST unavailable – holding last price, no trades fired');
   }
 }
 
@@ -414,13 +401,11 @@ async function loadBinanceHistory() {
       });
       currentPrice       = parseFloat(data.price) || currentPrice;
       state.btcPrice     = currentPrice;
-      // Seed a minimal priceHistory so the bot can start immediately
+      // Seed a single real price point — no synthetic noise
+      // The bot will populate priceHistory organically from Binance WS/REST ticks
       const now = Date.now();
-      state.priceHistory = Array.from({ length: 60 }, (_, i) => ({
-        time:  now - (60 - i) * 1000,
-        price: currentPrice * (1 + (Math.random() - 0.5) * 0.0002),
-      }));
-      console.log(`[Binance] Emergency seed: price=$${currentPrice}`);
+      state.priceHistory = [{ time: now, price: currentPrice }];
+      console.log(`[Binance] Emergency seed: price=$${currentPrice} (waiting for real ticks)`);
     } catch (_) { /* keep default state */ }
   }
 }
@@ -670,26 +655,18 @@ function computeBinaryMid(market, btcOverride) {
 }
 
 // computeEdge: computes implied, poly and edge for a GIVEN market.
-// Both sides use the same market and the same formula (computeBinaryMid),
-// with different BTC timestamps:
-//   implied = f(BTC_now)      — real-time fair value
-//   poly    = f(BTC_lagMs_ago) — stale price (mirrors Gamma API lag)
-//   edge    = implied - poly  — purely driven by BTC moves, symmetric
+//   implied = computeBinaryMid(market, BTC_now) — our binary option model fair value
+//   poly    = market.outcomePrices[0]           — ACTUAL Polymarket price
+//               • live markets: from Gamma API (polled every 90s)
+//               • sim markets:  from updateSimMarketPrices() using lagged BTC
+//   edge    = implied - poly  — our model's mispricing vs what Polymarket offers
 //
-// BTC rose last lagMs ms → implied > poly → edge > 0 → BUY_YES
-// BTC fell last lagMs ms → implied < poly → edge < 0 → BUY_NO
-// BTC flat               → edge ≈ 0       → no trade
-//
-// IMPORTANT: entry/exit prices still use outcomePrices[0] (real CLOB price).
+// implied > poly → market underprices YES → BUY_YES
+// implied < poly → market overprices  YES → BUY_NO
 function computeEdge(market) {
   if (!market) return { implied: 0.5, poly: 0.5, edge: 0 };
-  // Lag window: use all available history up to 90s.
-  // getPriceAt finds the closest real data point — safe even at boot.
-  const LAG_EDGE_MS = Math.min(90000, Math.max(5000, (state.priceHistory.length > 0
-    ? Date.now() - state.priceHistory[0].time
-    : 0) * 0.8));
-  const implied = computeBinaryMid(market);                       // BTC_now
-  const poly    = computeBinaryMid(market, getPriceAt(LAG_EDGE_MS)); // BTC_lagMs_ago
+  const implied = computeBinaryMid(market);          // our model: fair value at BTC_now
+  const poly    = market.outcomePrices?.[0] ?? 0.5; // real market price (Gamma API or sim)
   return { implied, poly, edge: implied - poly };
 }
 
