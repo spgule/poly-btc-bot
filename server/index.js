@@ -622,7 +622,15 @@ function getBestMarket() {
   if (scored.length === 0) {
     // No real markets qualify — use simulated markets in SIM mode so the engine can trade
     if (state.config.mode === 'SIM') {
-      if (!state.markets.some(m => m.id && m.id.startsWith('sim-'))) seedSimMarkets();
+      // Find a usable sim market (price not too skewed — otherwise edge ≈ 0 at extremes)
+      const usableSim = state.markets.find(m =>
+        m.id && m.id.startsWith('sim-') &&
+        Math.abs((m.outcomePrices?.[0] ?? 0.5) - 0.5) <= 0.42
+      );
+      if (!usableSim) {
+        // All sim markets are deeply skewed or missing — re-seed with fresh ATM markets
+        seedSimMarkets();
+      }
       return state.markets.find(m => m.id && m.id.startsWith('sim-')) || state.markets[0];
     }
     return null;
@@ -961,11 +969,13 @@ function openPosition(signal) {
 function updateSimMarketPrices() {
   if (!state.btcPrice || state.btcPrice <= 0) return;
 
-  // Auto-refresh sim markets if none are valid (expired or never seeded).
-  // This ensures the engine always has a fallback market to trade in SIM mode.
+  // Auto-refresh sim markets if none are valid (expired, never seeded, or deeply skewed).
+  // A deeply skewed market (YES > 0.85 or < 0.15) has near-zero binary option sensitivity
+  // to BTC moves — edge stays at ~0¢ and no trades are generated. Re-seed immediately.
   const nowMs = Date.now();
   const activeSims = state.markets.filter(m => !m.live && m.endDate && new Date(m.endDate).getTime() > nowMs + 60000);
-  if (activeSims.length === 0) seedSimMarkets();
+  const usableSims = activeSims.filter(m => Math.abs((m.outcomePrices?.[0] ?? 0.5) - 0.5) <= 0.35);
+  if (activeSims.length === 0 || usableSims.length === 0) seedSimMarkets();
   if (state.markets.length === 0) return;
 
   // Sim markets must mirror the same ~90s lag as the Gamma API has for live markets.
