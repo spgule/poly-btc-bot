@@ -16,6 +16,11 @@ Qualquer mudança neste arquivo deve preservar as seguintes regras:
 9. computePolyOdds(): Retorna market.outcomePrices[0] direto para ambos os modos.
 10. computeEdge(): poly = market.outcomePrices[0] — nunca computar poly a partir do histórico BTC.
 ================================================================================
+
+PRICE FEED LOCK (2026-05-03)
+Do not modify Binance/Railway price feed, fallback, candle, chart hydration, or
+cache behavior without explicit user approval in the current conversation.
+Read PRICE_FEED_LOCK.md before touching this area.
 */
 const express = require('express');
 const cors    = require('cors');
@@ -1712,16 +1717,19 @@ function monitorPositions() {
   }
 
   for (const pos of open) {
-    // Update mark price from real Polymarket market odds (re-polled every 90s from Gamma API).
-    // Identical for SIM and LIVE: mark = current YES or NO mid-price from the market.
     const mktForPos = state.markets.find(m => m.id === pos.marketId);
-    // Mark = current CLOB mid price from the market object.
-    // For sim markets: updated every 2s by updateSimMarketPrices() via binary option model.
-    // For live markets: updated every 90s by fetchBTCMarkets() from Gamma API.
-    // This is the price at which the CLOB currently quotes — the only price you can exit at.
-    const yesOdds = mktForPos?.outcomePrices?.[0] ?? pos.markOdds;
-    const midOdds = pos.side === 'BUY_YES' ? yesOdds : (1 - yesOdds);
-    const newMark = Math.max(0.03, Math.min(0.97, midOdds));
+    if (!mktForPos) continue;
+
+    // Mark open positions off the current BTC-driven model, not only the last
+    // Polymarket snapshot. Live market snapshots can stay stale for long enough
+    // to make P&L, percentages, TP/SL and timeout exits look frozen in the UI.
+    const modelYesOdds = computeBinaryMid(mktForPos, state.btcPrice);
+    const quotedYesOdds = mktForPos.outcomePrices?.[0];
+    const effectiveYesOdds = Number.isFinite(modelYesOdds) ? modelYesOdds : quotedYesOdds;
+    const midOdds = pos.side === 'BUY_YES'
+      ? effectiveYesOdds
+      : (1 - effectiveYesOdds);
+    const newMark = Math.max(0.03, Math.min(0.97, midOdds ?? pos.markOdds));
     pos.markOdds   = newMark;
 
     // TP/SL are based on movement from the entry MID price, not from the fill price.
