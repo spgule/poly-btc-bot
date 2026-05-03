@@ -135,6 +135,7 @@ const BINANCE_WS_URLS = [
   'wss://stream.binance.us:443/ws/btcusdt@trade',
 ];
 const BINANCE_REST_URLS = [
+  'https://data-api.binance.vision/api/v3',
   'https://api.binance.com/api/v3',
   'https://api.binance.us/api/v3',
 ];
@@ -471,13 +472,15 @@ function connectBinance() {
   if (binanceTimer) { clearTimeout(binanceTimer); binanceTimer = null; }
   const wsUrl = BINANCE_WS_URLS[wsUrlIndex % BINANCE_WS_URLS.length];
   const ws = new WebSocket(wsUrl);
+  let socketOpenedAt = 0;
+  let sawRealTick = false;
 
   ws.on('open', () => {
-    state.binanceConnected = true;
-    // Do not mark source as Binance until the first real tick is received.
-    // Some environments connect but receive no messages.
+    socketOpenedAt = Date.now();
+    state.binanceConnected = false;
+    // Only mark Binance as connected after the first real trade tick.
     console.log(`[Binance WS] Connected: ${wsUrl}`);
-    broadcast({ type: 'CONNECTION', data: { binanceConnected: true, priceSource: state.priceSource } });
+    broadcast({ type: 'CONNECTION', data: { binanceConnected: false, priceSource: state.priceSource } });
   });
 
   ws.on('message', (raw) => {
@@ -485,7 +488,9 @@ function connectBinance() {
       const msg = JSON.parse(raw);
       const price = parseFloat(msg.p);
       if (!price || isNaN(price)) return;
+      sawRealTick = true;
       lastWsMsgTs = Date.now();   // heartbeat
+      state.binanceConnected = true;
       state.btcPrice = price;
       state.priceSource = 'binance';
       const now = Date.now();
@@ -517,7 +522,9 @@ function connectBinance() {
   // the Railway proxy silently dropped the connection — force reconnect.
   let heartbeatGuardFired = false;
   const heartbeatGuard = setInterval(() => {
-    if (state.binanceConnected && Date.now() - lastWsMsgTs > 15000) {
+    const noFirstTick = socketOpenedAt > 0 && !sawRealTick && Date.now() - socketOpenedAt > 10000;
+    const staleAfterTick = sawRealTick && Date.now() - lastWsMsgTs > 15000;
+    if (noFirstTick || staleAfterTick) {
       console.warn('[Binance WS] No message in 15s – forcing reconnect');
       state.binanceConnected = false;
       wsUrlIndex = (wsUrlIndex + 1) % BINANCE_WS_URLS.length;
@@ -531,8 +538,8 @@ function connectBinance() {
   // Single close handler — prevents double-reconnect from duplicate listeners
   ws.on('close', () => {
     clearInterval(heartbeatGuard);
+    state.binanceConnected = false;
     if (!heartbeatGuardFired) {
-      state.binanceConnected = false;
       broadcast({ type: 'CONNECTION', data: { binanceConnected: false, priceSource: 'binance-rest' } });
       console.log('[Binance WS] Disconnected – reconnecting in 4s');
       wsUrlIndex = (wsUrlIndex + 1) % BINANCE_WS_URLS.length;
