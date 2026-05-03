@@ -113,6 +113,8 @@ const BINANCE_WS     = 'wss://stream.binance.com:443/ws/btcusdt@trade';
 const BINANCE_REST   = 'https://api.binance.com/api/v3';
 const POLY_GAMMA     = 'https://gamma-api.polymarket.com';
 const LAG_MS         = 2700;   // Polymarket average update lag
+let _idSeq = 0; // Monotonic counter — prevents Date.now() collisions at SIM 10 Hz
+const nextId = (prefix) => `${prefix}-${Date.now()}-${++_idSeq}`;
 const PRICE_HIST_MS  = 300000; // 5 minutes of price history for charts
 const POLY_FEE_RATE  = 0.02;   // Polymarket: 2% protocol fee on gross winnings (applied at settlement)
 const CANDLE_SEC     = 5;      // 5-second OHLCV candles for TradingView-style chart
@@ -258,17 +260,28 @@ function connectBinance() {
 
   // Heartbeat guard: if WS appears connected but no message arrives in 15s,
   // the Railway proxy silently dropped the connection — force reconnect.
+  let heartbeatGuardFired = false;
   const heartbeatGuard = setInterval(() => {
     if (state.binanceConnected && Date.now() - lastWsMsgTs > 15000) {
       console.warn('[Binance WS] No message in 15s – forcing reconnect');
       state.binanceConnected = false;
       clearInterval(heartbeatGuard);
-      try { ws.terminate(); } catch (_) {}
+      heartbeatGuardFired = true;
       binanceTimer = setTimeout(connectBinance, 1000);
+      try { ws.terminate(); } catch (_) {}
     }
   }, 5000);
 
-  ws.on('close', () => clearInterval(heartbeatGuard));
+  ws.on('close', () => {
+    clearInterval(heartbeatGuard);
+    // heartbeatGuard already set binanceTimer + logged — skip double-reconnect
+    if (!heartbeatGuardFired) {
+      state.binanceConnected = false;
+      broadcast({ type: 'CONNECTION', data: { binanceConnected: false, priceSource: 'binance-rest' } });
+      console.log('[Binance WS] Disconnected – reconnecting in 4s');
+      binanceTimer = setTimeout(connectBinance, 4000);
+    }
+  });
 }
 
 // ── BINANCE REST FALLBACK (no API key required) ─────────────────────────────
@@ -537,7 +550,7 @@ async function fetchBTCMarkets() {
             prices = [0.5, 0.5];
           }
         }
-        if (!prices.every(p => isFinite(p) && p >= 0 && p <= 1)) prices = [0.5, 0.5];
+        if (!Array.isArray(prices) || prices.length < 2 || !prices.every(p => isFinite(p) && p >= 0 && p <= 1)) prices = [0.5, 0.5];
       } catch { prices = [0.5, 0.5]; }
 
       const q = (m.question || m.title || '').toLowerCase();
@@ -560,6 +573,18 @@ async function fetchBTCMarkets() {
         clobTokenIds: m.clobTokenIds || [],
         live: true,
         _score: score,
+        priceIsEstimated,
+        // Snapshot BTC price at market window open (used as strike for Up/Down markets).
+        // Capture while priceHistory is still fresh — getPriceAt() only has 5 min depth.
+        _strikeSnapshot: (() => {
+          if (!upOrDown) return null;
+          const windowOpenMs = (m.startDate || m.startDateIso)
+            ? new Date(m.startDate || m.startDateIso).getTime() : 0;
+          if (windowOpenMs > 0 && windowOpenMs <= Date.now()) {
+            return getPriceAt(Date.now() - windowOpenMs) || null;
+          }
+          return null;
+        })(),
       };
     }
 
@@ -636,27 +661,31 @@ function recentVolatility(msWindow = 30000) {
 
 // Edge velocity: is the edge currently OPENING (positive) or CLOSING (negative)?
 // Only enter when edge is expanding — avoids chasing edges that already peaked.
+// Uses relative window (last half vs first half of recent history) so it works
+// correctly at both 10 Hz (WS) and 0.5 Hz (REST fallback) tick rates.
 function edgeVelocity() {
-  if (state.edgeHistory.length < 4) return 0;
-  const now    = Date.now();
-  const recent = state.edgeHistory.filter(e => now - e.time <=  800);
-  const older  = state.edgeHistory.filter(e => now - e.time >   800 && now - e.time <= 2000);
-  if (recent.length === 0 || older.length === 0) return 0;
+  const h = state.edgeHistory;
+  if (h.length < 4) return 0;
+  const mid = Math.ceil(h.length / 2);
+  const recent = h.slice(mid);
+  const older  = h.slice(0, mid);
   const rAvg = recent.reduce((s, e) => s + Math.abs(e.edge), 0) / recent.length;
   const oAvg = older.reduce((s, e)  => s + Math.abs(e.edge), 0) / older.length;
   return rAvg - oAvg; // positive = edge growing, negative = edge shrinking
 }
 
-// Edge quality: ratio of consistent-direction samples in recent window.
+// Edge quality: ratio of consistent-direction samples in recent 1/3 of history.
 // 1.0 = all samples agree, 0.5 = random noise.
 function edgeQuality(edge) {
-  const now    = Date.now();
-  const recent = state.edgeHistory.filter(e => now - e.time <= 2000 && Math.abs(e.edge) > 0.005);
-  if (recent.length < 3) return 0.5;
-  const bull   = recent.filter(e => e.edge > 0).length;
-  const bear   = recent.filter(e => e.edge < 0).length;
+  const h = state.edgeHistory;
+  if (h.length < 3) return 0.5;
+  const recentSlice = h.slice(-Math.max(3, Math.ceil(h.length / 3)));
+  const significant = recentSlice.filter(e => Math.abs(e.edge) > 0.005);
+  if (significant.length < 2) return 0.5;
+  const bull     = significant.filter(e => e.edge > 0).length;
+  const bear     = significant.filter(e => e.edge < 0).length;
   const dominant = Math.max(bull, bear);
-  return dominant / recent.length; // 0.5–1.0
+  return dominant / significant.length; // 0.5–1.0
 }
 
 // Best market to trade: prefer short-term + highest edge potential
@@ -672,6 +701,8 @@ function getBestMarket() {
     const msLeft = m.endDate ? new Date(m.endDate).getTime() - now : 10 * 60000;
     const minLeft = msLeft / 60000;
     if (minLeft < minMinutes || minLeft > maxMinutes) return { m, score: -1 };
+    // Block markets with no real price data — would generate false signals against 0.5
+    if (m.priceIsEstimated) return { m, score: -1 };
     // Prefer short-term (5–30 min window) for momentum arb
     const timeScore = minLeft <= 30 ? 3 : minLeft <= 60 ? 2 : minLeft <= 1440 ? 1 : 0;
     const volScore  = m.volume >= 100000 ? 2 : m.volume >= 20000 ? 1 : 0;
@@ -737,8 +768,12 @@ function computeBinaryMid(market, btcOverride) {
     const windowOpenMs = market.startDate ? new Date(market.startDate).getTime() : 0;
     const nowMs = Date.now();
     if (windowOpenMs > 0 && windowOpenMs <= nowMs) {
-      // Window is open — use BTC at window start as reference price
-      strike = getPriceAt(nowMs - windowOpenMs) || state.priceHistory[0]?.price || btc;
+      // Window is open — use snapshotted strike if available (more accurate than
+      // getPriceAt which is limited to 5-min history depth)
+      strike = market._strikeSnapshot
+        || getPriceAt(nowMs - windowOpenMs)
+        || state.priceHistory[0]?.price
+        || btc;
     } else {
       // Window hasn't started yet — oldest price in priceHistory is best proxy
       strike = (state.priceHistory.length > 0 ? state.priceHistory[0].price : null) || btc;
@@ -1092,8 +1127,11 @@ function openPosition(signal) {
   if (state.positions.filter(p => p.status === 'OPEN').length >= state.config.maxOpenPos) return;
 
   // Find the correct market by ID, fallback to best-scored market
-  const market = state.markets.find(m => m.id === marketId) || getBestMarket() || state.markets[0];
-  if (!market) return;
+  const market = state.markets.find(m => m.id === marketId);
+  if (!market) {
+    console.warn(`[CLOB] Stale marketId ${marketId} — market no longer in state, signal expired`);
+    return;
+  }
 
   // ── REAL CLOB CONSTRAINTS (applied in both SIM and LIVE) ──────────────────
   const vol = Number(market.volume || 0);
@@ -1120,7 +1158,7 @@ function openPosition(signal) {
   const shares   = Math.round(fillSize / fillOdds * 100) / 100;
 
   const pos = {
-    id:               `p-${Date.now()}`,
+    id:               nextId('p'),
     marketId,
     question:         (question || 'BTC Market').slice(0, 60),
     side,
@@ -1345,6 +1383,8 @@ function _legacySimTrade_unused(signal) {
 function broadcastMarketData() {
   const mkt            = getBestMarket();
   const { implied, poly, edge } = computeEdge(mkt);
+  // Send only live tick + current candle. Full candle history (300 candles ~39KB)
+  // is fetched by the 3s HTTP pollCandles — do NOT resend every 150ms WS tick.
   broadcast({
     type: 'MARKET_DATA',
     data: {
@@ -1356,7 +1396,6 @@ function broadcastMarketData() {
       edge,
       edgeHistory:  state.edgeHistory.slice(-80),
       priceChart:   state.priceChart.slice(-100),
-      candles:      state.candles.slice(-300),
       currentCandle:state.currentCandle,
       priceSource:  state.priceSource,
       timestamp:    Date.now(),
@@ -1566,14 +1605,17 @@ app.get('/api/prices',  (req, res) => res.json({
   change24h: state.btcChange24h,
   source:  state.priceSource,
 }));
-app.get('/api/candles', (req, res) => res.json({
-  candles:       state.candles.slice(-300),
-  currentCandle: state.currentCandle,
-  edgeHistory:   state.edgeHistory.slice(-80),
-  impliedProb:   computeImpliedProb(),
-  polyOdds:      computePolyOdds(),
-  edge:          computeImpliedProb() - computePolyOdds(),
-}));
+app.get('/api/candles', (req, res) => {
+  const { implied, poly, edge } = computeEdge(getBestMarket());
+  res.json({
+    candles:       state.candles.slice(-300),
+    currentCandle: state.currentCandle,
+    edgeHistory:   state.edgeHistory.slice(-80),
+    impliedProb:   implied,
+    polyOdds:      poly,
+    edge,
+  });
+});
 
 // ── WEBSOCKET ─────────────────────────────────────────────────────────────────
 // SPA catch-all: serve index.html for any non-API route when dist exists
@@ -1596,15 +1638,16 @@ wss.on('connection', (ws) => {
   console.log('[WS] Client connected');
   ws.isAlive = true;
   ws.on('pong', () => { ws.isAlive = true; });
-  // Burst initial state
+  // Burst initial state — use single getBestMarket() call so implied/poly/edge are consistent
+  const { implied: initImp, poly: initPly, edge: initEdg } = computeEdge(getBestMarket());
   ws.send(JSON.stringify({ type: 'STATUS',  data: buildStatusPayload() }));
   ws.send(JSON.stringify({ type: 'MARKETS', data: state.markets }));
   ws.send(JSON.stringify({ type: 'TRADES_HISTORY', data: state.trading.trades.slice(0, 200) }));
   ws.send(JSON.stringify({ type: 'POSITIONS', data: state.positions.filter(p => p.status === 'OPEN') }));
   ws.send(JSON.stringify({ type: 'MARKET_DATA', data: {
     btcPrice: state.btcPrice, btcChange24h: state.btcChange24h,
-    laggedPrice: getPriceAt(LAG_MS), impliedProb: computeImpliedProb(),
-    polyOdds: computePolyOdds(), edge: computeImpliedProb() - computePolyOdds(),
+    laggedPrice: getPriceAt(LAG_MS), impliedProb: initImp,
+    polyOdds: initPly, edge: initEdg,
     edgeHistory: state.edgeHistory.slice(-80),
     priceChart: state.priceChart.slice(-100),
     candles: state.candles.slice(-300),

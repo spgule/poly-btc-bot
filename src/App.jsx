@@ -12,7 +12,7 @@ import {
   XAxis, YAxis, Tooltip, ResponsiveContainer, ReferenceLine, Cell,
 } from 'recharts';
 import { cn } from './lib/utils';
-import { api, getWsUrl } from './services/api';
+import { api, getWsUrl, BASE } from './services/api';
 import ConfigModal from './components/ConfigModal';
 import CandleChart from './components/CandleChart';
 
@@ -130,7 +130,7 @@ function useBot() {
         const [st, mkts, prices] = await Promise.all([
           api.getStatus(),
           api.getMarkets(),
-          fetch('/api/prices').then(r => r.json()).catch(() => null),
+          fetch(BASE + '/api/prices').then(r => r.json()).catch(() => null),
         ]);
         if (st)     setStatus(st);
         if (mkts)   setMarkets(mkts);
@@ -178,7 +178,8 @@ function useBot() {
       ws.onerror   = () => ws.close();
       ws.onmessage = (ev) => {
         if (destroyed) return;
-        const msg = JSON.parse(ev.data);
+        let msg;
+        try { msg = JSON.parse(ev.data); } catch { return; }
         switch (msg.type) {
           case 'MARKET_DATA':
             setMarket(d => ({ ...d, ...msg.data }));

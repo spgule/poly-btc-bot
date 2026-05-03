@@ -10,6 +10,7 @@ function sanitizeBase(raw) {
 const BASE = sanitizeBase(
   typeof __VITE_API_URL__ !== 'undefined' ? __VITE_API_URL__ : ''
 );
+export { BASE };
 
 // WebSocket URL derived from BASE (https → wss, http → ws, empty → same host)
 export function getWsUrl() {
