@@ -148,6 +148,7 @@ const BINANCE_REST_URLS = [
   'https://api.binance.us/api/v3',
 ];
 const POLY_GAMMA     = 'https://gamma-api.polymarket.com';
+const POLY_CLOB_WSS  = 'wss://ws-subscriptions-clob.polymarket.com/ws/market';
 const LAG_MS         = 2700;   // Polymarket average update lag
 const WS_STALE_MS    = 7000;   // If no WS tick in this window, treat feed as stale
 let _idSeq = 0; // Monotonic counter — prevents Date.now() collisions at SIM 10 Hz
@@ -194,7 +195,7 @@ const state = {
     active:        false,
     trades:        [],
     lastTradeTs:   0,
-    cooldownMs:    500,    // 500ms cooldown — high-frequency scalping mode
+    cooldownMs:    2000,   // CLOB-safe minimum cooldown shared by SIM and LIVE
   },
 
   positions:        [],   // open/recently closed positions
@@ -216,6 +217,14 @@ const state = {
   lastPriceChartTs: 0,
   candles:          [],   // closed 5s OHLCV candles ({ time (s), open, high, low, close, ticks })
   currentCandle:    null, // currently forming 5s candle
+  polyLive: {
+    marketId:     null,
+    marketIds:    [],
+    assetIds:     [],
+    connected:    false,
+    lastEventTs:  0,
+    assetBooks:   {},
+  },
 };
 
 // ── PRICE CHART SAMPLER ───────────────────────────────────────────────────────
@@ -244,6 +253,64 @@ function seedMinimalChartState(price, now = Date.now(), priceSource = state.pric
     ticks: 1,
     volume: 0,
   };
+}
+
+function parseClobTokenIds(raw) {
+  if (Array.isArray(raw)) return raw.map(String).filter(Boolean);
+  if (typeof raw === 'string') {
+    try {
+      const parsed = JSON.parse(raw);
+      if (Array.isArray(parsed)) return parsed.map(String).filter(Boolean);
+    } catch (_) {
+      return raw.split(',').map(s => s.trim()).filter(Boolean);
+    }
+  }
+  return [];
+}
+
+function clampProb(value) {
+  return Math.max(0.03, Math.min(0.97, value));
+}
+
+function getPolyAssetBook(assetId) {
+  return state.polyLive.assetBooks[String(assetId)] || null;
+}
+
+function getPolyDisplayPrice(assetId) {
+  const book = getPolyAssetBook(assetId);
+  if (!book) return null;
+  const bid = Number(book.bestBid);
+  const ask = Number(book.bestAsk);
+  const last = Number(book.lastTrade);
+  const hasBidAsk = Number.isFinite(bid) && Number.isFinite(ask) && bid >= 0 && ask > 0 && ask >= bid;
+  if (hasBidAsk) {
+    const midpoint = (bid + ask) / 2;
+    if (ask - bid > 0.10 && Number.isFinite(last)) return clampProb(last);
+    return clampProb(midpoint);
+  }
+  if (Number.isFinite(last)) return clampProb(last);
+  if (Number.isFinite(bid) && bid > 0) return clampProb(bid);
+  if (Number.isFinite(ask) && ask > 0) return clampProb(ask);
+  return null;
+}
+
+function applyPolyLivePrices() {
+  for (const market of state.markets) {
+    if (!market.live) continue;
+    const assetIds = parseClobTokenIds(market.clobTokenIds).slice(0, 2);
+    if (assetIds.length < 2) continue;
+    const yesPrice = getPolyDisplayPrice(assetIds[0]);
+    const noPrice = getPolyDisplayPrice(assetIds[1]);
+    const resolvedYes = Number.isFinite(yesPrice)
+      ? yesPrice
+      : Number.isFinite(noPrice)
+        ? 1 - noPrice
+        : null;
+    if (!Number.isFinite(resolvedYes)) continue;
+    const roundedYes = Math.round(clampProb(resolvedYes) * 1000) / 1000;
+    market.outcomePrices = [roundedYes, Math.round((1 - roundedYes) * 1000) / 1000];
+    market.priceIsEstimated = false;
+  }
 }
 
 function candleBucketSec(timestampMs) {
@@ -556,6 +623,178 @@ function connectBinance() {
   });
 }
 
+let polyMarketWs = null;
+let polyMarketPingTimer = null;
+let polyMarketReconnectTimer = null;
+
+function getDesiredPolyLiveMarket() {
+  const marketIds = [];
+  const assetIds = [];
+  const pushMarket = (market) => {
+    if (!market || !market.live || marketIds.includes(market.id)) return;
+    const ids = parseClobTokenIds(market.clobTokenIds).slice(0, 2);
+    if (ids.length < 2) return;
+    marketIds.push(market.id);
+    for (const id of ids) {
+      if (!assetIds.includes(id)) assetIds.push(id);
+    }
+  };
+
+  for (const pos of state.positions.filter(p => p.status === 'OPEN')) {
+    pushMarket(state.markets.find(m => m.id === pos.marketId));
+  }
+  pushMarket(getBestMarket());
+
+  if (assetIds.length === 0) return null;
+  return { marketId: marketIds[0], marketIds, assetIds };
+}
+
+function updatePolyAssetBook(assetId, patch) {
+  const key = String(assetId);
+  const current = state.polyLive.assetBooks[key] || {};
+  state.polyLive.assetBooks[key] = {
+    ...current,
+    ...patch,
+    updatedAt: Date.now(),
+  };
+  state.polyLive.lastEventTs = Date.now();
+}
+
+function refreshPolyLiveMarket() {
+  applyPolyLivePrices();
+  if (state.trading.active && state.priceHistory.length >= 3) runArbitrageCheck();
+  if (Date.now() - lastBroadcastTs >= 200) {
+    lastBroadcastTs = Date.now();
+    broadcastMarketData();
+  }
+}
+
+function subscribePolyMarket(assetIds, operation = null) {
+  if (!polyMarketWs || polyMarketWs.readyState !== WebSocket.OPEN || assetIds.length === 0) return;
+  const payload = operation
+    ? { operation, assets_ids: assetIds, custom_feature_enabled: true }
+    : { type: 'market', assets_ids: assetIds, custom_feature_enabled: true };
+  polyMarketWs.send(JSON.stringify(payload));
+}
+
+function clearPolyMarketPing() {
+  if (polyMarketPingTimer) {
+    clearInterval(polyMarketPingTimer);
+    polyMarketPingTimer = null;
+  }
+}
+
+function connectPolyMarketWs() {
+  if (polyMarketWs && [WebSocket.OPEN, WebSocket.CONNECTING].includes(polyMarketWs.readyState)) return;
+  const desired = getDesiredPolyLiveMarket();
+  if (!desired) return;
+
+  polyMarketWs = new WebSocket(POLY_CLOB_WSS);
+
+  polyMarketWs.on('open', () => {
+    state.polyLive.connected = true;
+    state.polyLive.marketId = desired.marketId;
+    state.polyLive.marketIds = desired.marketIds;
+    state.polyLive.assetIds = desired.assetIds;
+    state.polyLive.assetBooks = {};
+    subscribePolyMarket(desired.assetIds);
+    clearPolyMarketPing();
+    polyMarketPingTimer = setInterval(() => {
+      if (polyMarketWs?.readyState === WebSocket.OPEN) polyMarketWs.send('PING');
+    }, 10000);
+    console.log(`[Polymarket CLOB] Subscribed markets=${desired.marketIds.join(',')} assets=${desired.assetIds.join(',')}`);
+  });
+
+  polyMarketWs.on('message', (raw) => {
+    const text = raw.toString();
+    if (text === 'PONG') return;
+    let msg = null;
+    try { msg = JSON.parse(text); } catch (_) { return; }
+    if (!msg || !msg.event_type) return;
+
+    if (msg.event_type === 'book') {
+      updatePolyAssetBook(msg.asset_id, {
+        bestBid: parseFloat(msg.bids?.[0]?.price ?? NaN),
+        bestAsk: parseFloat(msg.asks?.[0]?.price ?? NaN),
+      });
+      refreshPolyLiveMarket();
+      return;
+    }
+
+    if (msg.event_type === 'best_bid_ask') {
+      updatePolyAssetBook(msg.asset_id, {
+        bestBid: parseFloat(msg.best_bid ?? NaN),
+        bestAsk: parseFloat(msg.best_ask ?? NaN),
+      });
+      refreshPolyLiveMarket();
+      return;
+    }
+
+    if (msg.event_type === 'price_change' && Array.isArray(msg.price_changes)) {
+      for (const change of msg.price_changes) {
+        updatePolyAssetBook(change.asset_id, {
+          bestBid: parseFloat(change.best_bid ?? NaN),
+          bestAsk: parseFloat(change.best_ask ?? NaN),
+        });
+      }
+      refreshPolyLiveMarket();
+      return;
+    }
+
+    if (msg.event_type === 'last_trade_price') {
+      updatePolyAssetBook(msg.asset_id, {
+        lastTrade: parseFloat(msg.price ?? NaN),
+      });
+      refreshPolyLiveMarket();
+    }
+  });
+
+  polyMarketWs.on('close', () => {
+    clearPolyMarketPing();
+    state.polyLive.connected = false;
+    polyMarketWs = null;
+    if (polyMarketReconnectTimer) clearTimeout(polyMarketReconnectTimer);
+    polyMarketReconnectTimer = setTimeout(connectPolyMarketWs, 3000);
+  });
+
+  polyMarketWs.on('error', (err) => {
+    console.warn('[Polymarket CLOB] WS error:', err.message);
+  });
+}
+
+function syncPolyMarketSubscription() {
+  const desired = getDesiredPolyLiveMarket();
+  if (!desired) {
+    state.polyLive.marketId = null;
+    state.polyLive.marketIds = [];
+    state.polyLive.assetIds = [];
+    if (polyMarketWs?.readyState === WebSocket.OPEN) {
+      try { polyMarketWs.close(); } catch (_) {}
+    }
+    return;
+  }
+
+  const sameMarket = desired.marketId === state.polyLive.marketId;
+  const sameMarkets = desired.marketIds.join(',') === state.polyLive.marketIds.join(',');
+  const sameAssets = desired.assetIds.join(',') === state.polyLive.assetIds.join(',');
+
+  if (!polyMarketWs || polyMarketWs.readyState === WebSocket.CLOSED) {
+    connectPolyMarketWs();
+    return;
+  }
+
+  if (polyMarketWs.readyState !== WebSocket.OPEN) return;
+  if (sameMarket && sameMarkets && sameAssets) return;
+
+  if (state.polyLive.assetIds.length > 0) subscribePolyMarket(state.polyLive.assetIds, 'unsubscribe');
+  state.polyLive.marketId = desired.marketId;
+  state.polyLive.marketIds = desired.marketIds;
+  state.polyLive.assetIds = desired.assetIds;
+  state.polyLive.assetBooks = {};
+  subscribePolyMarket(desired.assetIds, 'subscribe');
+  console.log(`[Polymarket CLOB] Switched markets=${desired.marketIds.join(',')}`);
+}
+
 // ── BINANCE REST FALLBACK (no API key required) ─────────────────────────────
 async function pollBinanceRest() {
   // If WS is stale (connected but no ticks), keep price alive via REST/fallbacks.
@@ -709,7 +948,9 @@ async function loadBinanceHistory() {
       }
       // Keep only last 5 minutes (PRICE_HIST_MS)
       const cutoff = Date.now() - PRICE_HIST_MS;
-      state.priceHistory = syntheticPoints.filter(p => p.time >= cutoff);
+      state.priceHistory = klines1m
+        .map(k => ({ time: Number(k[0]), price: parseFloat(k[4]) }))
+        .filter(p => p.time >= cutoff);
 
       // Fallback seed until we can fetch real 1s klines.
       buildApproxCandlesFrom1mKlines(klines1m, cutoff);
@@ -775,7 +1016,9 @@ async function loadBinanceHistory() {
           }
         }
         const cutoff = Date.now() - PRICE_HIST_MS;
-        state.priceHistory = syntheticPoints.filter(p => p.time >= cutoff);
+        state.priceHistory = klines1m
+          .map(k => ({ time: Number(k[0]) * 1000, price: parseFloat(k[4]) }))
+          .filter(p => p.time >= cutoff);
 
         buildApproxCandlesFrom1mKlines(
           klines1m.map(k => [Number(k[0]) * 1000, k[1], k[2], k[3], k[4], k[6] ?? k[5] ?? 0]),
@@ -895,7 +1138,7 @@ async function fetchBTCMarkets() {
         volume: (isFinite(parsedVol) && parsedVol > 0) ? Math.round(parsedVol) : 0,
         startDate: m.startDate || m.startDateIso || null,
         endDate: m.endDateIso || m.endDate || m.end_date_iso,
-        clobTokenIds: m.clobTokenIds || [],
+        clobTokenIds: parseClobTokenIds(m.clobTokenIds || m.clob_token_ids || m.asset_ids || []),
         live: true,
         _score: score,
         priceIsEstimated,
@@ -919,6 +1162,7 @@ async function fetchBTCMarkets() {
 
     const existingSim = state.markets.filter(m => m.id && m.id.startsWith('sim-'));
     state.markets = [...mapped, ...existingSim];
+    applyPolyLivePrices();
     const top = mapped[0];
     console.log(`[Polymarket] Loaded ${mapped.length} real BTC markets | top: "${top.question}" price=${top.outcomePrices[0]} vol=$${top.volume.toLocaleString()}`);
     broadcast({ type: 'MARKETS', data: state.markets });
@@ -1040,12 +1284,9 @@ function getBestMarket() {
     const yesPrice  = m.outcomePrices?.[0] ?? 0.5;
     const priceDist = Math.abs(yesPrice - 0.5);
     if (priceDist > 0.42) return { m, score: -1 }; // YES > 0.92 or < 0.08 — exclude
-    // Volume threshold: "Up or Down" short-term binaries have low volume at creation
-    // ($1k–$15k) — they accumulate volume near expiry. Accept them with $1k minimum.
-    // Other live markets keep the $50k threshold (CLOB fills are infeasible below that).
     const q = (m.question || '').toLowerCase();
     const isUpOrDown = /up or down/.test(q);
-    const minVol = isUpOrDown ? 1000 : 50000;
+    const minVol = 50000;
     if (m.live && Number(m.volume || 0) < minVol) return { m, score: -1 };
     // Prefer markets nearer to 0.5 (more uncertainty = larger edge swings possible)
     const priceScore = priceDist < 0.10 ? 3 : priceDist < 0.25 ? 2 : priceDist < 0.40 ? 1 : 0;
@@ -1115,16 +1356,15 @@ function computeBinaryMid(market, btcOverride) {
   const hoursLeft = Math.max(1 / 3600, msLeft / 3600000); // min 1 second
 
   // Realized vol (1-min window) scaled to per-hour
-  const realizedVol = recentVolatility(60000);
-  const volPerHour  = Math.max(0.001, realizedVol * Math.sqrt(3600));
+  const realizedVol = Math.max(0.001, recentVolatility(60000) * Math.sqrt(3600));
 
   // Black-Scholes d2: ln(S/K) / (σ√T)
   // Positive when BTC is above strike, negative when below.
-  const sigmaT = volPerHour * Math.sqrt(hoursLeft);
-  const d2     = Math.log(btc / strike) / Math.max(0.001, sigmaT);
+  const sigmaT = realizedVol * Math.sqrt(hoursLeft);
+  const d1     = Math.log(btc / strike) / Math.max(0.001, sigmaT);
 
   // Logistic CDF ≈ normal CDF Φ(d2)
-  return Math.max(0.03, Math.min(0.97, 1 / (1 + Math.exp(-1.7 * d2))));
+  return clampProb(1 / (1 + Math.exp(-d1)));
 }
 
 // computeEdge: computes implied, poly and edge for a GIVEN market.
@@ -1501,10 +1741,7 @@ function openPosition(signal) {
   // ── REAL CLOB CONSTRAINTS (applied in both SIM and LIVE) ──────────────────
   const vol = Number(market.volume || 0);
 
-  // Minimum market volume: "Up or Down" short-term markets have low volume at creation
-  // but are the primary arb target. Use $1k minimum for them, $50k for all others.
-  const qLower = (market.question || '').toLowerCase();
-  const MIN_VOL = /up or down/.test(qLower) ? 1000 : 50000;
+  const MIN_VOL = 50000;
   if (vol < MIN_VOL && !marketId.startsWith('sim-')) {
     console.log(`[CLOB] Skip — market volume $${vol.toLocaleString()} below minimum $${MIN_VOL.toLocaleString()}`);
     return;
@@ -1582,16 +1819,14 @@ function updateSimMarketPrices() {
   // Sim markets must mirror the same ~90s lag as the Gamma API has for live markets.
   // Use the real BTC price from 90s ago (from priceHistory) — not the current price.
   // This way: implied(BTC now) vs poly(BTC 90s ago) → edge is non-zero when BTC moved.
-  const btcLagged = getPriceAt(90000); // real historical BTC price, 90s ago
+  const btcLagged = state.btcPrice;
 
   for (const m of state.markets) {
     if (m.live) continue; // real markets updated by fetchBTCMarkets every 90s
     if (!m.outcomePrices) m.outcomePrices = [0.5, 0.5];
     // Price with lagged BTC — mirrors Gamma API poll cadence
     const rawProb = computeBinaryMid(m, btcLagged);
-    // Add tiny microstructure noise (\u00b10.3\u00a2)
-    const noise = (Math.random() - 0.5) * 0.003;
-    const newYes = Math.max(0.03, Math.min(0.97, rawProb + noise));
+    const newYes = clampProb(rawProb);
     m.outcomePrices[0] = Math.round(newYes * 1000) / 1000;
     m.outcomePrices[1] = Math.round((1 - m.outcomePrices[0]) * 1000) / 1000;
   }
@@ -1720,12 +1955,7 @@ function monitorPositions() {
     const mktForPos = state.markets.find(m => m.id === pos.marketId);
     if (!mktForPos) continue;
 
-    // Mark open positions off the current BTC-driven model, not only the last
-    // Polymarket snapshot. Live market snapshots can stay stale for long enough
-    // to make P&L, percentages, TP/SL and timeout exits look frozen in the UI.
-    const modelYesOdds = computeBinaryMid(mktForPos, state.btcPrice);
-    const quotedYesOdds = mktForPos.outcomePrices?.[0];
-    const effectiveYesOdds = Number.isFinite(modelYesOdds) ? modelYesOdds : quotedYesOdds;
+    const effectiveYesOdds = mktForPos.outcomePrices?.[0];
     const midOdds = pos.side === 'BUY_YES'
       ? effectiveYesOdds
       : (1 - effectiveYesOdds);
@@ -1962,7 +2192,7 @@ app.post('/api/config', (req, res) => {
   if (maxOpenPos    !== undefined) state.config.maxOpenPos    = Math.min(20, Math.max(1, maxOpenPos));
   // cooldown exposed so UI/config can tune trade frequency
   const { cooldownMs } = req.body;
-  if (cooldownMs    !== undefined) state.trading.cooldownMs   = Math.min(60000, Math.max(100, cooldownMs));
+  if (cooldownMs    !== undefined) state.trading.cooldownMs   = Math.min(60000, Math.max(2000, cooldownMs));
   const { requireStableEdge, allowDuplicateMarkets } = req.body;
   if (requireStableEdge     !== undefined) state.config.requireStableEdge     = Boolean(requireStableEdge);
   if (allowDuplicateMarkets !== undefined) state.config.allowDuplicateMarkets = Boolean(allowDuplicateMarkets);
@@ -2058,6 +2288,11 @@ app.get('/api/debug/feed', (_req, res) => {
     liveMarkets: state.markets.filter(m => m.live).length,
     simMarkets: state.markets.filter(m => !m.live).length,
     bestMarket: getBestMarket()?.question || null,
+    polyLiveMarketId: state.polyLive.marketId,
+    polyLiveMarketIds: state.polyLive.marketIds,
+    polyLiveAssetIds: state.polyLive.assetIds,
+    polyLiveConnected: state.polyLive.connected,
+    polyLiveLastEventTs: state.polyLive.lastEventTs,
     lastPricePoint: state.priceHistory[state.priceHistory.length - 1] || null,
     serverTime: Date.now(),
   });
@@ -2127,7 +2362,7 @@ server.listen(PORT, async () => {
     if (saved.maxOpenPos            !== undefined) c.maxOpenPos            = saved.maxOpenPos;
     if (saved.requireStableEdge     !== undefined) c.requireStableEdge     = saved.requireStableEdge;
     if (saved.allowDuplicateMarkets !== undefined) c.allowDuplicateMarkets = saved.allowDuplicateMarkets;
-    if (saved.cooldownMs            !== undefined) state.trading.cooldownMs = saved.cooldownMs;
+    if (saved.cooldownMs            !== undefined) state.trading.cooldownMs = Math.max(2000, saved.cooldownMs);
   }
   // Session restores balance/stats AFTER config applied — saved progress wins over default capital
   loadSavedSession();
@@ -2144,9 +2379,11 @@ server.listen(PORT, async () => {
   seedSimMarkets();
   connectBinance();
   await fetchBTCMarkets();
+  syncPolyMarketSubscription();
   // Refresh markets every 90s — ensures fresh Polymarket prices and valid expiry windows.
   // This natural polling lag (90s) mirrors Polymarket's real update cycle for both SIM and LIVE.
   setInterval(fetchBTCMarkets, 90 * 1000);
+  setInterval(syncPolyMarketSubscription, 2000);
   // Sim market price model: re-prices non-live markets every 2s using real BTC + binary option math
   setInterval(updateSimMarketPrices, 2000);
   // Binance REST fallback every 2s when WS is down — keeps priceHistory dense
