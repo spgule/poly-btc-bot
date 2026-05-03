@@ -1,4 +1,22 @@
 'use strict';
+/*
+================================================================================
+REGRAS DE FIDELIDADE DE SIMULAÇÃO (NUNCA REVERTER)
+Este projeto exige que o modo SIM seja 100% fiel ao LIVE.
+Qualquer mudança neste arquivo deve preservar as seguintes regras:
+
+1. Preço BTC: 100% real Binance WS. Nunca injetar pontos sintéticos em priceHistory.
+2. Odds Polymarket (mercados reais): Polled do Gamma API a cada 90s. Nunca computar de momentum BTC.
+3. Odds Polymarket (sim fallback): updateSimMarketPrices() a cada 2s — modelo de opção binária: P(BTC_T > strike) = logistic(d1).
+4. Spread de entrada: simulateClobFill(): mid + clobSpread(vol) + priceImpact() — igual em SIM e LIVE.
+5. Spread de saída: closePosition(): effectiveExit = exitOdds - clobSpread(vol) — igual em SIM e LIVE.
+6. Volume mínimo: MIN_VOL = $50k para SIM e LIVE.
+7. Taxa Polymarket 2%: Somente no settlement (TIMEOUT, odds >= 0.95 ou <= 0.05). Não em TP/SL/MANUAL.
+8. Cooldown: Math.max(cooldownMs, 2000) — mínimo 2s entre trades.
+9. computePolyOdds(): Retorna market.outcomePrices[0] direto para ambos os modos.
+10. computeEdge(): poly = market.outcomePrices[0] — nunca computar poly a partir do histórico BTC.
+================================================================================
+*/
 const express = require('express');
 const cors    = require('cors');
 const WebSocket = require('ws');
@@ -126,6 +144,7 @@ const state = {
   priceHistory:  [],      // { price, time } – last PRICE_HIST_MS ms
   priceChart:    [],      // sampled 1/sec, last 300 pts – sent to chart
   edgeHistory:   [],      // { time, edge, implied, poly } for edge chart
+  volHistory:    [],      // { qty, isSell, time } for VPIN toxicity
 
   config: {
     mode: 'SIM',
@@ -146,11 +165,14 @@ const state = {
   },
 
   trading: {
-    active:      false,
-    balance:     1000,
-    startBalance:1000,
-    peakBalance: 1000,
-    trades:      [],
+    balance:       1000,
+    startBalance:  1000,
+    peakBalance:   1000,
+    peakBalanceDay: 0,
+    peakBalanceMonth: 0,
+    pausedUntil:   0,
+    pauseReason:   null,
+    active:        false,
     lastTradeTs: 0,
     cooldownMs:  500,    // 500ms cooldown — high-frequency scalping mode
   },
@@ -231,6 +253,10 @@ function connectBinance() {
       lastWsMsgTs = Date.now();   // heartbeat
       state.btcPrice = price;
       const now = Date.now();
+      const qty = parseFloat(msg.q || 0);
+      const isSell = msg.m === true;
+      state.volHistory.push({ qty, isSell, time: now });
+      state.volHistory = state.volHistory.filter(v => now - v.time <= 60000); // 60s window
       state.priceHistory.push({ price, time: now });
       state.priceHistory = state.priceHistory.filter(p => now - p.time <= PRICE_HIST_MS);
       addChartPoint(price, now);
@@ -874,16 +900,29 @@ function kellySize(edge, winProb, entryPrice, balance, maxBetPct) {
   const scaled    = Math.max(0, fullKelly * kFrac);
   const streak    = state.stats.streak;
   // Adaptive sizing from MrFadiAi: -20% per consecutive loss, +10% per consecutive win, cap 2.5×
-  const sMult     = streak < -1
-    ? Math.max(0.4, Math.pow(0.80, Math.abs(streak) - 1))   // shrink on losing streak
-    : streak > 1
-      ? Math.min(2.5, Math.pow(1.10, streak - 1))            // grow on winning streak
+  const sMult     = streak < 0
+    ? Math.max(0.2, Math.pow(0.80, Math.abs(streak)))       // -20% per loss
+    : streak > 0
+      ? Math.min(2.5, Math.pow(1.10, streak))               // +10% per win
       : 1.0;
   const vol       = recentVolatility(20000);
   const vMult     = vol > 0.003 ? 0.70 : vol > 0.0015 ? 0.85 : 1.0;
   const capped    = Math.min(scaled, maxBetPct / 100) * sMult * vMult;
   const raw       = Math.round(balance * capped * 100) / 100;
   return raw >= 2 ? raw : 0;
+}
+
+function computeVPIN() {
+  const now = Date.now();
+  let buyVol = 0, sellVol = 0;
+  for (const v of state.volHistory) {
+    if (now - v.time <= 60000) {
+      if (v.isSell) sellVol += v.qty;
+      else buyVol += v.qty;
+    }
+  }
+  const totalVol = buyVol + sellVol;
+  return totalVol === 0 ? 0 : Math.abs(buyVol - sellVol) / totalVol;
 }
 
 function isGoodEntry(edge) {
@@ -903,6 +942,12 @@ function isGoodEntry(edge) {
 function hasStableEdge(edge) { return isGoodEntry(edge); }
 
 function runArbitrageCheck() {
+  // 4-layer loss limit check
+  if (state.trading.pausedUntil > Date.now()) {
+    state.currentSignal = null;
+    return;
+  }
+
   // ── Single getBestMarket() call per tick ─────────────────────────────────
   // CRITICAL: getBestMarket() must be called ONCE here. Calling it separately
   // inside computeImpliedProb() and computePolyOdds() can return different
@@ -1015,19 +1060,35 @@ function runArbitrageCheck() {
     return broadcastSignal();
   }
 
-  // 2. BTC DIRECTIONAL CONFIRMATION
-  // BTC trend (last 10s) must not be strongly OPPOSING our bet direction.
-  // Prevents buying YES while BTC is in a sharp downtrend, and vice versa.
-  // Only blocked when counter-trend > 5bps in 10s AND edge < 3× minimum.
-  const btc10sAgo   = getPriceAt(10000);
-  const btcTrend10s = btc10sAgo > 0 ? (state.btcPrice - btc10sAgo) / btc10sAgo : 0;
-  const counterFlow = side === 'BUY_YES' ? btcTrend10s < -0.0005 : btcTrend10s > 0.0005;
-  if (counterFlow && Math.abs(edge) < dynMinEdge * 3) {
+  // 2. VPIN TOXICITY
+  // VPIN = |buyVol-sellVol|/totalVol; se > 0.75 → pausar entradas
+  const vpin = computeVPIN();
+  if (vpin > 0.75) {
     state.currentSignal = null;
     return broadcastSignal();
   }
 
-  // 3. ADVERSE SELECTION COOLDOWN
+  // 3. SPIKE DETECTION & MULTI-SIGNAL CONFIRMATION
+  // Spike detection: se |BTC move em 3s| > 15bps (0.0015) → entrada DipArb imediata
+  const btc3sAgo = getPriceAt(3000);
+  const btcSpike = btc3sAgo > 0 ? Math.abs(state.btcPrice - btc3sAgo) / btc3sAgo : 0;
+  const isSpike = btcSpike > 0.0015;
+
+  // Multi-signal: exigir 2-de-3 sinais concordando
+  const btc10sAgo   = getPriceAt(10000);
+  const btcTrend10s = btc10sAgo > 0 ? (state.btcPrice - btc10sAgo) / btc10sAgo : 0;
+  const trendMatches = side === 'BUY_YES' ? btcTrend10s > 0 : btcTrend10s < 0;
+  const velOk = edgeVelocity() > 0.001;
+  const edgeOk = Math.abs(edge) >= dynMinEdge;
+
+  const confirmedSignals = [trendMatches, velOk, edgeOk].filter(Boolean).length;
+  
+  if (confirmedSignals < 2 && !isSpike) {
+    state.currentSignal = null;
+    return broadcastSignal();
+  }
+
+  // 4. ADVERSE SELECTION COOLDOWN
   // If ≥3 of the last 5 closed trades were losses, pause new auto-entries for 60s.
   // Signals the bot may be in a toxic-flow regime. (gamma-trade-lab pattern)
   const last5 = state.trading.trades.slice(0, 5);
@@ -1246,7 +1307,7 @@ function closePosition(pos, exitOdds, reason) {
   // Apply CLOB exit spread (selling at BID = mid − half-spread) — identical in SIM and LIVE.
   // clobSpread() returns the half-spread (distance from mid to ask/bid).
   const market = state.markets.find(m => m.id === pos.marketId);
-  const exitSpread    = clobSpread(Number(market?.volume || 0));
+  const exitSpread    = reason === 'MERGE' ? 0 : clobSpread(Number(market?.volume || 0));
   const effectiveExit = Math.max(0.01, exitOdds - exitSpread);
 
   // P&L = (effectiveExit − entryOdds) × shares
@@ -1263,6 +1324,25 @@ function closePosition(pos, exitOdds, reason) {
   // Return cost + net PnL to balance
   state.trading.balance     = Math.round((state.trading.balance + pos.cost + pnl) * 100) / 100;
   state.trading.peakBalance = Math.max(state.trading.peakBalance, state.trading.balance);
+
+  if (!state.trading.peakBalanceDay) state.trading.peakBalanceDay = state.trading.balance;
+  if (!state.trading.peakBalanceMonth) state.trading.peakBalanceMonth = state.trading.balance;
+
+  state.trading.peakBalanceDay = Math.max(state.trading.peakBalanceDay, state.trading.balance);
+  state.trading.peakBalanceMonth = Math.max(state.trading.peakBalanceMonth, state.trading.balance);
+
+  const dayDrawdown = (state.trading.peakBalanceDay - state.trading.balance) / state.trading.peakBalanceDay;
+  const monthDrawdown = (state.trading.peakBalanceMonth - state.trading.balance) / state.trading.peakBalanceMonth;
+
+  if (monthDrawdown > 0.15 && state.trading.pausedUntil <= Date.now()) {
+    state.trading.pausedUntil = Date.now() + 30 * 24 * 60 * 60 * 1000;
+    state.trading.pauseReason = '15% Monthly Drawdown';
+    console.log('[Risk] Monthly drawdown limit reached. Paused for 30d.');
+  } else if (dayDrawdown > 0.05 && state.trading.pausedUntil <= Date.now()) {
+    state.trading.pausedUntil = Date.now() + 60 * 60 * 1000;
+    state.trading.pauseReason = '5% Daily Drawdown';
+    console.log('[Risk] Daily drawdown limit reached. Paused for 60m.');
+  }
 
   state.stats.totalTrades++;
   state.stats.totalPnl  = Math.round((state.stats.totalPnl  + pnl) * 100) / 100;
@@ -1315,6 +1395,24 @@ function closePosition(pos, exitOdds, reason) {
 function monitorPositions() {
   const open = state.positions.filter(p => p.status === 'OPEN');
   if (open.length === 0) return;
+
+  // Position merging YES+NO — quando tiver os dois lados do mesmo mercado, merge para resgatar $1.00
+  const byMarket = {};
+  for (const p of open) {
+    if (!byMarket[p.marketId]) byMarket[p.marketId] = [];
+    byMarket[p.marketId].push(p);
+  }
+  for (const mId in byMarket) {
+    const group = byMarket[mId];
+    const yesPos = group.find(p => p.side === 'BUY_YES');
+    const noPos = group.find(p => p.side === 'BUY_NO');
+    if (yesPos && noPos) {
+      console.log(`[MERGE] Merging YES and NO positions for market ${mId} to redeem $1.00 per pair`);
+      closePosition(yesPos, 0.5, 'MERGE');
+      closePosition(noPos, 0.5, 'MERGE');
+      return; // Array modified, let next tick handle the rest
+    }
+  }
 
   for (const pos of open) {
     // Update mark price from real Polymarket market odds (re-polled every 90s from Gamma API).
@@ -1734,6 +1832,7 @@ server.listen(PORT, async () => {
   const msToMidnight = new Date().setUTCHours(24, 0, 0, 0) - Date.now();
   setTimeout(function resetDay() {
     state.stats.todayPnl = 0;
+    state.trading.peakBalanceDay = state.trading.balance; // Reset daily peak limit
     broadcastStatus();
     setTimeout(resetDay, 86400000);
   }, msToMidnight);
