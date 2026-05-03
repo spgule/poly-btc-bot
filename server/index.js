@@ -127,8 +127,8 @@ function saveConfig() {
 // ── CONSTANTS ─────────────────────────────────────────────────────────────────
 const PORT           = process.env.PORT || 3001;
 // Port 443 works through Railway's proxy; port 9443 is blocked
-const BINANCE_WS     = 'wss://stream.binance.com:443/ws/btcusdt@trade';
-const BINANCE_REST   = 'https://api.binance.com/api/v3';
+const BINANCE_WS     = 'wss://stream.binance.us:443/ws/btcusdt@trade';
+const BINANCE_REST   = 'https://api.binance.us/api/v3';
 const POLY_GAMMA     = 'https://gamma-api.polymarket.com';
 const LAG_MS         = 2700;   // Polymarket average update lag
 let _idSeq = 0; // Monotonic counter — prevents Date.now() collisions at SIM 10 Hz
