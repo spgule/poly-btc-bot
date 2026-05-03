@@ -60,6 +60,7 @@ function saveSession() {
       startBalance: state.trading.startBalance,
       peakBalance:  state.trading.peakBalance,
       stats:        state.stats,
+      active:       state.trading.active,
     };
     fs.writeFileSync(SESSION_FILE, JSON.stringify(s, null, 2), 'utf8');
   } catch (e) { console.warn('[Session] Failed to save session:', e.message); }
@@ -72,6 +73,7 @@ function loadSavedSession() {
       if (s.balance      !== undefined) state.trading.balance      = s.balance;
       if (s.startBalance !== undefined) state.trading.startBalance = s.startBalance;
       if (s.peakBalance  !== undefined) state.trading.peakBalance  = s.peakBalance;
+      if (s.active       !== undefined) state.trading.active       = s.active;
       // Stats overridden by loadSavedTrades — only apply if no trades file
       if (!fs.existsSync(TRADES_FILE) && s.stats) Object.assign(state.stats, s.stats);
       console.log(`[Session] Restored balance: $${state.trading.balance}`);
@@ -1245,6 +1247,7 @@ app.post('/api/bot/start', (req, res) => {
   state.trading.active      = true;
   state.trading.lastTradeTs = 0;    // reset cooldown — first trade can fire immediately
   // NOTE: do NOT override autoTrade here — respect user config from settings
+  saveSession();
   broadcastStatus();
   // Run an immediate check so UI sees signal right away
   if (state.priceHistory.length >= 3) runArbitrageCheck();
@@ -1255,6 +1258,7 @@ app.post('/api/bot/stop', (req, res) => {
   if (!state.trading.active) return res.json({ success: true, active: false }); // idempotent
   state.trading.active  = false;
   state.currentSignal   = null;
+  saveSession();
   broadcastStatus();
   broadcastSignal();
   res.json({ success: true, active: false });
@@ -1411,6 +1415,15 @@ server.listen(PORT, async () => {
   }
   // Session restores balance/stats AFTER config applied — saved progress wins over default capital
   loadSavedSession();
+
+  // Auto-resume: if autoTrade was enabled when the server last ran, restart trading automatically.
+  // This ensures a Railway redeploy / crash-restart resumes without manual intervention.
+  if (state.config.autoTrade) {
+    state.trading.active      = true;
+    state.trading.lastTradeTs = 0; // reset cooldown so first trade fires immediately
+    console.log('[Bot] Auto-resumed: autoTrade=true in saved config');
+  }
+
   await loadBinanceHistory();
   connectBinance();
   await fetchBTCMarkets();
