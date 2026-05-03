@@ -759,7 +759,7 @@ function EdgeChartBody({ market }) {
         </ResponsiveContainer>
       ) : (
         <div style={{ height: '100%', display: 'flex', alignItems: 'center', justifyContent: 'center', color: 'var(--t2)', fontSize: 10 }}>
-          Inicie o bot para ver o edge ao vivo
+          Aguardando dados de mercado…
         </div>
       )}
     </div>

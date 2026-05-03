@@ -119,7 +119,7 @@ const CANDLE_SEC     = 5;      // 5-second OHLCV candles for TradingView-style c
 
 // ── STATE ─────────────────────────────────────────────────────────────────────
 const state = {
-  btcPrice:      97000,
+  btcPrice:      0,
   btcChange24h:  0,       // % change last 24h
   priceHistory:  [],      // { price, time } – last PRICE_HIST_MS ms
   priceChart:    [],      // sampled 1/sec, last 300 pts – sent to chart
@@ -297,35 +297,68 @@ async function pollBinanceRest() {
       broadcastMarketData();
     }
   } catch (e) {
-    // Binance REST also failed — try CoinGecko as last resort (Railway IPs sometimes
-    // get blocked by Binance; CoinGecko is a reliable independent fallback)
+    // Binance REST failed — try fallback price sources (Railway IPs sometimes blocked by Binance)
+    // Throttle: only call external fallbacks at most once every 10s to avoid rate limits
+    const nowFb = Date.now();
+    if (nowFb - (pollBinanceRest._lastFallback || 0) < 10000) return;
+    pollBinanceRest._lastFallback = nowFb;
+
+    // Fallback 1: CoinGecko (free, no auth, ~10 req/min safe)
+    let fbPrice = null;
+    let fbSource = 'unavailable';
     try {
       const { data: cgData } = await axios.get(
         'https://api.coingecko.com/api/v3/simple/price',
         { params: { ids: 'bitcoin', vs_currencies: 'usd' }, timeout: 5000 }
       );
-      const cgPrice = cgData?.bitcoin?.usd;
-      if (cgPrice && !isNaN(cgPrice)) {
-        state.btcPrice   = cgPrice;
-        state.priceSource = 'coingecko';
-        const now = Date.now();
-        state.priceHistory.push({ price: cgPrice, time: now });
-        state.priceHistory = state.priceHistory.filter(p => now - p.time <= PRICE_HIST_MS);
-        addChartPoint(cgPrice, now);
-        updateCandle(cgPrice, now);
-        if (state.trading.active && now - lastArbCheckTs >= 2000) {
-          lastArbCheckTs = now;
-          runArbitrageCheck();
-        }
-        if (now - lastBroadcastTs >= 2000) {
-          lastBroadcastTs = now;
-          broadcastMarketData();
-        }
-        return;
+      const p = cgData?.bitcoin?.usd;
+      if (p && !isNaN(p) && p > 1000) { fbPrice = p; fbSource = 'coingecko'; }
+    } catch (_) { /* try next */ }
+
+    // Fallback 2: Kraken public ticker (no auth, usually accessible from cloud)
+    if (!fbPrice) {
+      try {
+        const { data: krData } = await axios.get(
+          'https://api.kraken.com/0/public/Ticker',
+          { params: { pair: 'XBTUSD' }, timeout: 5000 }
+        );
+        const p = parseFloat(krData?.result?.XXBTZUSD?.c?.[0]);
+        if (p && !isNaN(p) && p > 1000) { fbPrice = p; fbSource = 'kraken'; }
+      } catch (_) { /* try next */ }
+    }
+
+    // Fallback 3: Coinbase public price (no auth)
+    if (!fbPrice) {
+      try {
+        const { data: cbData } = await axios.get(
+          'https://api.coinbase.com/v2/prices/BTC-USD/spot',
+          { timeout: 5000 }
+        );
+        const p = parseFloat(cbData?.data?.amount);
+        if (p && !isNaN(p) && p > 1000) { fbPrice = p; fbSource = 'coinbase'; }
+      } catch (_) { /* all fallbacks failed */ }
+    }
+
+    if (fbPrice) {
+      state.btcPrice    = fbPrice;
+      state.priceSource = fbSource;
+      const now = Date.now();
+      state.priceHistory.push({ price: fbPrice, time: now });
+      state.priceHistory = state.priceHistory.filter(p => now - p.time <= PRICE_HIST_MS);
+      addChartPoint(fbPrice, now);
+      updateCandle(fbPrice, now);
+      if (state.trading.active && now - lastArbCheckTs >= 2000) {
+        lastArbCheckTs = now;
+        runArbitrageCheck();
       }
-    } catch (_) { /* CoinGecko also down */ }
-    state.priceSource = 'unavailable';
-    console.warn('[Binance REST] Both WS and REST unavailable – holding last price, no trades fired');
+      if (now - lastBroadcastTs >= 2000) {
+        lastBroadcastTs = now;
+        broadcastMarketData();
+      }
+    } else {
+      state.priceSource = 'unavailable';
+      console.warn('[Price] Binance WS + REST + CoinGecko + Kraken + Coinbase all unavailable');
+    }
   }
 }
 
@@ -852,12 +885,10 @@ function runArbitrageCheck() {
     console.log(`[ARB] implied=${implied.toFixed(4)} poly=${poly.toFixed(4)} edge=${(edge*100).toFixed(2)}¢ minEdge=${(dynMinEdge*100).toFixed(2)}¢ mkt="${market.question?.slice(0,28)}" active=${state.trading.active} autoTrade=${state.config.autoTrade}`);
   }
 
-  // Only track edges above 50% of minEdge — prevents noise ticks from polluting
-  // the stability window and breaking hasStableEdge between valid signals
-  if (Math.abs(edge) >= dynMinEdge * 0.5) {
-    state.edgeHistory.push({ time: now, edge, implied, poly });
-    if (state.edgeHistory.length > 80) state.edgeHistory.shift();
-  }
+  // Always record edge history so the Binance-vs-Poly chart is always populated.
+  // The stability window (hasStableEdge) filters by minEdge separately below.
+  state.edgeHistory.push({ time: now, edge, implied, poly });
+  if (state.edgeHistory.length > 80) state.edgeHistory.shift();
 
   if (Math.abs(edge) < dynMinEdge) {
     state.currentSignal = null;
