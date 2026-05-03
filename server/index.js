@@ -802,11 +802,34 @@ function runArbitrageCheck() {
   const canTrade  = openCount < state.config.maxOpenPos;
   // Stability check is optional — disable for high-frequency scalping
   const stableOk  = !state.config.requireStableEdge || isGoodEntry(edge);
-  // Guard: NEVER open a position in the opposite direction to an existing open one
-  // (self-canceling trades destroy edge and stack losses)
-  const hasOpposite = state.positions.some(p =>
-    p.status === 'OPEN' && p.marketId === market.id && p.side !== side
+
+  // Guard: NEVER open opposite direction on the same market — self-canceling trades.
+  // BUT: if the best market has a conflicting open position, try an alternative market
+  // from the available list so YES and NO entries can both happen simultaneously.
+  let tradeMarket = market;
+  let hasOpposite = state.positions.some(p =>
+    p.status === 'OPEN' && p.marketId === tradeMarket.id && p.side !== side
   );
+  if (hasOpposite) {
+    // Try to find an alternative market without a conflicting position for this side
+    const alternatives = state.markets.filter(m => {
+      if (m.id === tradeMarket.id) return false; // skip primary
+      const priceDist = Math.abs((m.outcomePrices?.[0] ?? 0.5) - 0.5);
+      if (priceDist > 0.42) return false; // skip skewed markets
+      if (m.live && Number(m.volume || 0) < 50000) return false; // volume filter
+      const msLeft = m.endDate ? new Date(m.endDate).getTime() - now : 10 * 60000;
+      if (msLeft < 60000) return false; // must have at least 1 min left
+      return !state.positions.some(p => p.status === 'OPEN' && p.marketId === m.id && p.side !== side);
+    });
+    if (alternatives.length > 0) {
+      tradeMarket = alternatives[0];
+      hasOpposite = false; // cleared — alternative has no conflicting position
+      // Update signal to reflect the alternative market
+      state.currentSignal.marketId = tradeMarket.id;
+      state.currentSignal.question = tradeMarket.question;
+    }
+  }
+
   // Total exposure cap: never risk more than 40% of effective balance across all open positions
   // Use effective balance (cash + open costs) not just cash — otherwise the cap tightens every
   // time a position is opened, eventually blocking all new trades.
