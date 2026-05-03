@@ -126,11 +126,18 @@ function saveConfig() {
 
 // ── CONSTANTS ─────────────────────────────────────────────────────────────────
 const PORT           = process.env.PORT || 3001;
-// Note: Outbound 9443 works on Railway. Binance.us requires 9443 for WS.
-const BINANCE_WS     = 'wss://stream.binance.us:9443/ws/btcusdt@trade';
+// Ordered WS failover list. Some hosts/regions connect to one endpoint but
+// receive no ticks. Rotate automatically until one delivers real messages.
+const BINANCE_WS_URLS = [
+  'wss://stream.binance.us:9443/ws/btcusdt@trade',
+  'wss://stream.binance.com:9443/ws/btcusdt@trade',
+  'wss://stream.binance.com:443/ws/btcusdt@trade',
+  'wss://stream.binance.us:443/ws/btcusdt@trade',
+];
 const BINANCE_REST   = 'https://api.binance.us/api/v3';
 const POLY_GAMMA     = 'https://gamma-api.polymarket.com';
 const LAG_MS         = 2700;   // Polymarket average update lag
+const WS_STALE_MS    = 7000;   // If no WS tick in this window, treat feed as stale
 let _idSeq = 0; // Monotonic counter — prevents Date.now() collisions at SIM 10 Hz
 const nextId = (prefix) => `${prefix}-${Date.now()}-${++_idSeq}`;
 const PRICE_HIST_MS  = 300000; // 5 minutes of price history for charts
@@ -233,17 +240,23 @@ let lastBroadcastTs = 0;
 // ── BINANCE WS FEED ───────────────────────────────────────────────────────────
 let binanceTimer = null;
 let lastWsMsgTs  = 0;   // last time we received a real price tick
+let wsUrlIndex   = 0;
+
+function isWsFresh() {
+  return state.binanceConnected && (Date.now() - lastWsMsgTs <= WS_STALE_MS);
+}
 
 function connectBinance() {
   if (binanceTimer) { clearTimeout(binanceTimer); binanceTimer = null; }
-  const ws = new WebSocket(BINANCE_WS);
+  const wsUrl = BINANCE_WS_URLS[wsUrlIndex % BINANCE_WS_URLS.length];
+  const ws = new WebSocket(wsUrl);
 
   ws.on('open', () => {
     state.binanceConnected = true;
-    state.priceSource = 'binance';
-    lastWsMsgTs = Date.now();
-    console.log('[Binance WS] Connected');
-    broadcast({ type: 'CONNECTION', data: { binanceConnected: true, priceSource: 'binance' } });
+    // Do not mark source as Binance until the first real tick is received.
+    // Some environments connect but receive no messages.
+    console.log(`[Binance WS] Connected: ${wsUrl}`);
+    broadcast({ type: 'CONNECTION', data: { binanceConnected: true, priceSource: state.priceSource } });
   });
 
   ws.on('message', (raw) => {
@@ -253,6 +266,7 @@ function connectBinance() {
       if (!price || isNaN(price)) return;
       lastWsMsgTs = Date.now();   // heartbeat
       state.btcPrice = price;
+      state.priceSource = 'binance';
       const now = Date.now();
       const qty = parseFloat(msg.q || 0);
       const isSell = msg.m === true;
@@ -285,6 +299,7 @@ function connectBinance() {
     if (state.binanceConnected && Date.now() - lastWsMsgTs > 15000) {
       console.warn('[Binance WS] No message in 15s – forcing reconnect');
       state.binanceConnected = false;
+      wsUrlIndex = (wsUrlIndex + 1) % BINANCE_WS_URLS.length;
       clearInterval(heartbeatGuard);
       heartbeatGuardFired = true;
       binanceTimer = setTimeout(connectBinance, 1000);
@@ -299,6 +314,7 @@ function connectBinance() {
       state.binanceConnected = false;
       broadcast({ type: 'CONNECTION', data: { binanceConnected: false, priceSource: 'binance-rest' } });
       console.log('[Binance WS] Disconnected – reconnecting in 4s');
+      wsUrlIndex = (wsUrlIndex + 1) % BINANCE_WS_URLS.length;
       binanceTimer = setTimeout(connectBinance, 4000);
     }
   });
@@ -306,7 +322,8 @@ function connectBinance() {
 
 // ── BINANCE REST FALLBACK (no API key required) ─────────────────────────────
 async function pollBinanceRest() {
-  if (state.binanceConnected) return;
+  // If WS is stale (connected but no ticks), keep price alive via REST/fallbacks.
+  if (isWsFresh()) return;
   try {
     const { data } = await axios.get(`${BINANCE_REST}/ticker/price`, {
       params: { symbol: 'BTCUSDT' },
