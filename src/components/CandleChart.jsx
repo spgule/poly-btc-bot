@@ -104,22 +104,47 @@ export default function CandleChart({ candles = [], currentCandle = null }) {
     const closed  = candlesRef.current;
     const forming = curCandleRef.current;
     const all = forming ? [...closed, forming] : closed;
-    const bars = all
+    const rawBars = all
       .filter(c => c != null)
       .map(c => ({ time: toTime(c.time), open: Number(c.open), high: Number(c.high), low: Number(c.low), close: Number(c.close) }))
       .filter(b => b.time > 0 && !isNaN(b.open) && !isNaN(b.high) && !isNaN(b.low) && !isNaN(b.close));
-    const vols = all
+    const rawVols = all
       .filter(c => c != null)
       .map(c => ({
         time: toTime(c.time), value: Number(c.ticks) || 1,
         color: Number(c.close) >= Number(c.open) ? 'rgba(0,224,130,0.28)' : 'rgba(255,68,102,0.28)',
       }))
       .filter(v => v.time > 0 && !isNaN(v.value));
+
+    // Deduplicate by time and sort
+    const seenTimes = new Set();
+    const bars = [];
+    for (const b of rawBars) {
+      if (!seenTimes.has(b.time)) {
+        seenTimes.add(b.time);
+        bars.push(b);
+      }
+    }
+    bars.sort((a, b) => a.time - b.time);
+
+    const seenVolTimes = new Set();
+    const vols = [];
+    for (const v of rawVols) {
+      if (!seenVolTimes.has(v.time)) {
+        seenVolTimes.add(v.time);
+        vols.push(v);
+      }
+    }
+    vols.sort((a, b) => a.time - b.time);
     if (bars.length === 0) return;
-    seriesRef.current.setData(bars);
-    if (volRef.current) volRef.current.setData(vols);
-    lastChartTimeRef.current = bars[bars.length - 1].time;
-    loadedCountRef.current   = closed.length;
+    try {
+      seriesRef.current.setData(bars);
+      if (volRef.current) volRef.current.setData(vols);
+      lastChartTimeRef.current = bars[bars.length - 1].time;
+      loadedCountRef.current   = closed.length;
+    } catch (e) {
+      console.warn('[Chart] setData failed:', e);
+    }
   }
 
   // â”€â”€ Effect: handle closed candles array changes â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
