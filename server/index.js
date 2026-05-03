@@ -530,6 +530,7 @@ async function fetchBTCMarkets() {
   if (allBtc.length > 0) {
     function mapMarket(m) {
       let prices;
+      let priceIsEstimated = false;
       try {
         if (Array.isArray(m.outcomePrices)) {
           prices = m.outcomePrices.map(Number);
@@ -543,15 +544,19 @@ async function fetchBTCMarkets() {
           const ask  = parseFloat(m.bestAsk  ?? 1);
           if (isFinite(last) && last > 0 && last < 1) {
             prices = [last, 1 - last];
-          } else if (bid > 0 && ask < 1) {
+          } else if (bid > 0 && ask < 1 && bid < ask) {
             const mid = (bid + ask) / 2;
             prices = [mid, 1 - mid];
           } else {
             prices = [0.5, 0.5];
+            priceIsEstimated = true; // no price data — flag to block trading
           }
         }
-        if (!Array.isArray(prices) || prices.length < 2 || !prices.every(p => isFinite(p) && p >= 0 && p <= 1)) prices = [0.5, 0.5];
-      } catch { prices = [0.5, 0.5]; }
+        if (!Array.isArray(prices) || prices.length < 2 || !prices.every(p => isFinite(p) && p >= 0 && p <= 1)) {
+          prices = [0.5, 0.5];
+          priceIsEstimated = true;
+        }
+      } catch { prices = [0.5, 0.5]; priceIsEstimated = true; }
 
       const q = (m.question || m.title || '').toLowerCase();
       // Scoring: short-term "up or down" 5/15-min markets are highest priority
