@@ -13,6 +13,12 @@ function toTime(t) {
   return isFinite(n) && n > 0 ? n : 0;
 }
 
+function candleVolume(candle) {
+  const volume = Number(candle?.volume);
+  if (isFinite(volume) && volume >= 0) return volume;
+  return Number(candle?.ticks) || 1;
+}
+
 export default function CandleChart({ candles = [], currentCandle = null }) {
   const containerRef = useRef(null);
   const chartRef     = useRef(null);
@@ -111,7 +117,7 @@ export default function CandleChart({ candles = [], currentCandle = null }) {
     const rawVols = all
       .filter(c => c != null)
       .map(c => ({
-        time: toTime(c.time), value: Number(c.ticks) || 1,
+        time: toTime(c.time), value: candleVolume(c),
         color: Number(c.close) >= Number(c.open) ? 'rgba(0,224,130,0.28)' : 'rgba(255,68,102,0.28)',
       }))
       .filter(v => v.time > 0 && !isNaN(v.value));
@@ -172,11 +178,11 @@ export default function CandleChart({ candles = [], currentCandle = null }) {
         reloadAll();
       } else {
         try {
-          const o = Number(c.open), h = Number(c.high), l = Number(c.low), cl = Number(c.close), tk = Number(c.ticks) || 1;
+          const o = Number(c.open), h = Number(c.high), l = Number(c.low), cl = Number(c.close), vol = candleVolume(c);
           if (!isNaN(o) && !isNaN(h) && !isNaN(l) && !isNaN(cl)) {
             seriesRef.current.update({ time: t, open: o, high: h, low: l, close: cl });
             if (volRef.current) volRef.current.update({
-              time: t, value: tk,
+              time: t, value: vol,
               color: cl >= o ? 'rgba(0,224,130,0.28)' : 'rgba(255,68,102,0.28)',
             });
             lastChartTimeRef.current = t;
@@ -196,13 +202,13 @@ export default function CandleChart({ candles = [], currentCandle = null }) {
     if (t === 0) return;
 
     try {
-      const o = Number(currentCandle.open), h = Number(currentCandle.high), l = Number(currentCandle.low), cl = Number(currentCandle.close), tk = Number(currentCandle.ticks) || 1;
+      const o = Number(currentCandle.open), h = Number(currentCandle.high), l = Number(currentCandle.low), cl = Number(currentCandle.close), vol = candleVolume(currentCandle);
       if (!isNaN(o) && !isNaN(h) && !isNaN(l) && !isNaN(cl)) {
         // Bootstrap chart with the forming candle when no closed candles exist yet.
         if (loadedCountRef.current === 0 && (!candlesRef.current || candlesRef.current.length === 0)) {
           seriesRef.current.setData([{ time: t, open: o, high: h, low: l, close: cl }]);
           if (volRef.current) volRef.current.setData([{
-            time: t, value: tk,
+            time: t, value: vol,
             color: cl >= o ? 'rgba(0,224,130,0.28)' : 'rgba(255,68,102,0.28)',
           }]);
           lastChartTimeRef.current = t;
@@ -210,7 +216,7 @@ export default function CandleChart({ candles = [], currentCandle = null }) {
         }
         seriesRef.current.update({ time: t, open: o, high: h, low: l, close: cl });
         if (volRef.current) volRef.current.update({
-          time: t, value: tk,
+          time: t, value: vol,
           color: cl >= o ? 'rgba(0,224,130,0.28)' : 'rgba(255,68,102,0.28)',
         });
         if (t > lastChartTimeRef.current) lastChartTimeRef.current = t;

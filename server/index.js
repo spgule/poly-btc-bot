@@ -129,9 +129,9 @@ const PORT           = process.env.PORT || 3001;
 // Ordered WS failover list. Some hosts/regions connect to one endpoint but
 // receive no ticks. Rotate automatically until one delivers real messages.
 const BINANCE_WS_URLS = [
-  'wss://stream.binance.us:9443/ws/btcusdt@trade',
   'wss://stream.binance.com:9443/ws/btcusdt@trade',
   'wss://stream.binance.com:443/ws/btcusdt@trade',
+  'wss://stream.binance.us:9443/ws/btcusdt@trade',
   'wss://stream.binance.us:443/ws/btcusdt@trade',
 ];
 const BINANCE_REST_URLS = [
@@ -218,21 +218,111 @@ function addChartPoint(price, time) {
   }
 }
 
+function candleBucketSec(timestampMs) {
+  return Math.floor(timestampMs / (CANDLE_SEC * 1000)) * CANDLE_SEC;
+}
+
+function pushOrMergeCandle(bucketMap, bucketSec, partial) {
+  if (!bucketMap.has(bucketSec)) {
+    bucketMap.set(bucketSec, {
+      time: bucketSec,
+      open: partial.open,
+      high: partial.high,
+      low: partial.low,
+      close: partial.close,
+      ticks: partial.ticks ?? 1,
+      volume: partial.volume ?? 0,
+    });
+    return;
+  }
+
+  const candle = bucketMap.get(bucketSec);
+  candle.high = Math.max(candle.high, partial.high);
+  candle.low = Math.min(candle.low, partial.low);
+  candle.close = partial.close;
+  candle.ticks += partial.ticks ?? 1;
+  candle.volume += partial.volume ?? 0;
+}
+
+function setCandlesFromBuckets(bucketMap) {
+  const sorted = [...bucketMap.values()].sort((a, b) => a.time - b.time);
+  state.candles = sorted.slice(0, -1);
+  state.currentCandle = sorted[sorted.length - 1] || null;
+}
+
+function buildApproxCandlesFrom1mKlines(klines1m, cutoffMs) {
+  const buckets = new Map();
+  const recentKlines = klines1m.filter(k => Number(k[0]) >= cutoffMs);
+
+  for (const k of recentKlines) {
+    const openTs = Number(k[0]);
+    const open = parseFloat(k[1]);
+    const high = parseFloat(k[2]);
+    const low = parseFloat(k[3]);
+    const close = parseFloat(k[4]);
+    const totalVolume = parseFloat(k[5]) || 0;
+    const stepVolume = totalVolume / 12;
+
+    for (let step = 0; step < 12; step++) {
+      const chunkOpen = openTs + step * CANDLE_SEC * 1000;
+      const progressStart = step / 12;
+      const progressEnd = (step + 1) / 12;
+      const chunkStart = open + (close - open) * progressStart;
+      const chunkEnd = open + (close - open) * progressEnd;
+      const bucketSec = candleBucketSec(chunkOpen);
+
+      const chunkHigh = Math.max(chunkStart, chunkEnd, high);
+      const chunkLow = Math.min(chunkStart, chunkEnd, low);
+      pushOrMergeCandle(buckets, bucketSec, {
+        open: chunkStart,
+        high: chunkHigh,
+        low: chunkLow,
+        close: chunkEnd,
+        ticks: CANDLE_SEC,
+        volume: stepVolume,
+      });
+    }
+  }
+
+  setCandlesFromBuckets(buckets);
+}
+
+function buildRealCandlesFrom1sKlines(klines1s, cutoffMs) {
+  const buckets = new Map();
+  const recent = klines1s.filter(k => Number(k[0]) >= cutoffMs);
+
+  for (const k of recent) {
+    const openTs = Number(k[0]);
+    const bucketSec = candleBucketSec(openTs);
+    pushOrMergeCandle(buckets, bucketSec, {
+      open: parseFloat(k[1]),
+      high: parseFloat(k[2]),
+      low: parseFloat(k[3]),
+      close: parseFloat(k[4]),
+      ticks: 1,
+      volume: parseFloat(k[5]) || 0,
+    });
+  }
+
+  setCandlesFromBuckets(buckets);
+}
+
 // ── OHLCV CANDLE BUILDER ──────────────────────────────────────────────────────────
-function updateCandle(price, now) {
-  const bucket = Math.floor(now / (CANDLE_SEC * 1000)) * CANDLE_SEC; // seconds
+function updateCandle(price, now, volume = 0) {
+  const bucket = candleBucketSec(now); // seconds
   const c = state.currentCandle;
   if (!c || c.time !== bucket) {
     if (c) {
       state.candles.push(c);
       if (state.candles.length > 600) state.candles.shift();
     }
-    state.currentCandle = { time: bucket, open: price, high: price, low: price, close: price, ticks: 1 };
+    state.currentCandle = { time: bucket, open: price, high: price, low: price, close: price, ticks: 1, volume };
   } else {
     c.high  = Math.max(c.high, price);
     c.low   = Math.min(c.low,  price);
     c.close = price;
     c.ticks++;
+    c.volume += volume;
   }
 }
 
@@ -294,7 +384,7 @@ function connectBinance() {
       state.priceHistory.push({ price, time: now });
       state.priceHistory = state.priceHistory.filter(p => now - p.time <= PRICE_HIST_MS);
       addChartPoint(price, now);
-      updateCandle(price, now);
+      updateCandle(price, now, qty);
       if (state.trading.active && now - lastArbCheckTs >= 100) {
         lastArbCheckTs = now;
         runArbitrageCheck();
@@ -352,7 +442,7 @@ async function pollBinanceRest() {
     state.priceHistory.push({ price, time: now });
     state.priceHistory = state.priceHistory.filter(p => now - p.time <= PRICE_HIST_MS);
     addChartPoint(price, now);
-    updateCandle(price, now);
+    updateCandle(price, now, 0);
     state.priceSource = 'binance-rest';
     if (state.trading.active && now - lastArbCheckTs >= 500) {
       lastArbCheckTs = now;
@@ -416,7 +506,7 @@ async function pollBinanceRest() {
       state.priceHistory.push({ price: fbPrice, time: now });
       state.priceHistory = state.priceHistory.filter(p => now - p.time <= PRICE_HIST_MS);
       addChartPoint(fbPrice, now);
-      updateCandle(fbPrice, now);
+      updateCandle(fbPrice, now, 0);
       if (state.trading.active && now - lastArbCheckTs >= 1000) {
         lastArbCheckTs = now;
         runArbitrageCheck();
@@ -466,12 +556,13 @@ async function loadBinanceHistory() {
     if (!historyBase) throw (lastHistoryErr || new Error('Binance history unavailable'));
 
     if (Array.isArray(klines1m) && klines1m.length > 0) {
-      currentPrice = parseFloat(klines1m[klines1m.length - 1][4]);
+      currentPrice = parseFloat(ticker?.lastPrice) || parseFloat(klines1m[klines1m.length - 1][4]);
       state.btcPrice     = currentPrice;
       state.btcChange24h = parseFloat(ticker.priceChangePercent) || 0;
 
       // Build priceChart (1 point per minute)
       state.priceChart = klines1m.map(k => ({ t: Number(k[0]), p: parseFloat(k[4]) }));
+      state.lastPriceChartTs = state.priceChart[state.priceChart.length - 1]?.t || 0;
 
       // Interpolate each 1m kline into 60 synthetic 1s price points
       // Uses linear interpolation open→close within each minute
@@ -493,29 +584,8 @@ async function loadBinanceHistory() {
       const cutoff = Date.now() - PRICE_HIST_MS;
       state.priceHistory = syntheticPoints.filter(p => p.time >= cutoff);
 
-      // Build 5s candles from last 5 minutes of 1m klines
-      const recentKlines = klines1m.filter(k => Number(k[0]) >= cutoff);
-      const buckets = new Map();
-      for (const k of recentKlines) {
-        const openTs = Number(k[0]);
-        for (let i = 0; i < 60; i++) {
-          const ts     = openTs + i * 1000;
-          const price  = parseFloat(k[1]) + (parseFloat(k[4]) - parseFloat(k[1])) * (i / 60);
-          const bucket = Math.floor(ts / (CANDLE_SEC * 1000)) * CANDLE_SEC;
-          if (!buckets.has(bucket)) {
-            buckets.set(bucket, { time: bucket, open: price, high: price, low: price, close: price, ticks: 1 });
-          } else {
-            const c = buckets.get(bucket);
-            c.high  = Math.max(c.high, price);
-            c.low   = Math.min(c.low,  price);
-            c.close = price;
-            c.ticks++;
-          }
-        }
-      }
-      const sorted = [...buckets.values()].sort((a, b) => a.time - b.time);
-      state.candles       = sorted.slice(0, -1);
-      state.currentCandle = sorted[sorted.length - 1] || null;
+      // Fallback seed until we can fetch real 1s klines.
+      buildApproxCandlesFrom1mKlines(klines1m, cutoff);
 
       console.log(`[Binance] History (${historyBase}): ${state.priceHistory.length} pts, ${state.candles.length} candles, price=$${currentPrice}`);
     }
@@ -529,8 +599,18 @@ async function loadBinanceHistory() {
         historyBase
       );
       if (Array.isArray(klines1s) && klines1s.length > 0) {
-        state.priceHistory = klines1s.map(k => ({ time: Number(k[0]), price: parseFloat(k[4]) }));
-        console.log(`[Binance] Upgraded to ${klines1s.length} real 1s klines`);
+        const cutoff = Date.now() - PRICE_HIST_MS;
+        state.priceHistory = klines1s
+          .map(k => ({ time: Number(k[0]), price: parseFloat(k[4]) }))
+          .filter(p => p.time >= cutoff);
+        state.priceChart = klines1s
+          .map(k => ({ t: Number(k[0]), p: parseFloat(k[4]) }))
+          .filter(p => p.t >= cutoff);
+        state.lastPriceChartTs = state.priceChart[state.priceChart.length - 1]?.t || state.lastPriceChartTs;
+        buildRealCandlesFrom1sKlines(klines1s, cutoff);
+        currentPrice = parseFloat(klines1s[klines1s.length - 1][4]) || currentPrice;
+        state.btcPrice = currentPrice;
+        console.log(`[Binance] Upgraded to ${klines1s.length} real 1s klines and rebuilt 5s candles`);
       }
     } catch (_) {
       console.log('[Binance] 1s klines unavailable — using interpolated 1m data');
@@ -551,6 +631,7 @@ async function loadBinanceHistory() {
         
         // Build priceChart
         state.priceChart = klines1m.map(k => ({ t: Number(k[0]) * 1000, p: parseFloat(k[4]) }));
+        state.lastPriceChartTs = state.priceChart[state.priceChart.length - 1]?.t || 0;
         
         // Build synthetic points
         const syntheticPoints = [];
@@ -569,29 +650,10 @@ async function loadBinanceHistory() {
         const cutoff = Date.now() - PRICE_HIST_MS;
         state.priceHistory = syntheticPoints.filter(p => p.time >= cutoff);
 
-        // Build candles
-        const recentKlines = klines1m.filter(k => (Number(k[0]) * 1000) >= cutoff);
-        const buckets = new Map();
-        for (const k of recentKlines) {
-          const openTs = Number(k[0]) * 1000;
-          for (let i = 0; i < 60; i++) {
-            const ts     = openTs + i * 1000;
-            const price  = parseFloat(k[1]) + (parseFloat(k[4]) - parseFloat(k[1])) * (i / 60);
-            const bucket = Math.floor(ts / (CANDLE_SEC * 1000)) * CANDLE_SEC;
-            if (!buckets.has(bucket)) {
-              buckets.set(bucket, { time: bucket, open: price, high: price, low: price, close: price, ticks: 1 });
-            } else {
-              const c = buckets.get(bucket);
-              c.high  = Math.max(c.high, price);
-              c.low   = Math.min(c.low,  price);
-              c.close = price;
-              c.ticks++;
-            }
-          }
-        }
-        const sorted = [...buckets.values()].sort((a, b) => a.time - b.time);
-        state.candles       = sorted.slice(0, -1);
-        state.currentCandle = sorted[sorted.length - 1] || null;
+        buildApproxCandlesFrom1mKlines(
+          klines1m.map(k => [Number(k[0]) * 1000, k[1], k[2], k[3], k[4], k[6] ?? k[5] ?? 0]),
+          cutoff
+        );
 
         console.log(`[Kraken Fallback] History: ${state.priceHistory.length} pts, ${state.candles.length} candles, price=$${currentPrice}`);
       }
