@@ -121,12 +121,71 @@ function saveConfig() {
       maxOpenPos:            state.config.maxOpenPos,
       requireStableEdge:     state.config.requireStableEdge,
       allowDuplicateMarkets: state.config.allowDuplicateMarkets,
-      cooldownMs:            state.trading.cooldownMs,
+      cooldownMs:            Math.max(2000, state.trading.cooldownMs),
     };
     fs.writeFileSync(CONFIG_FILE, JSON.stringify(toSave, null, 2), 'utf8');
   } catch (e) {
     console.warn('[Config] Failed to save config:', e.message);
   }
+}
+
+function applyConfigPatch(patch = {}) {
+  const c = state.config;
+  if (patch.mode && ['SIM', 'LIVE'].includes(patch.mode)) c.mode = patch.mode;
+  if (patch.entryMode && ['kelly', 'fixed'].includes(patch.entryMode)) c.entryMode = patch.entryMode;
+  if (patch.capital > 0 && !state.trading.active) {
+    c.capital = patch.capital;
+    state.trading.balance = patch.capital;
+    state.trading.startBalance = patch.capital;
+    state.trading.peakBalance = patch.capital;
+  }
+  if (patch.fixedAmount > 0) {
+    c.fixedAmount = Math.min(patch.fixedAmount, state.trading.balance || c.capital);
+  }
+  if (patch.maxBetPct !== undefined) c.maxBetPct = Math.min(50, Math.max(1, Number(patch.maxBetPct) || c.maxBetPct));
+  if (patch.minEdge !== undefined) c.minEdge = Math.min(0.5, Math.max(0.01, Number(patch.minEdge) || c.minEdge));
+  if (patch.killThreshold !== undefined) c.killThreshold = Math.min(100, Math.max(5, Number(patch.killThreshold) || c.killThreshold));
+  if (patch.autoTrade !== undefined) c.autoTrade = Boolean(patch.autoTrade);
+  if (patch.takeProfitPct !== undefined) c.takeProfitPct = Math.min(100, Math.max(1, Number(patch.takeProfitPct) || c.takeProfitPct));
+  if (patch.stopLossPct !== undefined) c.stopLossPct = Math.min(100, Math.max(1, Number(patch.stopLossPct) || c.stopLossPct));
+  if (patch.posTimeoutMs !== undefined) c.posTimeoutMs = Math.min(3600000, Math.max(30000, Number(patch.posTimeoutMs) || c.posTimeoutMs));
+  if (patch.maxOpenPos !== undefined) c.maxOpenPos = Math.min(20, Math.max(1, Number(patch.maxOpenPos) || c.maxOpenPos));
+  if (patch.requireStableEdge !== undefined) c.requireStableEdge = Boolean(patch.requireStableEdge);
+  if (patch.allowDuplicateMarkets !== undefined) c.allowDuplicateMarkets = Boolean(patch.allowDuplicateMarkets);
+  if (patch.cooldownMs !== undefined) state.trading.cooldownMs = Math.min(60000, Math.max(2000, Number(patch.cooldownMs) || state.trading.cooldownMs));
+}
+
+function buildTradeSignal(market, now = Date.now()) {
+  if (!market) return null;
+  const { implied, poly, edge } = computeEdge(market);
+  const volScale   = Math.max(1.0, Math.min(1.5, recentVolatility(20000) / 0.0015));
+  const dynMinEdge = state.config.minEdge * volScale;
+  if (Math.abs(edge) < dynMinEdge) return null;
+
+  const side       = edge > 0 ? 'BUY_YES' : 'BUY_NO';
+  const winProb    = edge > 0 ? implied : (1 - implied);
+  const marketYes  = market.outcomePrices?.[0] ?? 0.5;
+  const entryPrice = side === 'BUY_YES' ? marketYes : (1 - marketYes);
+  const betSize = state.config.entryMode === 'fixed'
+    ? Math.min(state.config.fixedAmount, state.trading.balance)
+    : kellySize(Math.abs(edge), winProb, entryPrice, state.trading.balance, state.config.maxBetPct);
+  const velBonus   = edgeVelocity() > 0.003 ? 10 : 0;
+  const qualBonus  = Math.round(edgeQuality(edge) * 20);
+  const confidence = Math.min(99, 50 + Math.abs(edge) * 250 + velBonus + qualBonus);
+
+  return {
+    marketId: market.id,
+    question: market.question,
+    side,
+    edge: Math.abs(edge),
+    impliedProb: implied,
+    polyOdds: poly,
+    betSize,
+    confidence,
+    timestamp: now,
+    _rawEdge: edge,
+    _dynMinEdge: dynMinEdge,
+  };
 }
 
 // ── CONSTANTS ─────────────────────────────────────────────────────────────────
@@ -643,7 +702,7 @@ function getDesiredPolyLiveMarket() {
   for (const pos of state.positions.filter(p => p.status === 'OPEN')) {
     pushMarket(state.markets.find(m => m.id === pos.marketId));
   }
-  pushMarket(getBestMarket(true));
+  pushMarket(getBestObservationMarket(true));
   pushMarket(getBestMarket());
 
   if (assetIds.length === 0) return null;
@@ -1153,6 +1212,27 @@ function pickBestSimMarket(now = Date.now()) {
   })[0];
 }
 
+function getBestObservationMarket(preferLiveOnly = false) {
+  if (state.markets.length === 0) return null;
+  const now = Date.now();
+  const scored = state.markets.map(m => {
+    if (preferLiveOnly && !m.live) return { m, score: -1 };
+    const minLeft = getMarketMinutesLeft(m, now);
+    if (minLeft < 1 || minLeft > 1440) return { m, score: -1 };
+    if (m.priceIsEstimated) return { m, score: -1 };
+    const q = (m.question || '').toLowerCase();
+    const isUpOrDown = /up or down/.test(q);
+    const priceDist = getMarketPriceDistance(m);
+    if (priceDist > 0.42) return { m, score: -1 };
+    const timeScore = minLeft <= 15 ? 4 : minLeft <= 30 ? 3 : minLeft <= 60 ? 2 : 1;
+    const volumeScore = m.volume >= 20000 ? 3 : m.volume >= 5000 ? 2 : m.volume > 0 ? 1 : 0;
+    const priceScore = priceDist < 0.10 ? 3 : priceDist < 0.25 ? 2 : 1;
+    return { m, score: timeScore + volumeScore + priceScore + (isUpOrDown ? 3 : 0) };
+  }).filter(x => x.score >= 0).sort((a, b) => b.score - a.score || b.m.volume - a.m.volume);
+
+  return scored[0]?.m || null;
+}
+
 // ── ARBITRAGE ENGINE ──────────────────────────────────────────────────────────
 function sigmoid(x, k) { return 1 / (1 + Math.exp(-k * x)); }
 
@@ -1447,10 +1527,17 @@ function runArbitrageCheck() {
   const market = getBestMarket();
   if (!market) return;
 
-  const { implied, poly, edge } = computeEdge(market);
-  const now        = Date.now();
-  const volScale   = Math.max(1.0, Math.min(1.5, recentVolatility(20000) / 0.0015));
-  const dynMinEdge = state.config.minEdge * volScale;
+  const signalCandidate = buildTradeSignal(market);
+  if (!signalCandidate) {
+    state.currentSignal = null;
+    return broadcastSignal();
+  }
+
+  const implied = signalCandidate.impliedProb;
+  const poly = signalCandidate.polyOdds;
+  const edge = signalCandidate._rawEdge;
+  const now = signalCandidate.timestamp;
+  const dynMinEdge = signalCandidate._dynMinEdge;
 
   // Debug log every 10s
   if (now - (runArbitrageCheck._lastLog || 0) > 10000) {
@@ -1463,37 +1550,18 @@ function runArbitrageCheck() {
   state.edgeHistory.push({ time: now, edge, implied, poly });
   if (state.edgeHistory.length > 80) state.edgeHistory.shift();
 
-  if (Math.abs(edge) < dynMinEdge) {
-    state.currentSignal = null;
-    return broadcastSignal();
-  }
-
-  const side       = edge > 0 ? 'BUY_YES' : 'BUY_NO';
-  const winProb    = edge > 0 ? implied : (1 - implied);
-
-  const marketYes  = market.outcomePrices?.[0] ?? 0.5;
-  const entryPrice = side === 'BUY_YES' ? marketYes : (1 - marketYes);
-
-  const betSize = state.config.entryMode === 'fixed'
-    ? Math.min(state.config.fixedAmount, state.trading.balance)
-    : kellySize(Math.abs(edge), winProb, entryPrice, state.trading.balance, state.config.maxBetPct);
-
-  // Confidence: scaled from edge magnitude + velocity + quality
-  const velBonus   = edgeVelocity() > 0.003 ? 10 : 0;
-  const qualBonus  = Math.round(edgeQuality(edge) * 20);
-  const confidence = Math.min(99, 50 + Math.abs(edge) * 250 + velBonus + qualBonus);
-
   state.currentSignal = {
-    marketId:    market.id,
-    question:    market.question,
-    side,
-    edge:        Math.abs(edge),
-    impliedProb: implied,
-    polyOdds:    poly,
-    betSize,
-    confidence,
-    timestamp:   now,
+    marketId:    signalCandidate.marketId,
+    question:    signalCandidate.question,
+    side:        signalCandidate.side,
+    edge:        signalCandidate.edge,
+    impliedProb: signalCandidate.impliedProb,
+    polyOdds:    signalCandidate.polyOdds,
+    betSize:     signalCandidate.betSize,
+    confidence:  signalCandidate.confidence,
+    timestamp:   signalCandidate.timestamp,
   };
+  const side = signalCandidate.side;
 
   const openCount = state.positions.filter(p => p.status === 'OPEN').length;
   const canTrade  = openCount < state.config.maxOpenPos;
@@ -1521,9 +1589,22 @@ function runArbitrageCheck() {
     if (alternatives.length > 0) {
       tradeMarket = alternatives[0];
       hasOpposite = false; // cleared — alternative has no conflicting position
-      // Update signal to reflect the alternative market
-      state.currentSignal.marketId = tradeMarket.id;
-      state.currentSignal.question = tradeMarket.question;
+      const altSignal = buildTradeSignal(tradeMarket, now);
+      if (!altSignal) {
+        state.currentSignal = null;
+        return broadcastSignal();
+      }
+      state.currentSignal = {
+        marketId: altSignal.marketId,
+        question: altSignal.question,
+        side: altSignal.side,
+        edge: altSignal.edge,
+        impliedProb: altSignal.impliedProb,
+        polyOdds: altSignal.polyOdds,
+        betSize: altSignal.betSize,
+        confidence: altSignal.confidence,
+        timestamp: altSignal.timestamp,
+      };
     }
   }
 
@@ -1534,9 +1615,9 @@ function runArbitrageCheck() {
     .filter(p => p.status === 'OPEN')
     .reduce((s, p) => s + (p.cost || 0), 0);
   const effectiveBal  = state.trading.balance + totalExposure;
-  const exposureOk = totalExposure + betSize <= effectiveBal * 0.40;
+  const exposureOk = totalExposure + state.currentSignal.betSize <= effectiveBal * 0.40;
   // Keep enough cash to cover the bet
-  const safeBalance = state.trading.balance >= betSize;
+  const safeBalance = state.trading.balance >= state.currentSignal.betSize;
 
   // ── ENTRY QUALITY GUARDS (applied before auto-trade and signal display) ───────
   // Based on research: homerun, aulekator, gamma-trade-lab, MrFadiAi
@@ -1595,7 +1676,7 @@ function runArbitrageCheck() {
     }
   }
 
-  if (state.config.autoTrade && betSize >= 2 && canTrade && stableOk && safeBalance && !hasOpposite && exposureOk) {
+  if (state.config.autoTrade && state.currentSignal.betSize >= 2 && canTrade && stableOk && safeBalance && !hasOpposite && exposureOk) {
     executeTrade(state.currentSignal);
   }
   broadcastSignal();
@@ -1877,6 +1958,10 @@ function closePosition(pos, exitOdds, reason) {
   console.log(`[CLOB] CLOSE [${reason}] ${pos.side} entry=${pos.entryOdds} exit=${pos.exitOdds} | ${pnlStr} (${((pnl/pos.cost)*100).toFixed(1)}%) hold=${holdS}s`);
 }
 
+function getNetExitOdds(market, rawMarkOdds) {
+  return Math.max(0.01, rawMarkOdds - clobSpread(Number(market?.volume || 0)));
+}
+
 function monitorPositions() {
   const open = state.positions.filter(p => p.status === 'OPEN');
   if (open.length === 0) return;
@@ -1908,23 +1993,25 @@ function monitorPositions() {
       ? effectiveYesOdds
       : (1 - effectiveYesOdds);
     const newMark = Math.max(0.03, Math.min(0.97, midOdds ?? pos.markOdds));
+    const netExitOdds = getNetExitOdds(mktForPos, newMark);
     pos.markOdds   = newMark;
 
-    // TP/SL are based on movement from the entry MID price, not from the fill price.
-    // The fill price includes spread+impact (a known cost at entry). TP/SL should
-    // trigger on market movement, not on the built-in execution cost.
-    // entryMidOdds = mid price at the moment of entry (before spread/impact).
-    const refPrice = pos.entryMidOdds ?? pos.entryOdds; // fallback for legacy positions
-    const markDelta = newMark - refPrice;
-    pos.pnlPct     = Math.round((markDelta / refPrice) * 10000) / 100;
-    // Unrealized PnL still uses entryOdds (the actual fill) for accurate $ accounting
-    pos.unrealizedPnl = Math.round((newMark - pos.entryOdds) * pos.shares * 100) / 100;
+    // Execution cost should not immediately trip TP/SL. We compare the current
+    // exitable mark against the exitable mark that existed at entry time:
+    // entry MID minus the same exit spread. This keeps TP/SL tied to real market
+    // movement while unrealized PnL still reflects true liquidation value.
+    const entryMarkBaseline = getNetExitOdds(mktForPos, pos.entryMidOdds ?? pos.entryOdds);
+    const triggerDelta = netExitOdds - entryMarkBaseline;
+    pos.unrealizedPnl = Math.round((netExitOdds - pos.entryOdds) * pos.shares * 100) / 100;
+    pos.pnlPct = pos.cost > 0
+      ? Math.round((pos.unrealizedPnl / pos.cost) * 10000) / 100
+      : 0;
 
-    const gainPct  = markDelta / refPrice;         // positive = market moved in our favor
-    const lossPct  = -markDelta / refPrice;         // positive = market moved against us
+    const gainPct  = triggerDelta / entryMarkBaseline; // positive = market moved in our favor
+    const lossPct  = -triggerDelta / entryMarkBaseline; // positive = market moved against us
     const elapsed  = Date.now() - pos.entryTime;
 
-    if (gainPct >= state.config.takeProfitPct / 100) {
+    if (gainPct >= state.config.takeProfitPct / 100 && pos.unrealizedPnl > 0) {
       closePosition(pos, newMark, 'TP'); continue;
     }
     if (lossPct >= state.config.stopLossPct / 100) {
@@ -2118,32 +2205,8 @@ app.post('/api/trade', async (req, res) => {
 });
 
 app.post('/api/config', (req, res) => {
-  const { mode, capital, entryMode, fixedAmount, maxBetPct, minEdge, killThreshold,
-          autoTrade, privateKey, takeProfitPct, stopLossPct, posTimeoutMs, maxOpenPos } = req.body;
-
-  if (mode && ['SIM', 'LIVE'].includes(mode)) state.config.mode = mode;
-  if (entryMode && ['kelly', 'fixed'].includes(entryMode)) state.config.entryMode = entryMode;
-  if (fixedAmount > 0) state.config.fixedAmount = Math.min(fixedAmount, state.trading.balance || state.config.capital);
-  if (capital > 0 && !state.trading.active) {
-    state.config.capital      = capital;
-    state.trading.balance     = capital;
-    state.trading.startBalance = capital;
-    state.trading.peakBalance = capital;
-  }
-  if (maxBetPct     !== undefined) state.config.maxBetPct     = Math.min(50, Math.max(1, maxBetPct));
-  if (minEdge       !== undefined) state.config.minEdge       = Math.min(0.5, Math.max(0.01, minEdge));
-  if (killThreshold !== undefined) state.config.killThreshold = Math.min(100, Math.max(5, killThreshold));
-  if (autoTrade     !== undefined) state.config.autoTrade     = Boolean(autoTrade);
-  if (takeProfitPct !== undefined) state.config.takeProfitPct = Math.min(100, Math.max(1,  takeProfitPct));
-  if (stopLossPct   !== undefined) state.config.stopLossPct   = Math.min(100, Math.max(1,  stopLossPct));
-  if (posTimeoutMs  !== undefined) state.config.posTimeoutMs  = Math.min(3600000, Math.max(30000, posTimeoutMs));
-  if (maxOpenPos    !== undefined) state.config.maxOpenPos    = Math.min(20, Math.max(1, maxOpenPos));
-  // cooldown exposed so UI/config can tune trade frequency
-  const { cooldownMs } = req.body;
-  if (cooldownMs    !== undefined) state.trading.cooldownMs   = Math.min(60000, Math.max(2000, cooldownMs));
-  const { requireStableEdge, allowDuplicateMarkets } = req.body;
-  if (requireStableEdge     !== undefined) state.config.requireStableEdge     = Boolean(requireStableEdge);
-  if (allowDuplicateMarkets !== undefined) state.config.allowDuplicateMarkets = Boolean(allowDuplicateMarkets);
+  applyConfigPatch(req.body);
+  const { mode, privateKey } = req.body;
   if (privateKey && mode === 'LIVE') {
     const clean = privateKey.replace(/^0x/, '');
     if (/^[0-9a-fA-F]{64}$/.test(clean)) {
@@ -2154,6 +2217,7 @@ app.post('/api/config', (req, res) => {
   }
 
   saveConfig();
+  saveSession();
   broadcastStatus();
   res.json({ success: true, config: buildStatusPayload().config });
 });
@@ -2295,22 +2359,8 @@ server.listen(PORT, async () => {
   const saved = loadSavedConfig();
   loadSavedTrades();
   if (saved) {
-    const c = state.config;
-    if (saved.mode                  !== undefined) c.mode                  = saved.mode;
-    if (saved.capital               !== undefined) { c.capital = saved.capital; }
-    if (saved.entryMode             !== undefined) c.entryMode             = saved.entryMode;
-    if (saved.fixedAmount           !== undefined) c.fixedAmount           = saved.fixedAmount;
-    if (saved.maxBetPct             !== undefined) c.maxBetPct             = saved.maxBetPct;
-    if (saved.minEdge               !== undefined) c.minEdge               = saved.minEdge;
-    if (saved.killThreshold         !== undefined) c.killThreshold         = saved.killThreshold;
-    if (saved.autoTrade             !== undefined) c.autoTrade             = saved.autoTrade;
-    if (saved.takeProfitPct         !== undefined) c.takeProfitPct         = saved.takeProfitPct;
-    if (saved.stopLossPct           !== undefined) c.stopLossPct           = saved.stopLossPct;
-    if (saved.posTimeoutMs          !== undefined) c.posTimeoutMs          = saved.posTimeoutMs;
-    if (saved.maxOpenPos            !== undefined) c.maxOpenPos            = saved.maxOpenPos;
-    if (saved.requireStableEdge     !== undefined) c.requireStableEdge     = saved.requireStableEdge;
-    if (saved.allowDuplicateMarkets !== undefined) c.allowDuplicateMarkets = saved.allowDuplicateMarkets;
-    if (saved.cooldownMs            !== undefined) state.trading.cooldownMs = Math.max(2000, saved.cooldownMs);
+    applyConfigPatch(saved);
+    saveConfig();
   }
   // Session restores balance/stats AFTER config applied — saved progress wins over default capital
   loadSavedSession();
