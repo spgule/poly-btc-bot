@@ -490,19 +490,77 @@ async function loadBinanceHistory() {
 
   } catch (e) {
     console.warn('[Binance] History load failed:', e.message);
-    // Minimal fallback: just get current price
     try {
-      const { data } = await axios.get(`${BINANCE_REST}/ticker/price`, {
-        params: { symbol: 'BTCUSDT' }, timeout: 5000,
+      console.log('[Fallback] Attempting to load history from Kraken...');
+      const krRes = await axios.get('https://api.kraken.com/0/public/OHLC', {
+        params: { pair: 'XBTUSD', interval: 1 },
+        timeout: 12000
       });
-      currentPrice       = parseFloat(data.price) || currentPrice;
-      state.btcPrice     = currentPrice;
-      // Seed a single real price point — no synthetic noise
-      // The bot will populate priceHistory organically from Binance WS/REST ticks
-      const now = Date.now();
-      state.priceHistory = [{ time: now, price: currentPrice }];
-      console.log(`[Binance] Emergency seed: price=$${currentPrice} (waiting for real ticks)`);
-    } catch (_) { /* keep default state */ }
+      const klines1m = krRes.data?.result?.XXBTZUSD;
+      if (Array.isArray(klines1m) && klines1m.length > 0) {
+        currentPrice = parseFloat(klines1m[klines1m.length - 1][4]);
+        state.btcPrice = currentPrice;
+        
+        // Build priceChart
+        state.priceChart = klines1m.map(k => ({ t: Number(k[0]) * 1000, p: parseFloat(k[4]) }));
+        
+        // Build synthetic points
+        const syntheticPoints = [];
+        for (const k of klines1m) {
+          const openTs  = Number(k[0]) * 1000;
+          const open    = parseFloat(k[1]);
+          const close   = parseFloat(k[4]);
+          const steps   = 60;
+          for (let i = 0; i < steps; i++) {
+            syntheticPoints.push({
+              time:  openTs + i * 1000,
+              price: open + (close - open) * (i / steps),
+            });
+          }
+        }
+        const cutoff = Date.now() - PRICE_HIST_MS;
+        state.priceHistory = syntheticPoints.filter(p => p.time >= cutoff);
+
+        // Build candles
+        const recentKlines = klines1m.filter(k => (Number(k[0]) * 1000) >= cutoff);
+        const buckets = new Map();
+        for (const k of recentKlines) {
+          const openTs = Number(k[0]) * 1000;
+          for (let i = 0; i < 60; i++) {
+            const ts     = openTs + i * 1000;
+            const price  = parseFloat(k[1]) + (parseFloat(k[4]) - parseFloat(k[1])) * (i / 60);
+            const bucket = Math.floor(ts / (CANDLE_SEC * 1000)) * CANDLE_SEC;
+            if (!buckets.has(bucket)) {
+              buckets.set(bucket, { time: bucket, open: price, high: price, low: price, close: price, ticks: 1 });
+            } else {
+              const c = buckets.get(bucket);
+              c.high  = Math.max(c.high, price);
+              c.low   = Math.min(c.low,  price);
+              c.close = price;
+              c.ticks++;
+            }
+          }
+        }
+        const sorted = [...buckets.values()].sort((a, b) => a.time - b.time);
+        state.candles       = sorted.slice(0, -1);
+        state.currentCandle = sorted[sorted.length - 1] || null;
+
+        console.log(`[Kraken Fallback] History: ${state.priceHistory.length} pts, ${state.candles.length} candles, price=$${currentPrice}`);
+      }
+    } catch (err) {
+      console.warn('[Kraken Fallback] History load failed:', err.message);
+      // Minimal fallback: just get current price
+      try {
+        const { data } = await axios.get(`${BINANCE_REST}/ticker/price`, {
+          params: { symbol: 'BTCUSDT' }, timeout: 5000,
+        });
+        currentPrice       = parseFloat(data.price) || currentPrice;
+        state.btcPrice     = currentPrice;
+        const now = Date.now();
+        state.priceHistory = [{ time: now, price: currentPrice }];
+        console.log(`[Binance] Emergency seed: price=$${currentPrice} (waiting for real ticks)`);
+      } catch (_) { /* keep default state */ }
+    }
   }
 }
 
