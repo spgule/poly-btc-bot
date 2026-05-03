@@ -373,29 +373,8 @@ async function pollBinanceRest() {
         broadcastMarketData();
       }
     } else {
-      // All external APIs unavailable (Railway geo-block or rate limits).
-      // Synthesize micro-drift to keep candles/chart alive until a real price returns.
-      // ONLY activates when a real seed price exists (btcPrice > 0).
-      // Drift is tiny (±0.08% max) — diverges < $1 per minute from real price.
-      const now = Date.now();
-      if (state.btcPrice > 0 && now - lastBroadcastTs >= 2000) {
-        const drift = (Math.random() - 0.499) * 0.0008;
-        const noise = (Math.random() - 0.5)   * 0.0002;
-        state.btcPrice = Math.round(state.btcPrice * (1 + drift + noise) * 100) / 100;
-        state.priceHistory.push({ price: state.btcPrice, time: now });
-        state.priceHistory = state.priceHistory.filter(p => now - p.time <= PRICE_HIST_MS);
-        addChartPoint(state.btcPrice, now);
-        updateCandle(state.btcPrice, now);
-        state.priceSource = 'sim';
-        if (state.trading.active && now - lastArbCheckTs >= 500) {
-          lastArbCheckTs = now;
-          runArbitrageCheck();
-        }
-        lastBroadcastTs = now;
-        broadcastMarketData();
-      }
       state.priceSource = 'unavailable';
-      console.warn('[Price] All sources unavailable — using synthetic drift');
+      console.warn('[Price] Binance WS + REST + CoinGecko + Kraken + Coinbase all unavailable');
     }
   }
 }
