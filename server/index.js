@@ -413,86 +413,98 @@ async function loadBinanceHistory() {
 
 // ── POLYMARKET MARKETS ────────────────────────────────────────────────────────
 async function fetchBTCMarkets() {
-  const strategies = [
-    // Strategy 1: wide fetch — BTC markets are NOT always high volume
-    () => axios.get(`${POLY_GAMMA}/markets`, {
+  // Run ALL three fetches in parallel and MERGE results.
+  // Previously we stopped at the first successful fetch — this caused the bot to miss
+  // the short-term "Bitcoin Up or Down" 5/15-min markets (only in the recent-startDate slice)
+  // because the high-volume slice (S1) found other BTC markets first but they were all
+  // deeply skewed (prices near 0.999 or 0.018) and got rejected by getBestMarket().
+  const fetches = [
+    // S1: top 500 by volume — catches high-volume long-dated BTC markets
+    axios.get(`${POLY_GAMMA}/markets`, {
       params: { active: true, closed: false, limit: 500, order: 'volume', ascending: false },
       timeout: 15000,
       headers: { 'User-Agent': 'poly-btc-bot/1.0' },
-    }),
-    // Strategy 2: direct slug search for Bitcoin price markets
-    () => axios.get(`${POLY_GAMMA}/markets`, {
+    }).catch(() => null),
+    // S2: next 200 by volume (offset)
+    axios.get(`${POLY_GAMMA}/markets`, {
       params: { active: true, closed: false, limit: 200, order: 'volume', ascending: false, offset: 500 },
       timeout: 12000,
-    }),
-    // Strategy 3: search by question keyword (note: Gamma search is fuzzy, filter strictly after)
-    () => axios.get(`${POLY_GAMMA}/markets`, {
+    }).catch(() => null),
+    // S3: most recently created — catches short-term "Bitcoin Up or Down" 5/15-min markets
+    axios.get(`${POLY_GAMMA}/markets`, {
       params: { active: true, closed: false, limit: 200, order: 'startDate', ascending: false },
       timeout: 10000,
-    }),
+    }).catch(() => null),
   ];
 
-  for (const strategy of strategies) {
-    try {
-      const { data } = await strategy();
-      const list = Array.isArray(data) ? data : (data?.markets || data?.results || []);
-      const btc = list.filter(m => {
-        const q = (m.question || m.title || '').toLowerCase();
-        return (q.includes('btc') || q.includes('bitcoin')) &&
-          !q.includes('eth') && !q.includes('sol');
-      }).slice(0, 8);
+  const responses = await Promise.all(fetches);
 
-      if (btc.length > 0) {
-        const mapped = btc.map(m => {
-          // Gamma API returns outcomePrices as a JSON string (e.g. '["0.97","0.03"]'),
-          // NOT as a real JS array. Must parse it explicitly.
-          let prices;
-          try {
-            if (Array.isArray(m.outcomePrices)) {
-              prices = m.outcomePrices.map(Number);
-            } else if (typeof m.outcomePrices === 'string') {
-              prices = JSON.parse(m.outcomePrices).map(Number);
-            } else {
-              prices = [0.5, 0.5];
-            }
-            if (!prices.every(p => isFinite(p))) prices = [0.5, 0.5];
-          } catch { prices = [0.5, 0.5]; }
-          const q = (m.question || m.title || '').toLowerCase();
-          // Score: short-term "up or down" markets first (best for momentum arb)
-          const shortTerm = /up or down|5 min|10 min|15 min|1 hour|today|\bday\b/.test(q);
-          const midTerm   = /this week|week|\bmonth\b|may |june|july/.test(q);
-          const score     = shortTerm ? 3 : midTerm ? 2 : 1;
-          // Volume: Gamma API sometimes omits the volume field even for high-volume markets.
-          // Try all known field names to maximise coverage.
-          const rawVol = m.volume ?? m.volumeNum ?? m.volumeClob ?? m.usdcSize ?? m.liquidity ?? 0;
-          const parsedVol = typeof rawVol === 'string' ? parseFloat(rawVol) : Number(rawVol);
-          return {
-            id: m.conditionId || m.id || m.slug,
-            question: m.question || m.title || 'BTC Market',
-            outcomes: m.outcomes || ['Yes', 'No'],
-            outcomePrices: prices,
-            volume: (isFinite(parsedVol) && parsedVol > 0) ? Math.round(parsedVol) : 0,
-            endDate: m.endDateIso || m.endDate || m.end_date_iso,
-            clobTokenIds: m.clobTokenIds || [],
-            live: true,
-            _score: score,
-          };
-        });
-        // Sort: short-term first, then by volume
-        mapped.sort((a, b) => b._score - a._score || b.volume - a.volume);
-        // Preserve existing sim markets — they serve as fallback when real markets have low/missing volume
-        const existingSim = state.markets.filter(m => m.id && m.id.startsWith('sim-'));
-        state.markets = [...mapped, ...existingSim];
-        console.log(`[Polymarket] Loaded ${mapped.length} real BTC markets | top: "${mapped[0].question}" vol=$${mapped[0].volume.toLocaleString()}`);
-        broadcast({ type: 'MARKETS', data: state.markets });
-        return;
-      }
-    } catch (e) {
-      console.warn(`[Polymarket] Strategy failed:`, e.message);
+  // Collect all raw BTC markets from all slices, deduplicate by id
+  const seen = new Set();
+  const allBtc = [];
+  for (const res of responses) {
+    if (!res) continue;
+    const list = Array.isArray(res.data) ? res.data : (res.data?.markets || res.data?.results || []);
+    for (const m of list) {
+      const q = (m.question || m.title || '').toLowerCase();
+      if (!(q.includes('btc') || q.includes('bitcoin'))) continue;
+      if (q.includes('eth') || q.includes('sol')) continue;
+      const id = m.conditionId || m.id || m.slug;
+      if (!id || seen.has(id)) continue;
+      seen.add(id);
+      allBtc.push(m);
     }
   }
 
-  // All strategies failed – seed simulated markets
+  if (allBtc.length > 0) {
+    function mapMarket(m) {
+      let prices;
+      try {
+        if (Array.isArray(m.outcomePrices)) {
+          prices = m.outcomePrices.map(Number);
+        } else if (typeof m.outcomePrices === 'string') {
+          prices = JSON.parse(m.outcomePrices).map(Number);
+        } else {
+          prices = [0.5, 0.5];
+        }
+        if (!prices.every(p => isFinite(p))) prices = [0.5, 0.5];
+      } catch { prices = [0.5, 0.5]; }
+
+      const q = (m.question || m.title || '').toLowerCase();
+      // Scoring: short-term "up or down" 5/15-min markets are highest priority
+      const upOrDown = /up or down/.test(q);
+      const shortTerm = /5 min|10 min|15 min|1 hour|today|\bday\b/.test(q);
+      const midTerm   = /this week|week|\bmonth\b|may |june|july/.test(q);
+      const score     = upOrDown ? 5 : shortTerm ? 3 : midTerm ? 2 : 1;
+
+      const rawVol    = m.volume ?? m.volumeNum ?? m.volumeClob ?? m.usdcSize ?? m.liquidity ?? 0;
+      const parsedVol = typeof rawVol === 'string' ? parseFloat(rawVol) : Number(rawVol);
+      return {
+        id: m.conditionId || m.id || m.slug,
+        question: m.question || m.title || 'BTC Market',
+        outcomes: m.outcomes || ['Yes', 'No'],
+        outcomePrices: prices,
+        volume: (isFinite(parsedVol) && parsedVol > 0) ? Math.round(parsedVol) : 0,
+        endDate: m.endDateIso || m.endDate || m.end_date_iso,
+        clobTokenIds: m.clobTokenIds || [],
+        live: true,
+        _score: score,
+      };
+    }
+
+    const mapped = allBtc.map(mapMarket);
+    // Sort: up-or-down first, then short-term, then by volume
+    mapped.sort((a, b) => b._score - a._score || b.volume - a.volume);
+
+    const existingSim = state.markets.filter(m => m.id && m.id.startsWith('sim-'));
+    state.markets = [...mapped, ...existingSim];
+    const top = mapped[0];
+    console.log(`[Polymarket] Loaded ${mapped.length} real BTC markets | top: "${top.question}" price=${top.outcomePrices[0]} vol=$${top.volume.toLocaleString()}`);
+    broadcast({ type: 'MARKETS', data: state.markets });
+    return;
+  }
+
+  // All fetches failed or no BTC markets found — fall back to sim markets
   seedSimMarkets();
   broadcast({ type: 'MARKETS', data: state.markets });
 }
@@ -580,8 +592,10 @@ function edgeQuality(edge) {
 function getBestMarket() {
   if (state.markets.length === 0) return null;
   const now = Date.now();
-  // In SIM mode use a much wider window so long-dated markets are tradeable
-  const maxMinutes = state.config.mode === 'SIM' ? 44640 : 240; // SIM: up to 31 days
+  // "Up or Down" short-term binaries are created ~24h in advance — allow up to 24h window.
+  // Other live markets: up to 4h in LIVE (don't trade long-dated with binary model).
+  // SIM: up to 31 days (educational range).
+  const maxMinutes = state.config.mode === 'SIM' ? 44640 : 1440; // LIVE: 24h (was 4h)
   const minMinutes = 1;
   const scored = state.markets.map(m => {
     const msLeft = m.endDate ? new Date(m.endDate).getTime() - now : 10 * 60000;
@@ -591,18 +605,21 @@ function getBestMarket() {
     const timeScore = minLeft <= 30 ? 3 : minLeft <= 60 ? 2 : minLeft <= 1440 ? 1 : 0;
     const volScore  = m.volume >= 100000 ? 2 : m.volume >= 20000 ? 1 : 0;
     // Filter out near-certain markets (YES > 0.92 or YES < 0.08).
-    // These are essentially resolved — tiny NO/YES price means extreme leverage,
-    // minimal liquidity, and the binary model has no meaningful edge to detect.
-    // Markets between 0.08–0.92 are valid for both BUY_YES and BUY_NO.
     const yesPrice  = m.outcomePrices?.[0] ?? 0.5;
     const priceDist = Math.abs(yesPrice - 0.5);
     if (priceDist > 0.42) return { m, score: -1 }; // YES > 0.92 or < 0.08 — exclude
-    // Real markets must have adequate volume — ensures CLOB fills are feasible.
-    // Sim markets (live:false) bypass this check and serve as automatic fallback.
-    if (m.live && Number(m.volume || 0) < 50000) return { m, score: -1 };
+    // Volume threshold: "Up or Down" short-term binaries have low volume at creation
+    // ($1k–$15k) — they accumulate volume near expiry. Accept them with $1k minimum.
+    // Other live markets keep the $50k threshold (CLOB fills are infeasible below that).
+    const q = (m.question || '').toLowerCase();
+    const isUpOrDown = /up or down/.test(q);
+    const minVol = isUpOrDown ? 1000 : 50000;
+    if (m.live && Number(m.volume || 0) < minVol) return { m, score: -1 };
     // Prefer markets nearer to 0.5 (more uncertainty = larger edge swings possible)
     const priceScore = priceDist < 0.10 ? 3 : priceDist < 0.25 ? 2 : priceDist < 0.40 ? 1 : 0;
-    return { m, score: timeScore + volScore + priceScore };
+    // Bonus score for Up or Down markets (these are the ideal arb target)
+    const upOrDownBonus = isUpOrDown ? 2 : 0;
+    return { m, score: timeScore + volScore + priceScore + upOrDownBonus };
   }).filter(x => x.score >= 0).sort((a, b) => b.score - a.score);
 
   if (scored.length === 0) {
@@ -993,9 +1010,10 @@ function openPosition(signal) {
   // ── REAL CLOB CONSTRAINTS (applied in both SIM and LIVE) ──────────────────
   const vol = Number(market.volume || 0);
 
-  // Minimum market volume: same threshold as LIVE ($50k)
-  // Below this, spread is too wide and fills are unreliable
-  const MIN_VOL = 50000; // same threshold in SIM and LIVE — below $50k spread is too wide
+  // Minimum market volume: "Up or Down" short-term markets have low volume at creation
+  // but are the primary arb target. Use $1k minimum for them, $50k for all others.
+  const qLower = (market.question || '').toLowerCase();
+  const MIN_VOL = /up or down/.test(qLower) ? 1000 : 50000;
   if (vol < MIN_VOL && !marketId.startsWith('sim-')) {
     console.log(`[CLOB] Skip — market volume $${vol.toLocaleString()} below minimum $${MIN_VOL.toLocaleString()}`);
     return;
