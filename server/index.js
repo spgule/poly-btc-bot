@@ -353,6 +353,18 @@ function getPolyDisplayPrice(assetId) {
   return null;
 }
 
+function getBestBookBid(levels) {
+  if (!Array.isArray(levels) || levels.length === 0) return NaN;
+  const prices = levels.map(level => parseFloat(level?.price)).filter(Number.isFinite);
+  return prices.length ? Math.max(...prices) : NaN;
+}
+
+function getBestBookAsk(levels) {
+  if (!Array.isArray(levels) || levels.length === 0) return NaN;
+  const prices = levels.map(level => parseFloat(level?.price)).filter(Number.isFinite);
+  return prices.length ? Math.min(...prices) : NaN;
+}
+
 function applyPolyLivePrices() {
   for (const market of state.markets) {
     if (!market.live) continue;
@@ -718,6 +730,7 @@ function updatePolyAssetBook(assetId, patch) {
     updatedAt: Date.now(),
   };
   state.polyLive.lastEventTs = Date.now();
+  state.polyLive.connected = true;
 }
 
 function refreshPolyLiveMarket() {
@@ -752,7 +765,8 @@ function connectPolyMarketWs() {
   polyMarketWs = new WebSocket(POLY_CLOB_WSS);
 
   polyMarketWs.on('open', () => {
-    state.polyLive.connected = true;
+    state.polyLive.connected = false;
+    state.polyLive.lastEventTs = 0;
     state.polyLive.marketId = desired.marketId;
     state.polyLive.marketIds = desired.marketIds;
     state.polyLive.assetIds = desired.assetIds;
@@ -768,45 +782,54 @@ function connectPolyMarketWs() {
   polyMarketWs.on('message', (raw) => {
     const text = raw.toString();
     if (text === 'PONG') return;
-    let msg = null;
-    try { msg = JSON.parse(text); } catch (_) { return; }
-    if (!msg || !msg.event_type) return;
+    let payload = null;
+    try { payload = JSON.parse(text); } catch (_) { return; }
+    const messages = Array.isArray(payload) ? payload : [payload];
+    let didUpdate = false;
 
-    if (msg.event_type === 'book') {
-      updatePolyAssetBook(msg.asset_id, {
-        bestBid: parseFloat(msg.bids?.[0]?.price ?? NaN),
-        bestAsk: parseFloat(msg.asks?.[0]?.price ?? NaN),
-      });
-      refreshPolyLiveMarket();
-      return;
-    }
+    for (const msg of messages) {
+      if (!msg || !msg.event_type) continue;
 
-    if (msg.event_type === 'best_bid_ask') {
-      updatePolyAssetBook(msg.asset_id, {
-        bestBid: parseFloat(msg.best_bid ?? NaN),
-        bestAsk: parseFloat(msg.best_ask ?? NaN),
-      });
-      refreshPolyLiveMarket();
-      return;
-    }
-
-    if (msg.event_type === 'price_change' && Array.isArray(msg.price_changes)) {
-      for (const change of msg.price_changes) {
-        updatePolyAssetBook(change.asset_id, {
-          bestBid: parseFloat(change.best_bid ?? NaN),
-          bestAsk: parseFloat(change.best_ask ?? NaN),
+      if (msg.event_type === 'book') {
+        updatePolyAssetBook(msg.asset_id, {
+          bestBid: getBestBookBid(msg.bids),
+          bestAsk: getBestBookAsk(msg.asks),
+          lastTrade: parseFloat(msg.last_trade_price ?? NaN),
         });
+        didUpdate = true;
+        continue;
       }
-      refreshPolyLiveMarket();
-      return;
+
+      if (msg.event_type === 'best_bid_ask') {
+        updatePolyAssetBook(msg.asset_id, {
+          bestBid: parseFloat(msg.best_bid ?? NaN),
+          bestAsk: parseFloat(msg.best_ask ?? NaN),
+        });
+        didUpdate = true;
+        continue;
+      }
+
+      if (msg.event_type === 'price_change' && Array.isArray(msg.price_changes)) {
+        for (const change of msg.price_changes) {
+          updatePolyAssetBook(change.asset_id, {
+            bestBid: parseFloat(change.best_bid ?? NaN),
+            bestAsk: parseFloat(change.best_ask ?? NaN),
+            lastTrade: parseFloat(change.price ?? NaN),
+          });
+        }
+        didUpdate = true;
+        continue;
+      }
+
+      if (msg.event_type === 'last_trade_price') {
+        updatePolyAssetBook(msg.asset_id, {
+          lastTrade: parseFloat(msg.price ?? NaN),
+        });
+        didUpdate = true;
+      }
     }
 
-    if (msg.event_type === 'last_trade_price') {
-      updatePolyAssetBook(msg.asset_id, {
-        lastTrade: parseFloat(msg.price ?? NaN),
-      });
-      refreshPolyLiveMarket();
-    }
+    if (didUpdate) refreshPolyLiveMarket();
   });
 
   polyMarketWs.on('close', () => {
@@ -1212,6 +1235,15 @@ function pickBestSimMarket(now = Date.now()) {
   })[0];
 }
 
+function hasTradableLiveMarket(now = Date.now()) {
+  return state.markets.some(m => {
+    if (!m.live || m.priceIsEstimated) return false;
+    const minLeft = getMarketMinutesLeft(m, now);
+    if (minLeft < 1 || minLeft > 1440) return false;
+    return getMarketPriceDistance(m) <= 0.42;
+  });
+}
+
 function getBestObservationMarket(preferLiveOnly = false) {
   if (state.markets.length === 0) return null;
   const now = Date.now();
@@ -1293,6 +1325,7 @@ function edgeQuality(edge) {
 function getBestMarket(preferLiveOnly = false) {
   if (state.markets.length === 0) return null;
   const now = Date.now();
+  const liveAvailable = hasTradableLiveMarket(now);
   // "Up or Down" short-term binaries are created ~24h in advance — allow up to 24h window.
   // Other live markets: up to 24h in LIVE. SIM fallback should stay short-dated and near ATM.
   const maxMinutes = state.config.mode === 'SIM' ? 1440 : 1440;
@@ -1304,6 +1337,7 @@ function getBestMarket(preferLiveOnly = false) {
     // Block markets with no real price data — would generate false signals against 0.5
     if (m.priceIsEstimated) return { m, score: -1 };
     const isSim = !m.live;
+    if (!preferLiveOnly && liveAvailable && isSim) return { m, score: -1 };
     // Prefer short-term (5–30 min window) for momentum arb.
     const timeScore = minLeft <= 15 ? 4 : minLeft <= 30 ? 3 : minLeft <= 60 ? 2 : minLeft <= 1440 ? 1 : 0;
     const volScore  = m.volume >= 100000 ? 2 : m.volume >= 20000 ? 1 : 0;
@@ -1313,8 +1347,6 @@ function getBestMarket(preferLiveOnly = false) {
     if (priceDist > 0.42) return { m, score: -1 }; // YES > 0.92 or < 0.08 — exclude
     const q = (m.question || '').toLowerCase();
     const isUpOrDown = /up or down/.test(q);
-    const minVol = 50000;
-    if (m.live && Number(m.volume || 0) < minVol) return { m, score: -1 };
     if (isSim && minLeft > 45) return { m, score: -1 };
     const strike = getSimStrike(m);
     const strikeGap = isSim && strike && state.btcPrice
@@ -1326,8 +1358,7 @@ function getBestMarket(preferLiveOnly = false) {
     // Bonus score for Up or Down markets (these are the ideal arb target)
     const upOrDownBonus = isUpOrDown ? 2 : 0;
     const edgeBonus = Math.min(4, Math.abs(computeEdge(m).edge) / Math.max(0.005, state.config.minEdge / 2));
-    const simBonus = isSim ? 3 : 0;
-    return { m, score: timeScore + volScore + priceScore + upOrDownBonus + edgeBonus + simBonus };
+    return { m, score: timeScore + volScore + priceScore + upOrDownBonus + edgeBonus };
   }).filter(x => x.score >= 0).sort((a, b) => b.score - a.score);
 
   if (scored.length === 0) {
