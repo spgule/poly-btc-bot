@@ -171,7 +171,10 @@ function buildTradeSignal(market, now = Date.now()) {
     : kellySize(Math.abs(edge), winProb, entryPrice, state.trading.balance, state.config.maxBetPct);
   const velBonus   = edgeVelocity() > 0.003 ? 10 : 0;
   const qualBonus  = Math.round(edgeQuality(edge) * 20);
-  const confidence = Math.min(99, 50 + Math.abs(edge) * 250 + velBonus + qualBonus);
+  const bollinger = computeBollinger();
+  const bollingerBias = getBollingerBias(side, bollinger);
+  const bollingerBonus = bollingerBias === 'favorable' ? 6 : bollingerBias === 'unfavorable' ? -8 : 0;
+  const confidence = Math.min(99, Math.max(1, 50 + Math.abs(edge) * 250 + velBonus + qualBonus + bollingerBonus));
 
   return {
     marketId: market.id,
@@ -183,6 +186,8 @@ function buildTradeSignal(market, now = Date.now()) {
     betSize,
     confidence,
     timestamp: now,
+    bollinger,
+    bollingerBias,
     _rawEdge: edge,
     _dynMinEdge: dynMinEdge,
   };
@@ -294,6 +299,8 @@ const state = {
     vpin: 0,
     btcSpike: 0,
     isSpike: false,
+    bollinger: null,
+    bollingerBias: 'neutral',
   },
   binanceConnected: false,
   priceSource:      'binance',  // 'binance' | 'binance-rest' | 'unavailable'
@@ -1325,6 +1332,53 @@ function recentVolatility(msWindow = 30000) {
   return Math.sqrt(variance) || 0.0001;
 }
 
+function computeBollinger(period = 20, mult = 2) {
+  const closed = state.candles.slice(-Math.max(0, period - 1)).map(c => Number(c.close)).filter(Number.isFinite);
+  const currentClose = Number(state.currentCandle?.close);
+  const closes = Number.isFinite(currentClose) ? [...closed, currentClose] : closed;
+  if (closes.length < period) return null;
+
+  const window = closes.slice(-period);
+  const mean = window.reduce((sum, value) => sum + value, 0) / window.length;
+  const variance = window.reduce((sum, value) => sum + (value - mean) ** 2, 0) / window.length;
+  const stdDev = Math.sqrt(variance) || 0;
+  const upper = mean + stdDev * mult;
+  const lower = mean - stdDev * mult;
+  const last = window[window.length - 1];
+  const bandwidth = mean !== 0 ? (upper - lower) / mean : 0;
+  const percentB = upper === lower ? 0.5 : (last - lower) / (upper - lower);
+  const zScore = stdDev > 0 ? (last - mean) / stdDev : 0;
+  const squeeze = bandwidth < 0.0015;
+
+  return {
+    period,
+    mult,
+    middle: mean,
+    upper,
+    lower,
+    last,
+    bandwidth,
+    percentB,
+    zScore,
+    squeeze,
+  };
+}
+
+function getBollingerBias(side, bollinger) {
+  if (!bollinger) return 'neutral';
+  if (side === 'BUY_YES') {
+    if (bollinger.percentB <= 0.35 || bollinger.zScore <= -0.5) return 'favorable';
+    if (bollinger.percentB >= 0.9 || bollinger.zScore >= 1.5) return 'unfavorable';
+    return 'neutral';
+  }
+  if (side === 'BUY_NO') {
+    if (bollinger.percentB >= 0.65 || bollinger.zScore >= 0.5) return 'favorable';
+    if (bollinger.percentB <= 0.1 || bollinger.zScore <= -1.5) return 'unfavorable';
+    return 'neutral';
+  }
+  return 'neutral';
+}
+
 // Edge velocity: is the edge currently OPENING (positive) or CLOSING (negative)?
 // Only enter when edge is expanding — avoids chasing edges that already peaked.
 // Uses relative window (last half vs first half of recent history) so it works
@@ -1644,6 +1698,8 @@ function runArbitrageCheck() {
     polyOdds:    signalCandidate.polyOdds,
     betSize:     signalCandidate.betSize,
     confidence:  signalCandidate.confidence,
+    bollinger:   signalCandidate.bollinger,
+    bollingerBias: signalCandidate.bollingerBias,
     timestamp:   signalCandidate.timestamp,
   };
   const side = signalCandidate.side;
@@ -1688,6 +1744,8 @@ function runArbitrageCheck() {
         polyOdds: altSignal.polyOdds,
         betSize: altSignal.betSize,
         confidence: altSignal.confidence,
+        bollinger: altSignal.bollinger,
+        bollingerBias: altSignal.bollingerBias,
         timestamp: altSignal.timestamp,
       };
     }
@@ -1767,6 +1825,8 @@ function runArbitrageCheck() {
     vpin: diagnostics.vpin || 0,
     btcSpike,
     isSpike,
+    bollinger: signalCandidate.bollinger,
+    bollingerBias: signalCandidate.bollingerBias,
   });
   if (!canTrade) diagnostics.blockers.push('max_open_positions');
   if (!stableOk) diagnostics.blockers.push('stable_edge');
@@ -2220,6 +2280,7 @@ function broadcastMarketData() {
       edgeHistory:  state.edgeHistory.slice(-80),
       priceChart:   state.priceChart.slice(-100),
       currentCandle:state.currentCandle,
+      bollinger:    computeBollinger(),
       priceSource:  state.priceSource,
       timestamp:    Date.now(),
     },
@@ -2420,6 +2481,7 @@ app.get('/api/candles', (req, res) => {
     impliedProb:   implied,
     polyOdds:      poly,
     edge,
+    bollinger:     computeBollinger(),
   });
 });
 
@@ -2438,6 +2500,7 @@ app.get('/api/debug/feed', (_req, res) => {
     simMarkets: state.markets.filter(m => !m.live).length,
     bestMarket: getBestMarket()?.question || null,
     signalDiagnostics: state.signalDiagnostics,
+    bollinger: computeBollinger(),
     polyLiveMarketId: state.polyLive.marketId,
     polyLiveMarketIds: state.polyLive.marketIds,
     polyLiveAssetIds: state.polyLive.assetIds,
