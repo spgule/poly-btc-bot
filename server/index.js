@@ -1272,6 +1272,7 @@ function hasTradableLiveMarket(now = Date.now()) {
     if (!m.live || m.priceIsEstimated) return false;
     const minLeft = getMarketMinutesLeft(m, now);
     if (minLeft < 1 || minLeft > 1440) return false;
+    if (Number(m.volume || 0) < 50000) return false;
     return getMarketPriceDistance(m) <= 0.42;
   });
 }
@@ -1379,6 +1380,7 @@ function getBestMarket(preferLiveOnly = false) {
     if (priceDist > 0.42) return { m, score: -1 }; // YES > 0.92 or < 0.08 — exclude
     const q = (m.question || '').toLowerCase();
     const isUpOrDown = /up or down/.test(q);
+    if (m.live && Number(m.volume || 0) < 50000) return { m, score: -1 };
     if (isSim && minLeft > 45) return { m, score: -1 };
     const strike = getSimStrike(m);
     const strikeGap = isSim && strike && state.btcPrice
