@@ -374,6 +374,99 @@ async function binanceRestGet(path, params = {}, timeout = 5000, preferredBase =
   throw lastErr || new Error(`Binance REST failed for ${path}`);
 }
 
+async function fetchFreshBinancePrice(preferredBase = null) {
+  const cacheBust = Date.now();
+  const attempts = [
+    async () => {
+      const { data, base } = await binanceRestGet(
+        '/ticker/price',
+        { symbol: 'BTCUSDT', _t: cacheBust },
+        5000,
+        preferredBase
+      );
+      return {
+        price: parseFloat(data?.price),
+        qty: 0,
+        source: 'ticker-price',
+        base,
+      };
+    },
+    async () => {
+      const { data, base } = await binanceRestGet(
+        '/ticker/bookTicker',
+        { symbol: 'BTCUSDT', _t: cacheBust },
+        5000,
+        preferredBase
+      );
+      const bid = parseFloat(data?.bidPrice);
+      const ask = parseFloat(data?.askPrice);
+      const price = bid > 0 && ask > 0 ? (bid + ask) / 2 : NaN;
+      return {
+        price,
+        qty: 0,
+        source: 'book-ticker',
+        base,
+      };
+    },
+    async () => {
+      const { data, base } = await binanceRestGet(
+        '/trades',
+        { symbol: 'BTCUSDT', limit: 1, _t: cacheBust },
+        5000,
+        preferredBase
+      );
+      const trade = Array.isArray(data) ? data[0] : null;
+      return {
+        price: parseFloat(trade?.price),
+        qty: parseFloat(trade?.qty || 0),
+        source: 'trades',
+        base,
+      };
+    },
+    async () => {
+      const { data, base } = await binanceRestGet(
+        '/aggTrades',
+        { symbol: 'BTCUSDT', limit: 1, _t: cacheBust },
+        5000,
+        preferredBase
+      );
+      const trade = Array.isArray(data) ? data[0] : null;
+      return {
+        price: parseFloat(trade?.p),
+        qty: parseFloat(trade?.q || 0),
+        source: 'agg-trades',
+        base,
+      };
+    },
+    async () => {
+      const { data, base } = await binanceRestGet(
+        '/klines',
+        { symbol: 'BTCUSDT', interval: '1s', limit: 1, _t: cacheBust },
+        6000,
+        preferredBase
+      );
+      const kline = Array.isArray(data) ? data[0] : null;
+      return {
+        price: parseFloat(kline?.[4]),
+        qty: parseFloat(kline?.[5] || 0),
+        source: '1s-kline',
+        base,
+      };
+    },
+  ];
+
+  let lastErr = null;
+  for (const attempt of attempts) {
+    try {
+      const result = await attempt();
+      if (result.price && isFinite(result.price) && result.price > 1000) return result;
+    } catch (e) {
+      lastErr = e;
+    }
+  }
+  throw lastErr || new Error('Fresh Binance REST price unavailable');
+}
+
 function connectBinance() {
   if (binanceTimer) { clearTimeout(binanceTimer); binanceTimer = null; }
   const wsUrl = BINANCE_WS_URLS[wsUrlIndex % BINANCE_WS_URLS.length];
@@ -453,15 +546,15 @@ async function pollBinanceRest() {
   // If WS is stale (connected but no ticks), keep price alive via REST/fallbacks.
   if (isWsFresh()) return;
   try {
-    const { data } = await binanceRestGet('/ticker/price', { symbol: 'BTCUSDT' }, 5000);
-    const price = parseFloat(data.price);
+    const fresh = await fetchFreshBinancePrice();
+    const price = parseFloat(fresh.price);
     if (!price || isNaN(price)) return;
     state.btcPrice = price;
     const now = Date.now();
     state.priceHistory.push({ price, time: now });
     state.priceHistory = state.priceHistory.filter(p => now - p.time <= PRICE_HIST_MS);
     addChartPoint(price, now);
-    updateCandle(price, now, 0);
+    updateCandle(price, now, fresh.qty || 0);
     state.priceSource = 'binance-rest';
     if (state.trading.active && now - lastArbCheckTs >= 500) {
       lastArbCheckTs = now;
@@ -1780,6 +1873,12 @@ function broadcast(payload) {
 const app = express();
 app.use(cors({ origin: '*' }));
 app.use(express.json());
+app.use('/api', (_req, res, next) => {
+  res.set('Cache-Control', 'no-store, no-cache, must-revalidate, proxy-revalidate');
+  res.set('Pragma', 'no-cache');
+  res.set('Expires', '0');
+  next();
+});
 
 // Serve the built frontend from ../dist if it exists (Railway production)
 const distPath = path.join(__dirname, '..', 'dist');

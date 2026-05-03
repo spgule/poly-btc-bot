@@ -23,7 +23,8 @@ export function getWsUrl() {
 async function post(path, body = {}) {
   const res = await fetch(`${BASE}${path}`, {
     method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
+    headers: { 'Content-Type': 'application/json', 'Cache-Control': 'no-cache' },
+    cache: 'no-store',
     body: JSON.stringify(body),
   });
   if (!res.ok) {
@@ -34,7 +35,10 @@ async function post(path, body = {}) {
 }
 
 async function get(path) {
-  const res = await fetch(`${BASE}${path}`);
+  const res = await fetch(`${BASE}${path}`, {
+    cache: 'no-store',
+    headers: { 'Cache-Control': 'no-cache' },
+  });
   if (!res.ok) throw new Error(res.statusText);
   return res.json();
 }

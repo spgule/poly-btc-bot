@@ -130,7 +130,10 @@ function useBot() {
         const [st, mkts, prices, candleData] = await Promise.all([
           api.getStatus(),
           api.getMarkets(),
-          fetch(BASE + '/api/prices').then(r => r.json()).catch(() => null),
+          fetch(BASE + '/api/prices', {
+            cache: 'no-store',
+            headers: { 'Cache-Control': 'no-cache' },
+          }).then(r => r.json()).catch(() => null),
           api.getCandles().catch(() => null),
         ]);
         if (st) setStatus(st);
