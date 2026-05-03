@@ -213,7 +213,7 @@ const state = {
   markets:          [],
   currentSignal:    null,
   binanceConnected: false,
-  priceSource:      'binance',  // 'binance' | 'coingecko'
+  priceSource:      'binance',  // 'binance' | 'binance-rest' | 'unavailable'
   lastPriceChartTs: 0,
   candles:          [],   // closed 5s OHLCV candles ({ time (s), open, high, low, close, ticks })
   currentCandle:    null, // currently forming 5s candle
@@ -819,79 +819,15 @@ async function pollBinanceRest() {
       broadcastMarketData();
     }
   } catch (e) {
-    // Binance REST failed — try fallback price sources (Railway IPs often blocked by Binance)
-    // Throttle: 3s minimum between fallback calls.
-    // Kraken is first — no rate limit on public endpoints and very reliable from cloud IPs.
-    // CoinGecko is second — free tier ~30 req/min, safe at 3s interval.
-    // Coinbase is last resort.
-    const nowFb = Date.now();
-    if (nowFb - (pollBinanceRest._lastFallback || 0) < 3000) return;
-    pollBinanceRest._lastFallback = nowFb;
-
-    let fbPrice = null;
-    let fbSource = 'unavailable';
-
-    // Fallback 1: Kraken (no rate limit, cloud-friendly)
-    try {
-      const { data: krData } = await axios.get(
-        'https://api.kraken.com/0/public/Ticker',
-        { params: { pair: 'XBTUSD' }, timeout: 4000 }
-      );
-      const p = parseFloat(krData?.result?.XXBTZUSD?.c?.[0]);
-      if (p && !isNaN(p) && p > 1000) { fbPrice = p; fbSource = 'kraken'; }
-    } catch (_) { /* try next */ }
-
-    // Fallback 2: CoinGecko (free, ~30 req/min)
-    if (!fbPrice) {
-      try {
-        const { data: cgData } = await axios.get(
-          'https://api.coingecko.com/api/v3/simple/price',
-          { params: { ids: 'bitcoin', vs_currencies: 'usd' }, timeout: 4000 }
-        );
-        const p = cgData?.bitcoin?.usd;
-        if (p && !isNaN(p) && p > 1000) { fbPrice = p; fbSource = 'coingecko'; }
-      } catch (_) { /* try next */ }
-    }
-
-    // Fallback 3: Coinbase public price (no auth)
-    if (!fbPrice) {
-      try {
-        const { data: cbData } = await axios.get(
-          'https://api.coinbase.com/v2/prices/BTC-USD/spot',
-          { timeout: 4000 }
-        );
-        const p = parseFloat(cbData?.data?.amount);
-        if (p && !isNaN(p) && p > 1000) { fbPrice = p; fbSource = 'coinbase'; }
-      } catch (_) { /* all fallbacks failed */ }
-    }
-
-    if (fbPrice) {
-      state.btcPrice    = fbPrice;
-      state.priceSource = fbSource;
-      const now = Date.now();
-      state.priceHistory.push({ price: fbPrice, time: now });
-      state.priceHistory = state.priceHistory.filter(p => now - p.time <= PRICE_HIST_MS);
-      addChartPoint(fbPrice, now);
-      updateCandle(fbPrice, now, 0);
-      if (state.trading.active && now - lastArbCheckTs >= 1000) {
-        lastArbCheckTs = now;
-        runArbitrageCheck();
-      }
-      if (now - lastBroadcastTs >= 500) {
-        lastBroadcastTs = now;
-        broadcastMarketData();
-      }
-    } else {
-      state.priceSource = 'unavailable';
-      console.warn('[Price] Binance WS + REST + CoinGecko + Kraken + Coinbase all unavailable');
-    }
+    state.priceSource = 'unavailable';
+    console.warn('[Price] Binance WS + REST unavailable; keeping last confirmed Binance price');
   }
 }
 
 // ── BINANCE KLINES HISTORY (boot-time) ────────────────────────────────────────────────
-// Seeds priceHistory with sub-second resolution for the momentum model.
-// Strategy: try 1s klines first; if unavailable, interpolate 1m klines into
-// synthetic 1s points (linear interpolation between each minute's OHLC).
+// Seeds priceHistory from real Binance data only.
+// Strategy: prefer 1s klines; if unavailable, use real 1m close points and
+// approximate candles only for chart continuity (never synthetic priceHistory).
 async function loadBinanceHistory() {
   let currentPrice = state.btcPrice;
   try {
@@ -930,22 +866,6 @@ async function loadBinanceHistory() {
       state.priceChart = klines1m.map(k => ({ t: Number(k[0]), p: parseFloat(k[4]) }));
       state.lastPriceChartTs = state.priceChart[state.priceChart.length - 1]?.t || 0;
 
-      // Interpolate each 1m kline into 60 synthetic 1s price points
-      // Uses linear interpolation open→close within each minute
-      // This gives the momentum model enough sub-second resolution to work
-      const syntheticPoints = [];
-      for (const k of klines1m) {
-        const openTs  = Number(k[0]);
-        const open    = parseFloat(k[1]);
-        const close   = parseFloat(k[4]);
-        const steps   = 60;
-        for (let i = 0; i < steps; i++) {
-          syntheticPoints.push({
-            time:  openTs + i * 1000,
-            price: open + (close - open) * (i / steps),
-          });
-        }
-      }
       // Keep only last 5 minutes (PRICE_HIST_MS)
       const cutoff = Date.now() - PRICE_HIST_MS;
       state.priceHistory = klines1m
@@ -987,58 +907,13 @@ async function loadBinanceHistory() {
   } catch (e) {
     console.warn('[Binance] History load failed:', e.message);
     try {
-      console.log('[Fallback] Attempting to load history from Kraken...');
-      const krRes = await axios.get('https://api.kraken.com/0/public/OHLC', {
-        params: { pair: 'XBTUSD', interval: 1 },
-        timeout: 12000
-      });
-      const klines1m = krRes.data?.result?.XXBTZUSD;
-      if (Array.isArray(klines1m) && klines1m.length > 0) {
-        currentPrice = parseFloat(klines1m[klines1m.length - 1][4]);
-        state.btcPrice = currentPrice;
-        
-        // Build priceChart
-        state.priceChart = klines1m.map(k => ({ t: Number(k[0]) * 1000, p: parseFloat(k[4]) }));
-        state.lastPriceChartTs = state.priceChart[state.priceChart.length - 1]?.t || 0;
-        
-        // Build synthetic points
-        const syntheticPoints = [];
-        for (const k of klines1m) {
-          const openTs  = Number(k[0]) * 1000;
-          const open    = parseFloat(k[1]);
-          const close   = parseFloat(k[4]);
-          const steps   = 60;
-          for (let i = 0; i < steps; i++) {
-            syntheticPoints.push({
-              time:  openTs + i * 1000,
-              price: open + (close - open) * (i / steps),
-            });
-          }
-        }
-        const cutoff = Date.now() - PRICE_HIST_MS;
-        state.priceHistory = klines1m
-          .map(k => ({ time: Number(k[0]) * 1000, price: parseFloat(k[4]) }))
-          .filter(p => p.time >= cutoff);
-
-        buildApproxCandlesFrom1mKlines(
-          klines1m.map(k => [Number(k[0]) * 1000, k[1], k[2], k[3], k[4], k[6] ?? k[5] ?? 0]),
-          cutoff
-        );
-
-        console.log(`[Kraken Fallback] History: ${state.priceHistory.length} pts, ${state.candles.length} candles, price=$${currentPrice}`);
-      }
-    } catch (err) {
-      console.warn('[Kraken Fallback] History load failed:', err.message);
-      // Minimal fallback: just get current price
-      try {
-        const { data } = await binanceRestGet('/ticker/price', { symbol: 'BTCUSDT' }, 5000);
-        currentPrice       = parseFloat(data.price) || currentPrice;
-        seedMinimalChartState(currentPrice, Date.now(), 'binance-rest');
-        console.log(`[Binance] Emergency seed: price=$${currentPrice} (waiting for real ticks)`);
-      } catch (_) {
-        if (currentPrice && isFinite(currentPrice) && currentPrice > 0) {
-          seedMinimalChartState(currentPrice, Date.now(), state.priceSource || 'bootstrap');
-        }
+      const { data } = await binanceRestGet('/ticker/price', { symbol: 'BTCUSDT' }, 5000);
+      currentPrice       = parseFloat(data.price) || currentPrice;
+      seedMinimalChartState(currentPrice, Date.now(), 'binance-rest');
+      console.log(`[Binance] Emergency seed: price=$${currentPrice} (waiting for real ticks)`);
+    } catch (_) {
+      if (currentPrice && isFinite(currentPrice) && currentPrice > 0) {
+        seedMinimalChartState(currentPrice, Date.now(), state.priceSource || 'bootstrap');
       }
     }
   }
@@ -1802,8 +1677,8 @@ function openPosition(signal) {
 
 // ── SIM MARKET PRICE MODEL ───────────────────────────────────────────────────────────────
 // Updates prices for sim (non-live) markets every 2s using a proper binary option model.
-// This mimics how a real Polymarket market maker reprices based on the underlying asset.
-// Real markets (live:true) are updated via fetchBTCMarkets() every 90s — same as LIVE mode.
+// Sim markets are repriced every 2s from the same binary option model used for
+// live implied calculation. Real market metadata still refreshes from Gamma.
 function updateSimMarketPrices() {
   if (!state.btcPrice || state.btcPrice <= 0) return;
 
@@ -1816,15 +1691,11 @@ function updateSimMarketPrices() {
   if (activeSims.length === 0 || usableSims.length === 0) seedSimMarkets();
   if (state.markets.length === 0) return;
 
-  // Sim markets must mirror the same ~90s lag as the Gamma API has for live markets.
-  // Use the real BTC price from 90s ago (from priceHistory) — not the current price.
-  // This way: implied(BTC now) vs poly(BTC 90s ago) → edge is non-zero when BTC moved.
   const btcLagged = state.btcPrice;
 
   for (const m of state.markets) {
-    if (m.live) continue; // real markets updated by fetchBTCMarkets every 90s
+    if (m.live) continue;
     if (!m.outcomePrices) m.outcomePrices = [0.5, 0.5];
-    // Price with lagged BTC — mirrors Gamma API poll cadence
     const rawProb = computeBinaryMid(m, btcLagged);
     const newYes = clampProb(rawProb);
     m.outcomePrices[0] = Math.round(newYes * 1000) / 1000;
