@@ -1801,8 +1801,12 @@ function runArbitrageCheck() {
 
   if (!state.config.autoTrade) diagnostics.blockers.push('auto_trade_disabled');
   if (state.currentSignal.betSize < 2) diagnostics.blockers.push('bet_too_small');
+  const liveVolumeMin = 50000;
+  const liveVolume = Number(tradeMarket?.volume || 0);
+  const volumeOk = !tradeMarket.live || liveVolume >= liveVolumeMin;
+  if (!volumeOk) diagnostics.blockers.push('market_volume');
 
-  if (state.config.autoTrade && state.currentSignal.betSize >= 2 && canTrade && stableOk && safeBalance && !hasOpposite && exposureOk) {
+  if (state.config.autoTrade && state.currentSignal.betSize >= 2 && canTrade && stableOk && safeBalance && !hasOpposite && exposureOk && volumeOk) {
     diagnostics.blockReason = 'READY';
     setSignalDiagnostics(diagnostics);
     executeTrade(state.currentSignal);
