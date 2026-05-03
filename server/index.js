@@ -129,8 +129,11 @@ const PORT           = process.env.PORT || 3001;
 // Ordered WS failover list. Some hosts/regions connect to one endpoint but
 // receive no ticks. Rotate automatically until one delivers real messages.
 const BINANCE_WS_URLS = [
-  'wss://stream.binance.com:9443/ws/btcusdt@trade',
-  'wss://stream.binance.com:443/ws/btcusdt@trade',
+  'wss://data-stream.binance.vision/ws/btcusdt@aggTrade',
+  'wss://data-stream.binance.vision:443/ws/btcusdt@aggTrade',
+  'wss://data-stream.binance.vision:9443/ws/btcusdt@aggTrade',
+  'wss://stream.binance.com:9443/ws/btcusdt@aggTrade',
+  'wss://stream.binance.com:443/ws/btcusdt@aggTrade',
   'wss://stream.binance.us:9443/ws/btcusdt@trade',
   'wss://stream.binance.us:443/ws/btcusdt@trade',
 ];
