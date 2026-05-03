@@ -134,7 +134,10 @@ const BINANCE_WS_URLS = [
   'wss://stream.binance.com:443/ws/btcusdt@trade',
   'wss://stream.binance.us:443/ws/btcusdt@trade',
 ];
-const BINANCE_REST   = 'https://api.binance.us/api/v3';
+const BINANCE_REST_URLS = [
+  'https://api.binance.com/api/v3',
+  'https://api.binance.us/api/v3',
+];
 const POLY_GAMMA     = 'https://gamma-api.polymarket.com';
 const LAG_MS         = 2700;   // Polymarket average update lag
 const WS_STALE_MS    = 7000;   // If no WS tick in this window, treat feed as stale
@@ -246,6 +249,22 @@ function isWsFresh() {
   return state.binanceConnected && (Date.now() - lastWsMsgTs <= WS_STALE_MS);
 }
 
+async function binanceRestGet(path, params = {}, timeout = 5000, preferredBase = null) {
+  const orderedBases = preferredBase
+    ? [preferredBase, ...BINANCE_REST_URLS.filter(b => b !== preferredBase)]
+    : BINANCE_REST_URLS;
+  let lastErr = null;
+  for (const base of orderedBases) {
+    try {
+      const { data } = await axios.get(`${base}${path}`, { params, timeout });
+      return { data, base };
+    } catch (e) {
+      lastErr = e;
+    }
+  }
+  throw lastErr || new Error(`Binance REST failed for ${path}`);
+}
+
 function connectBinance() {
   if (binanceTimer) { clearTimeout(binanceTimer); binanceTimer = null; }
   const wsUrl = BINANCE_WS_URLS[wsUrlIndex % BINANCE_WS_URLS.length];
@@ -325,10 +344,7 @@ async function pollBinanceRest() {
   // If WS is stale (connected but no ticks), keep price alive via REST/fallbacks.
   if (isWsFresh()) return;
   try {
-    const { data } = await axios.get(`${BINANCE_REST}/ticker/price`, {
-      params: { symbol: 'BTCUSDT' },
-      timeout: 5000,
-    });
+    const { data } = await binanceRestGet('/ticker/price', { symbol: 'BTCUSDT' }, 5000);
     const price = parseFloat(data.price);
     if (!price || isNaN(price)) return;
     state.btcPrice = price;
@@ -423,18 +439,31 @@ async function pollBinanceRest() {
 async function loadBinanceHistory() {
   let currentPrice = state.btcPrice;
   try {
-    // Always fetch 1m klines (reliable, low weight) + 24h ticker
-    const [klinesRes, tickerRes] = await Promise.all([
-      axios.get(`${BINANCE_REST}/klines`, {
-        params: { symbol: 'BTCUSDT', interval: '1m', limit: 300 },
-        timeout: 12000,
-      }),
-      axios.get(`${BINANCE_REST}/ticker/24hr`, {
-        params: { symbol: 'BTCUSDT' }, timeout: 8000,
-      }),
-    ]);
-    const klines1m = klinesRes.data;
-    const ticker   = tickerRes.data;
+    // Always fetch 1m klines + 24h ticker from the same Binance REST host.
+    let klines1m = null;
+    let ticker = null;
+    let historyBase = null;
+    let lastHistoryErr = null;
+    for (const base of BINANCE_REST_URLS) {
+      try {
+        const [klinesRes, tickerRes] = await Promise.all([
+          axios.get(`${base}/klines`, {
+            params: { symbol: 'BTCUSDT', interval: '1m', limit: 300 },
+            timeout: 12000,
+          }),
+          axios.get(`${base}/ticker/24hr`, {
+            params: { symbol: 'BTCUSDT' }, timeout: 8000,
+          }),
+        ]);
+        klines1m = klinesRes.data;
+        ticker = tickerRes.data;
+        historyBase = base;
+        break;
+      } catch (e) {
+        lastHistoryErr = e;
+      }
+    }
+    if (!historyBase) throw (lastHistoryErr || new Error('Binance history unavailable'));
 
     if (Array.isArray(klines1m) && klines1m.length > 0) {
       currentPrice = parseFloat(klines1m[klines1m.length - 1][4]);
@@ -488,15 +517,17 @@ async function loadBinanceHistory() {
       state.candles       = sorted.slice(0, -1);
       state.currentCandle = sorted[sorted.length - 1] || null;
 
-      console.log(`[Binance] History: ${state.priceHistory.length} pts, ${state.candles.length} candles, price=$${currentPrice}`);
+      console.log(`[Binance] History (${historyBase}): ${state.priceHistory.length} pts, ${state.candles.length} candles, price=$${currentPrice}`);
     }
 
     // Attempt to upgrade to real 1s klines (more precise, but may not be available)
     try {
-      const { data: klines1s } = await axios.get(`${BINANCE_REST}/klines`, {
-        params: { symbol: 'BTCUSDT', interval: '1s', limit: 300 },
-        timeout: 8000,
-      });
+      const { data: klines1s } = await binanceRestGet(
+        '/klines',
+        { symbol: 'BTCUSDT', interval: '1s', limit: 300 },
+        8000,
+        historyBase
+      );
       if (Array.isArray(klines1s) && klines1s.length > 0) {
         state.priceHistory = klines1s.map(k => ({ time: Number(k[0]), price: parseFloat(k[4]) }));
         console.log(`[Binance] Upgraded to ${klines1s.length} real 1s klines`);
@@ -568,9 +599,7 @@ async function loadBinanceHistory() {
       console.warn('[Kraken Fallback] History load failed:', err.message);
       // Minimal fallback: just get current price
       try {
-        const { data } = await axios.get(`${BINANCE_REST}/ticker/price`, {
-          params: { symbol: 'BTCUSDT' }, timeout: 5000,
-        });
+        const { data } = await binanceRestGet('/ticker/price', { symbol: 'BTCUSDT' }, 5000);
         currentPrice       = parseFloat(data.price) || currentPrice;
         state.btcPrice     = currentPrice;
         const now = Date.now();

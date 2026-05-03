@@ -191,13 +191,23 @@ export default function CandleChart({ candles = [], currentCandle = null }) {
   // â”€â”€ Effect: real-time forming candle tick (every ~150ms from WS) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
   // ————————————————— Effect: real-time forming candle tick (every ~150ms from WS) —————
   useEffect(() => {
-    if (!seriesRef.current || !currentCandle || loadedCountRef.current === 0) return;
+    if (!seriesRef.current || !currentCandle) return;
     const t = toTime(currentCandle.time);
     if (t === 0) return;
 
     try {
       const o = Number(currentCandle.open), h = Number(currentCandle.high), l = Number(currentCandle.low), cl = Number(currentCandle.close), tk = Number(currentCandle.ticks) || 1;
       if (!isNaN(o) && !isNaN(h) && !isNaN(l) && !isNaN(cl)) {
+        // Bootstrap chart with the forming candle when no closed candles exist yet.
+        if (loadedCountRef.current === 0 && (!candlesRef.current || candlesRef.current.length === 0)) {
+          seriesRef.current.setData([{ time: t, open: o, high: h, low: l, close: cl }]);
+          if (volRef.current) volRef.current.setData([{
+            time: t, value: tk,
+            color: cl >= o ? 'rgba(0,224,130,0.28)' : 'rgba(255,68,102,0.28)',
+          }]);
+          lastChartTimeRef.current = t;
+          return;
+        }
         seriesRef.current.update({ time: t, open: o, high: h, low: l, close: cl });
         if (volRef.current) volRef.current.update({
           time: t, value: tk,
