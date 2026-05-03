@@ -58,8 +58,23 @@ export default function ConfigModal({ onClose, initialConfig }) {
   const [showKey, setShowKey] = useState(false);
   const [saving,  setSaving]  = useState(false);
   const [error,   setError]   = useState(null);
+  const [resetting, setResetting] = useState(false);
+  const [resetConfirm, setResetConfirm] = useState(false);
 
   const set = (k, v) => setCfg(c => ({ ...c, [k]: v }));
+
+  async function handleReset() {
+    if (!resetConfirm) { setResetConfirm(true); return; }
+    setResetting(true); setError(null); setResetConfirm(false);
+    try {
+      await api.simReset();
+      onClose();
+    } catch (e) {
+      setError(e.message);
+    } finally {
+      setResetting(false);
+    }
+  }
 
   async function handleSave() {
     setSaving(true); setError(null);
@@ -381,6 +396,27 @@ export default function ConfigModal({ onClose, initialConfig }) {
           {error && (
             <div style={{ marginBottom: 14, padding: '8px 12px', background: 'var(--red-bg)', border: '1px solid var(--red-b)', borderRadius: 4, fontSize: 10, color: 'var(--red)' }}>
               {error}
+            </div>
+          )}
+
+          {/* SIM Reset — only visible in SIM mode */}
+          {cfg.mode === 'SIM' && (
+            <div style={{ borderTop: '1px solid var(--border)', paddingTop: 16, marginBottom: 16 }}>
+              <span style={S.label}>Danger Zone</span>
+              <span style={S.hint}>Wipes all SIM trades, positions and resets balance to starting capital. Irreversible.</span>
+              <button
+                className="btn btn-red"
+                style={{ width: '100%', marginTop: 6 }}
+                onClick={handleReset}
+                disabled={resetting}
+              >
+                {resetting ? 'Resetting…' : resetConfirm ? '⚠ Click again to confirm reset' : '🗑 Reset SIM Data'}
+              </button>
+              {resetConfirm && (
+                <div style={{ fontSize: 9, color: 'var(--red)', marginTop: 4, textAlign: 'center' }}>
+                  All trades and P&L will be permanently erased.
+                </div>
+              )}
             </div>
           )}
 

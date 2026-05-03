@@ -817,6 +817,48 @@ function runArbitrageCheck() {
   const exposureOk = totalExposure + betSize <= effectiveBal * 0.40;
   // Keep enough cash to cover the bet
   const safeBalance = state.trading.balance >= betSize;
+
+  // ── ENTRY QUALITY GUARDS (applied before auto-trade and signal display) ───────
+  // Based on research: homerun, aulekator, gamma-trade-lab, MrFadiAi
+
+  // 1. SETTLEMENT TIMING GUARD
+  // In the final 3 minutes of a short-term binary (≤30 min), 60-90% of informed
+  // volume arrives. Entering here is strongly adversely selected.
+  const mktMsLeft  = tradeMarket.endDate ? new Date(tradeMarket.endDate).getTime() - now : Infinity;
+  const isShortMkt = mktMsLeft <= 30 * 60000;
+  if (isShortMkt && mktMsLeft < 3 * 60000) {
+    state.currentSignal = null;
+    return broadcastSignal();
+  }
+
+  // 2. BTC DIRECTIONAL CONFIRMATION
+  // BTC trend (last 10s) must not be strongly OPPOSING our bet direction.
+  // Prevents buying YES while BTC is in a sharp downtrend, and vice versa.
+  // Only blocked when counter-trend > 5bps in 10s AND edge < 3× minimum.
+  const btc10sAgo   = getPriceAt(10000);
+  const btcTrend10s = btc10sAgo > 0 ? (state.btcPrice - btc10sAgo) / btc10sAgo : 0;
+  const counterFlow = side === 'BUY_YES' ? btcTrend10s < -0.0005 : btcTrend10s > 0.0005;
+  if (counterFlow && Math.abs(edge) < dynMinEdge * 3) {
+    state.currentSignal = null;
+    return broadcastSignal();
+  }
+
+  // 3. ADVERSE SELECTION COOLDOWN
+  // If ≥3 of the last 5 closed trades were losses, pause new auto-entries for 60s.
+  // Signals the bot may be in a toxic-flow regime. (gamma-trade-lab pattern)
+  const last5 = state.trading.trades.slice(0, 5);
+  if (last5.length >= 5) {
+    const lossCount = last5.filter(t => t.outcome === 'LOSS').length;
+    if (lossCount >= 3) {
+      const lastLossTs = (last5.find(t => t.outcome === 'LOSS') || {}).timestamp || 0;
+      if (now - lastLossTs < 60000) {
+        // Emit signal so UI shows it, but block auto-execution until cooldown expires
+        broadcastSignal();
+        return;
+      }
+    }
+  }
+
   if (state.config.autoTrade && betSize >= 2 && canTrade && stableOk && safeBalance && !hasOpposite && exposureOk) {
     executeTrade(state.currentSignal);
   }
@@ -1337,6 +1379,31 @@ app.post('/api/positions/:id/close', (req, res) => {
   if (!pos) return res.status(404).json({ error: 'Position not found or already closed' });
   closePosition(pos, pos.markOdds, 'MANUAL');
   res.json({ success: true });
+});
+
+app.post('/api/sim/reset', (req, res) => {
+  if (state.config.mode !== 'SIM') {
+    return res.status(400).json({ error: 'Reset only available in SIM mode' });
+  }
+  // Force-close all open positions without P&L (clean wipe)
+  state.positions.forEach(p => { if (p.status === 'OPEN') p.status = 'CLOSED'; });
+  // Reset balance and stats to starting capital
+  state.trading.balance      = state.config.capital;
+  state.trading.startBalance = state.config.capital;
+  state.trading.peakBalance  = state.config.capital;
+  state.trading.trades       = [];
+  state.trading.lastTradeTs  = 0;
+  state.stats = { totalTrades: 0, wins: 0, losses: 0, totalPnl: 0, todayPnl: 0, streak: 0 };
+  state.currentSignal = null;
+  // Clear persisted trade and session files
+  try { fs.unlinkSync(TRADES_FILE); } catch (_) {}
+  saveSession();
+  broadcastStatus();
+  broadcastSignal();
+  broadcast({ type: 'TRADES_HISTORY', data: [] });
+  broadcast({ type: 'POSITIONS', data: [] });
+  console.log('[SIM] Reset — balance restored to $' + state.config.capital);
+  res.json({ success: true, balance: state.trading.balance });
 });
 
 app.get('/api/status',    (req, res) => res.json(buildStatusPayload()));
