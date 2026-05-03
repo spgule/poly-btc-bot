@@ -126,8 +126,8 @@ function saveConfig() {
 
 // ── CONSTANTS ─────────────────────────────────────────────────────────────────
 const PORT           = process.env.PORT || 3001;
-// Port 443 works through Railway's proxy; port 9443 is blocked
-const BINANCE_WS     = 'wss://stream.binance.us:443/ws/btcusdt@trade';
+// Note: Outbound 9443 works on Railway. Binance.us requires 9443 for WS.
+const BINANCE_WS     = 'wss://stream.binance.us:9443/ws/btcusdt@trade';
 const BINANCE_REST   = 'https://api.binance.us/api/v3';
 const POLY_GAMMA     = 'https://gamma-api.polymarket.com';
 const LAG_MS         = 2700;   // Polymarket average update lag
