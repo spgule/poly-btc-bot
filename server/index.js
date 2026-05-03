@@ -271,6 +271,30 @@ const state = {
 
   markets:          [],
   currentSignal:    null,
+  signalDiagnostics: {
+    ts: null,
+    marketId: null,
+    question: null,
+    side: null,
+    implied: null,
+    poly: null,
+    edge: null,
+    dynMinEdge: null,
+    blockReason: 'INIT',
+    blockers: [],
+    confirmedSignals: 0,
+    trendMatches: false,
+    velOk: false,
+    edgeOk: false,
+    stableOk: false,
+    canTrade: false,
+    safeBalance: false,
+    exposureOk: false,
+    hasOpposite: false,
+    vpin: 0,
+    btcSpike: 0,
+    isSpike: false,
+  },
   binanceConnected: false,
   priceSource:      'binance',  // 'binance' | 'binance-rest' | 'unavailable'
   lastPriceChartTs: 0,
@@ -329,6 +353,14 @@ function parseClobTokenIds(raw) {
 
 function clampProb(value) {
   return Math.max(0.03, Math.min(0.97, value));
+}
+
+function setSignalDiagnostics(patch = {}) {
+  state.signalDiagnostics = {
+    ...state.signalDiagnostics,
+    ...patch,
+    ts: patch.ts ?? Date.now(),
+  };
 }
 
 function getPolyAssetBook(assetId) {
@@ -1547,6 +1579,7 @@ function runArbitrageCheck() {
   // 4-layer loss limit check
   if (state.trading.pausedUntil > Date.now()) {
     state.currentSignal = null;
+    setSignalDiagnostics({ blockReason: 'PAUSED_UNTIL', blockers: ['paused_until'] });
     return;
   }
 
@@ -1556,11 +1589,30 @@ function runArbitrageCheck() {
   // markets on consecutive calls (scoring is time-dependent), making the edge
   // meaningless (difference between two unrelated markets' model prices).
   const market = getBestMarket();
-  if (!market) return;
+  if (!market) {
+    state.currentSignal = null;
+    setSignalDiagnostics({ blockReason: 'NO_MARKET', blockers: ['no_market'] });
+    return;
+  }
 
   const signalCandidate = buildTradeSignal(market);
   if (!signalCandidate) {
     state.currentSignal = null;
+    const { implied, poly, edge } = computeEdge(market);
+    const volScale = Math.max(1.0, Math.min(1.5, recentVolatility(20000) / 0.0015));
+    const dynMinEdgeFail = state.config.minEdge * volScale;
+    setSignalDiagnostics({
+      marketId: market.id,
+      question: market.question,
+      side: edge > 0 ? 'BUY_YES' : 'BUY_NO',
+      implied,
+      poly,
+      edge,
+      dynMinEdge: dynMinEdgeFail,
+      edgeOk: Math.abs(edge) >= dynMinEdgeFail,
+      blockReason: 'MIN_EDGE',
+      blockers: ['min_edge'],
+    });
     return broadcastSignal();
   }
 
@@ -1660,14 +1712,21 @@ function runArbitrageCheck() {
   const isShortMkt = mktMsLeft <= 30 * 60000;
   if (isShortMkt && mktMsLeft < 3 * 60000) {
     state.currentSignal = null;
+    diagnostics.blockers.push('settlement_window');
+    diagnostics.blockReason = 'SETTLEMENT_WINDOW';
+    setSignalDiagnostics(diagnostics);
     return broadcastSignal();
   }
 
   // 2. VPIN TOXICITY
   // VPIN = |buyVol-sellVol|/totalVol; se > 0.75 → pausar entradas
   const vpin = computeVPIN();
+  diagnostics.vpin = vpin;
   if (vpin > 0.75) {
     state.currentSignal = null;
+    diagnostics.blockers.push('vpin');
+    diagnostics.blockReason = 'VPIN';
+    setSignalDiagnostics(diagnostics);
     return broadcastSignal();
   }
 
@@ -1685,9 +1744,39 @@ function runArbitrageCheck() {
   const edgeOk = Math.abs(edge) >= dynMinEdge;
 
   const confirmedSignals = [trendMatches, velOk, edgeOk].filter(Boolean).length;
+  const diagnostics = {
+    marketId: state.currentSignal.marketId,
+    question: state.currentSignal.question,
+    side: state.currentSignal.side,
+    implied,
+    poly,
+    edge,
+    dynMinEdge,
+    confirmedSignals,
+    trendMatches,
+    velOk,
+    edgeOk,
+    stableOk,
+    canTrade,
+    safeBalance,
+    exposureOk,
+    hasOpposite,
+    vpin: 0,
+    btcSpike,
+    isSpike,
+    blockers: [],
+  };
+  if (!canTrade) diagnostics.blockers.push('max_open_positions');
+  if (!stableOk) diagnostics.blockers.push('stable_edge');
+  if (!safeBalance) diagnostics.blockers.push('insufficient_balance');
+  if (!exposureOk) diagnostics.blockers.push('exposure_limit');
+  if (hasOpposite) diagnostics.blockers.push('opposite_position');
   
   if (confirmedSignals < 2 && !isSpike) {
     state.currentSignal = null;
+    diagnostics.blockers.push('signal_confirmation');
+    diagnostics.blockReason = 'SIGNAL_CONFIRMATION';
+    setSignalDiagnostics(diagnostics);
     return broadcastSignal();
   }
 
@@ -1701,14 +1790,25 @@ function runArbitrageCheck() {
       const lastLossTs = (last5.find(t => t.outcome === 'LOSS') || {}).timestamp || 0;
       if (now - lastLossTs < 60000) {
         // Emit signal so UI shows it, but block auto-execution until cooldown expires
+        diagnostics.blockers.push('recent_losses');
+        diagnostics.blockReason = 'RECENT_LOSSES';
+        setSignalDiagnostics(diagnostics);
         broadcastSignal();
         return;
       }
     }
   }
 
+  if (!state.config.autoTrade) diagnostics.blockers.push('auto_trade_disabled');
+  if (state.currentSignal.betSize < 2) diagnostics.blockers.push('bet_too_small');
+
   if (state.config.autoTrade && state.currentSignal.betSize >= 2 && canTrade && stableOk && safeBalance && !hasOpposite && exposureOk) {
+    diagnostics.blockReason = 'READY';
+    setSignalDiagnostics(diagnostics);
     executeTrade(state.currentSignal);
+  } else {
+    diagnostics.blockReason = diagnostics.blockers[0] ? diagnostics.blockers[0].toUpperCase() : 'READY_MANUAL';
+    setSignalDiagnostics(diagnostics);
   }
   broadcastSignal();
 }
@@ -2331,6 +2431,7 @@ app.get('/api/debug/feed', (_req, res) => {
     liveMarkets: state.markets.filter(m => m.live).length,
     simMarkets: state.markets.filter(m => !m.live).length,
     bestMarket: getBestMarket()?.question || null,
+    signalDiagnostics: state.signalDiagnostics,
     polyLiveMarketId: state.polyLive.marketId,
     polyLiveMarketIds: state.polyLive.marketIds,
     polyLiveAssetIds: state.polyLive.assetIds,
