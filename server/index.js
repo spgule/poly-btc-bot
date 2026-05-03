@@ -162,6 +162,7 @@ const state = {
     totalPnl:    0,
     todayPnl:    0,
     streak:      0,
+    totalFees:   0,
   },
 
   markets:          [],
@@ -681,18 +682,59 @@ function computePolyOdds() {
   return computeEdge(market).poly;
 }
 
-// Kelly criterion — quarter-Kelly for noise-resilient sizing
+// ── EMPIRICAL KELLY CALIBRATION ─────────────────────────────────────────
+// Computes win rate and win/loss ratio from the last N closed trades.
+// When enough data exists (≥20 trades), blends with the theoretical Kelly
+// computed from the edge. This grounds position sizing in actual results
+// rather than theoretical edge estimates alone.
+// Returns { winRate, avgWin, avgLoss, kellyFraction } or null if < 20 trades.
+function empiricalKellyParams(minTrades = 20, window = 100) {
+  const closed = state.trading.trades.slice(0, window);
+  if (closed.length < minTrades) return null;
+
+  const wins   = closed.filter(t => t.pnl > 0);
+  const losses = closed.filter(t => t.pnl < 0);
+  if (wins.length === 0 || losses.length === 0) return null;
+
+  const p      = wins.length / closed.length;  // empirical win rate
+  const avgWin  = wins.reduce((s, t) => s + t.pnl, 0) / wins.length;    // average $ won
+  const avgLoss = Math.abs(losses.reduce((s, t) => s + t.pnl, 0) / losses.length); // average $ lost
+  const b       = avgWin / avgLoss;            // win/loss ratio (b in Kelly formula)
+
+  // f* = (p*b - q) / b  where q = 1 - p
+  const kellyFraction = Math.max(0, Math.min(1, (p * b - (1 - p)) / b));
+  return { winRate: p, avgWin, avgLoss, b, kellyFraction };
+}
+
+// Kelly criterion — blends empirical (data-driven) with theoretical when ≥20 trades exist
 // entryPrice = cost per share; netOdds = (1 - entryPrice) / entryPrice
 function kellySize(edge, winProb, entryPrice, balance, maxBetPct) {
   if (edge <= 0 || winProb <= 0 || entryPrice <= 0 || entryPrice >= 1) return 0;
   const netOdds   = (1 - entryPrice) / entryPrice;
-  const fullKelly = (netOdds * winProb - (1 - winProb)) / netOdds;
+
+  // Theoretical Kelly (from model edge)
+  const fullKellyTheory = (netOdds * winProb - (1 - winProb)) / netOdds;
+
+  // Empirical Kelly (from actual trade results) — blended when ≥20 trades available
+  let fullKelly = fullKellyTheory;
+  const emp = empiricalKellyParams();
+  if (emp) {
+    // Blend: 60% empirical + 40% theoretical
+    // Empirical is grounded in reality; theoretical guides early-stage edge changes
+    fullKelly = emp.kellyFraction * 0.60 + fullKellyTheory * 0.40;
+  }
+
   // Quality-scaled Kelly fraction: 1/5 at low quality, up to 1/3 at perfect quality
   const quality   = edgeQuality(edge);
   const kFrac     = 0.20 + (quality - 0.5) * 0.267;
   const scaled    = Math.max(0, fullKelly * kFrac);
   const streak    = state.stats.streak;
-  const sMult     = streak < -1 ? Math.max(0.5, Math.pow(0.80, Math.abs(streak) - 1)) : 1.0;
+  // Adaptive sizing from MrFadiAi: -20% per consecutive loss, +10% per consecutive win, cap 2.5×
+  const sMult     = streak < -1
+    ? Math.max(0.4, Math.pow(0.80, Math.abs(streak) - 1))   // shrink on losing streak
+    : streak > 1
+      ? Math.min(2.5, Math.pow(1.10, streak - 1))            // grow on winning streak
+      : 1.0;
   const vol       = recentVolatility(20000);
   const vMult     = vol > 0.003 ? 0.70 : vol > 0.0015 ? 0.85 : 1.0;
   const capped    = Math.min(scaled, maxBetPct / 100) * sMult * vMult;
@@ -1071,6 +1113,7 @@ function closePosition(pos, exitOdds, reason) {
   state.stats.totalTrades++;
   state.stats.totalPnl  = Math.round((state.stats.totalPnl  + pnl) * 100) / 100;
   state.stats.todayPnl  = Math.round((state.stats.todayPnl  + pnl) * 100) / 100;
+  state.stats.totalFees = Math.round(((state.stats.totalFees || 0) + fee + (pos.spread || 0) * pos.shares + (pos.impact || 0) * pos.shares) * 100) / 100;
   if (pnl >= 0) {
     state.stats.wins++;
     state.stats.streak = state.stats.streak >= 0 ? state.stats.streak + 1 : 1;
@@ -1245,6 +1288,7 @@ function buildStatusPayload() {
     binanceConnected: state.binanceConnected,
     priceSource:   state.priceSource,
     stats:         state.stats,
+    kelly:         empiricalKellyParams(),   // null until 20 trades; then { winRate, b, kellyFraction }
     feeRate: POLY_FEE_RATE,
     config: {
       mode:                  state.config.mode,
@@ -1393,7 +1437,7 @@ app.post('/api/sim/reset', (req, res) => {
   state.trading.peakBalance  = state.config.capital;
   state.trading.trades       = [];
   state.trading.lastTradeTs  = 0;
-  state.stats = { totalTrades: 0, wins: 0, losses: 0, totalPnl: 0, todayPnl: 0, streak: 0 };
+  state.stats = { totalTrades: 0, wins: 0, losses: 0, totalPnl: 0, todayPnl: 0, streak: 0, totalFees: 0 };
   state.currentSignal = null;
   // Clear persisted trade and session files
   try { fs.unlinkSync(TRADES_FILE); } catch (_) {}
