@@ -643,6 +643,7 @@ function getDesiredPolyLiveMarket() {
   for (const pos of state.positions.filter(p => p.status === 'OPEN')) {
     pushMarket(state.markets.find(m => m.id === pos.marketId));
   }
+  pushMarket(getBestMarket(true));
   pushMarket(getBestMarket());
 
   if (assetIds.length === 0) return null;
@@ -1055,15 +1056,28 @@ async function fetchBTCMarkets() {
 }
 
 function seedSimMarkets() {
-  const base = Math.round(state.btcPrice / 1000) * 1000;
+  const btc = state.btcPrice || 0;
+  const base = Math.round(btc / 10) * 10 || 50000;
+  const strikes = [
+    { id: 'sim-1', strike: base,       minutes: 5,  volume: 185000 },
+    { id: 'sim-2', strike: base + 20,  minutes: 10, volume: 235000 },
+    { id: 'sim-3', strike: base - 20,  minutes: 15, volume: 310000 },
+    { id: 'sim-4', strike: base + 40,  minutes: 30, volume: 420000 },
+  ];
   // Keep real (live) markets intact — only replace/refresh sim markets
   const liveMarkets = state.markets.filter(m => m.live);
   state.markets = [
     ...liveMarkets,
-    { id: 'sim-1', question: `Will BTC be above $${base.toLocaleString()} in 15 min?`, outcomes: ['Yes','No'], outcomePrices: [0.52, 0.48], volume: 185000, endDate: new Date(Date.now() + 15 * 60000).toISOString(), live: false },
-    { id: 'sim-2', question: `Will BTC reach $${(base + 500).toLocaleString()} today?`,  outcomes: ['Yes','No'], outcomePrices: [0.44, 0.56], volume: 442000, endDate: new Date(Date.now() + 8 * 3600000).toISOString(), live: false },
-    { id: 'sim-3', question: 'Will BTC end the week above last week\'s close?',            outcomes: ['Yes','No'], outcomePrices: [0.55, 0.45], volume: 930000, endDate: new Date(Date.now() + 5 * 86400000).toISOString(), live: false },
-    { id: 'sim-4', question: `Will BTC make a new ATH this month?`,                        outcomes: ['Yes','No'], outcomePrices: [0.48, 0.52], volume: 2100000, endDate: new Date(Date.now() + 25 * 86400000).toISOString(), live: false },
+    ...strikes.map(({ id, strike, minutes, volume }) => ({
+      id,
+      question: `Will BTC be above $${strike.toLocaleString('en-US')} in ${minutes} min?`,
+      outcomes: ['Yes', 'No'],
+      outcomePrices: [0.5, 0.5],
+      volume,
+      startDate: new Date().toISOString(),
+      endDate: new Date(Date.now() + minutes * 60000).toISOString(),
+      live: false,
+    })),
   ];
   console.log('[Polymarket] Sim markets seeded (fallback)');
 }
@@ -1079,6 +1093,64 @@ function getPriceAt(msAgo) {
     if (d < minDiff) { minDiff = d; closest = p; }
   }
   return closest.price;
+}
+
+function getMarketMinutesLeft(market, now = Date.now()) {
+  if (!market?.endDate) return 10;
+  return (new Date(market.endDate).getTime() - now) / 60000;
+}
+
+function getMarketYesPrice(market) {
+  return market?.outcomePrices?.[0] ?? 0.5;
+}
+
+function getMarketPriceDistance(market) {
+  return Math.abs(getMarketYesPrice(market) - 0.5);
+}
+
+function getSimStrike(market) {
+  const strikeMatch = market?.question?.match(/\$([0-9,]+)/);
+  return strikeMatch ? parseFloat(strikeMatch[1].replace(/,/g, '')) : null;
+}
+
+function hasUsableSimMarket(now = Date.now()) {
+  return state.markets.some(m => {
+    if (m.live) return false;
+    const minutesLeft = getMarketMinutesLeft(m, now);
+    const strike = getSimStrike(m);
+    const strikeGap = strike && state.btcPrice ? Math.abs(strike - state.btcPrice) / state.btcPrice : 0;
+    return (
+      minutesLeft >= 2 &&
+      minutesLeft <= 45 &&
+      getMarketPriceDistance(m) <= 0.42 &&
+      strikeGap <= 0.012
+    );
+  });
+}
+
+function pickBestSimMarket(now = Date.now()) {
+  const sims = state.markets.filter(m => {
+    if (m.live) return false;
+    const minutesLeft = getMarketMinutesLeft(m, now);
+    const strike = getSimStrike(m);
+    const strikeGap = strike && state.btcPrice ? Math.abs(strike - state.btcPrice) / state.btcPrice : 0;
+    return (
+      minutesLeft >= 2 &&
+      minutesLeft <= 45 &&
+      getMarketPriceDistance(m) <= 0.42 &&
+      strikeGap <= 0.02
+    );
+  });
+  if (sims.length === 0) return null;
+  return sims.sort((a, b) => {
+    const aStrike = getSimStrike(a) ?? state.btcPrice;
+    const bStrike = getSimStrike(b) ?? state.btcPrice;
+    const aStrikeGap = Math.abs(aStrike - state.btcPrice);
+    const bStrikeGap = Math.abs(bStrike - state.btcPrice);
+    const aScore = getMarketPriceDistance(a) + aStrikeGap / Math.max(1, state.btcPrice) + getMarketMinutesLeft(a, now) / 1000;
+    const bScore = getMarketPriceDistance(b) + bStrikeGap / Math.max(1, state.btcPrice) + getMarketMinutesLeft(b, now) / 1000;
+    return aScore - bScore;
+  })[0];
 }
 
 // ── ARBITRAGE ENGINE ──────────────────────────────────────────────────────────
@@ -1138,51 +1210,53 @@ function edgeQuality(edge) {
 }
 
 // Best market to trade: prefer short-term + highest edge potential
-function getBestMarket() {
+function getBestMarket(preferLiveOnly = false) {
   if (state.markets.length === 0) return null;
   const now = Date.now();
   // "Up or Down" short-term binaries are created ~24h in advance — allow up to 24h window.
-  // Other live markets: up to 4h in LIVE (don't trade long-dated with binary model).
-  // SIM: up to 31 days (educational range).
-  const maxMinutes = state.config.mode === 'SIM' ? 44640 : 1440; // LIVE: 24h (was 4h)
+  // Other live markets: up to 24h in LIVE. SIM fallback should stay short-dated and near ATM.
+  const maxMinutes = state.config.mode === 'SIM' ? 1440 : 1440;
   const minMinutes = 1;
   const scored = state.markets.map(m => {
-    const msLeft = m.endDate ? new Date(m.endDate).getTime() - now : 10 * 60000;
-    const minLeft = msLeft / 60000;
+    if (preferLiveOnly && !m.live) return { m, score: -1 };
+    const minLeft = getMarketMinutesLeft(m, now);
     if (minLeft < minMinutes || minLeft > maxMinutes) return { m, score: -1 };
     // Block markets with no real price data — would generate false signals against 0.5
     if (m.priceIsEstimated) return { m, score: -1 };
-    // Prefer short-term (5–30 min window) for momentum arb
-    const timeScore = minLeft <= 30 ? 3 : minLeft <= 60 ? 2 : minLeft <= 1440 ? 1 : 0;
+    const isSim = !m.live;
+    // Prefer short-term (5–30 min window) for momentum arb.
+    const timeScore = minLeft <= 15 ? 4 : minLeft <= 30 ? 3 : minLeft <= 60 ? 2 : minLeft <= 1440 ? 1 : 0;
     const volScore  = m.volume >= 100000 ? 2 : m.volume >= 20000 ? 1 : 0;
     // Filter out near-certain markets (YES > 0.92 or YES < 0.08).
-    const yesPrice  = m.outcomePrices?.[0] ?? 0.5;
-    const priceDist = Math.abs(yesPrice - 0.5);
+    const yesPrice  = getMarketYesPrice(m);
+    const priceDist = getMarketPriceDistance(m);
     if (priceDist > 0.42) return { m, score: -1 }; // YES > 0.92 or < 0.08 — exclude
     const q = (m.question || '').toLowerCase();
     const isUpOrDown = /up or down/.test(q);
     const minVol = 50000;
     if (m.live && Number(m.volume || 0) < minVol) return { m, score: -1 };
+    if (isSim && minLeft > 45) return { m, score: -1 };
+    const strike = getSimStrike(m);
+    const strikeGap = isSim && strike && state.btcPrice
+      ? Math.abs(strike - state.btcPrice) / state.btcPrice
+      : 0;
+    if (isSim && strikeGap > 0.012) return { m, score: -1 };
     // Prefer markets nearer to 0.5 (more uncertainty = larger edge swings possible)
     const priceScore = priceDist < 0.10 ? 3 : priceDist < 0.25 ? 2 : priceDist < 0.40 ? 1 : 0;
     // Bonus score for Up or Down markets (these are the ideal arb target)
     const upOrDownBonus = isUpOrDown ? 2 : 0;
-    return { m, score: timeScore + volScore + priceScore + upOrDownBonus };
+    const edgeBonus = Math.min(4, Math.abs(computeEdge(m).edge) / Math.max(0.005, state.config.minEdge / 2));
+    const simBonus = isSim ? 3 : 0;
+    return { m, score: timeScore + volScore + priceScore + upOrDownBonus + edgeBonus + simBonus };
   }).filter(x => x.score >= 0).sort((a, b) => b.score - a.score);
 
   if (scored.length === 0) {
     // No real markets qualify — use simulated markets in SIM mode so the engine can trade
-    if (state.config.mode === 'SIM') {
-      // Find a usable sim market (price not too skewed — otherwise edge ≈ 0 at extremes)
-      const usableSim = state.markets.find(m =>
-        m.id && m.id.startsWith('sim-') &&
-        Math.abs((m.outcomePrices?.[0] ?? 0.5) - 0.5) <= 0.42
-      );
-      if (!usableSim) {
-        // All sim markets are deeply skewed or missing — re-seed with fresh ATM markets
+    if (state.config.mode === 'SIM' && !preferLiveOnly) {
+      if (!hasUsableSimMarket(now)) {
         seedSimMarkets();
       }
-      return state.markets.find(m => m.id && m.id.startsWith('sim-')) || state.markets[0];
+      return pickBestSimMarket(now) || state.markets.find(m => !m.live) || null;
     }
     return null;
   }
@@ -1682,21 +1756,24 @@ function openPosition(signal) {
 function updateSimMarketPrices() {
   if (!state.btcPrice || state.btcPrice <= 0) return;
 
-  // Auto-refresh sim markets if none are valid (expired, never seeded, or deeply skewed).
-  // A deeply skewed market (YES > 0.85 or < 0.15) has near-zero binary option sensitivity
-  // to BTC moves — edge stays at ~0¢ and no trades are generated. Re-seed immediately.
+  // Auto-refresh sim markets only when the ladder expired or drifted too far from spot.
+  // Price skew alone is not enough reason to reset, otherwise the ladder keeps snapping
+  // back to 0.50 and hides the true SIM edge.
   const nowMs = Date.now();
-  const activeSims = state.markets.filter(m => !m.live && m.endDate && new Date(m.endDate).getTime() > nowMs + 60000);
-  const usableSims = activeSims.filter(m => Math.abs((m.outcomePrices?.[0] ?? 0.5) - 0.5) <= 0.35);
-  if (activeSims.length === 0 || usableSims.length === 0) seedSimMarkets();
+  const activeSims = state.markets.filter(m => !m.live && getMarketMinutesLeft(m, nowMs) > 1);
+  const ladderTooFar = activeSims.length > 0 && activeSims.every(m => {
+    const strike = getSimStrike(m);
+    return strike && state.btcPrice
+      ? Math.abs(strike - state.btcPrice) / state.btcPrice > 0.012
+      : true;
+  });
+  if (activeSims.length === 0 || ladderTooFar) seedSimMarkets();
   if (state.markets.length === 0) return;
-
-  const btcLagged = state.btcPrice;
 
   for (const m of state.markets) {
     if (m.live) continue;
     if (!m.outcomePrices) m.outcomePrices = [0.5, 0.5];
-    const rawProb = computeBinaryMid(m, btcLagged);
+    const rawProb = computeBinaryMid(m, state.btcPrice);
     const newYes = clampProb(rawProb);
     m.outcomePrices[0] = Math.round(newYes * 1000) / 1000;
     m.outcomePrices[1] = Math.round((1 - m.outcomePrices[0]) * 1000) / 1000;
