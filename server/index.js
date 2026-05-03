@@ -1701,6 +1701,7 @@ function runArbitrageCheck() {
   const exposureOk = totalExposure + state.currentSignal.betSize <= effectiveBal * 0.40;
   // Keep enough cash to cover the bet
   const safeBalance = state.trading.balance >= state.currentSignal.betSize;
+  const diagnostics = { blockers: [], blockReason: null, vpin: 0 };
 
   // ── ENTRY QUALITY GUARDS (applied before auto-trade and signal display) ───────
   // Based on research: homerun, aulekator, gamma-trade-lab, MrFadiAi
@@ -1744,7 +1745,7 @@ function runArbitrageCheck() {
   const edgeOk = Math.abs(edge) >= dynMinEdge;
 
   const confirmedSignals = [trendMatches, velOk, edgeOk].filter(Boolean).length;
-  const diagnostics = {
+  Object.assign(diagnostics, {
     marketId: state.currentSignal.marketId,
     question: state.currentSignal.question,
     side: state.currentSignal.side,
@@ -1761,11 +1762,10 @@ function runArbitrageCheck() {
     safeBalance,
     exposureOk,
     hasOpposite,
-    vpin: 0,
+    vpin: diagnostics.vpin || 0,
     btcSpike,
     isSpike,
-    blockers: [],
-  };
+  });
   if (!canTrade) diagnostics.blockers.push('max_open_positions');
   if (!stableOk) diagnostics.blockers.push('stable_edge');
   if (!safeBalance) diagnostics.blockers.push('insufficient_balance');
