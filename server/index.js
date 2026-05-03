@@ -297,8 +297,33 @@ async function pollBinanceRest() {
       broadcastMarketData();
     }
   } catch (e) {
-    // REST also failing — do NOT generate synthetic prices; keep last known price stale
-    // (trading will not advance without a real price tick, preserving SIM fidelity)
+    // Binance REST also failed — try CoinGecko as last resort (Railway IPs sometimes
+    // get blocked by Binance; CoinGecko is a reliable independent fallback)
+    try {
+      const { data: cgData } = await axios.get(
+        'https://api.coingecko.com/api/v3/simple/price',
+        { params: { ids: 'bitcoin', vs_currencies: 'usd' }, timeout: 5000 }
+      );
+      const cgPrice = cgData?.bitcoin?.usd;
+      if (cgPrice && !isNaN(cgPrice)) {
+        state.btcPrice   = cgPrice;
+        state.priceSource = 'coingecko';
+        const now = Date.now();
+        state.priceHistory.push({ price: cgPrice, time: now });
+        state.priceHistory = state.priceHistory.filter(p => now - p.time <= PRICE_HIST_MS);
+        addChartPoint(cgPrice, now);
+        updateCandle(cgPrice, now);
+        if (state.trading.active && now - lastArbCheckTs >= 2000) {
+          lastArbCheckTs = now;
+          runArbitrageCheck();
+        }
+        if (now - lastBroadcastTs >= 2000) {
+          lastBroadcastTs = now;
+          broadcastMarketData();
+        }
+        return;
+      }
+    } catch (_) { /* CoinGecko also down */ }
     state.priceSource = 'unavailable';
     console.warn('[Binance REST] Both WS and REST unavailable – holding last price, no trades fired');
   }
@@ -465,9 +490,21 @@ async function fetchBTCMarkets() {
         } else if (typeof m.outcomePrices === 'string') {
           prices = JSON.parse(m.outcomePrices).map(Number);
         } else {
-          prices = [0.5, 0.5];
+          // outcomePrices missing — derive from CLOB order book (bestBid/bestAsk)
+          // or lastTradePrice. Gamma API omits outcomePrices for low-activity markets.
+          const last = parseFloat(m.lastTradePrice ?? NaN);
+          const bid  = parseFloat(m.bestBid  ?? 0);
+          const ask  = parseFloat(m.bestAsk  ?? 1);
+          if (isFinite(last) && last > 0 && last < 1) {
+            prices = [last, 1 - last];
+          } else if (bid > 0 && ask < 1) {
+            const mid = (bid + ask) / 2;
+            prices = [mid, 1 - mid];
+          } else {
+            prices = [0.5, 0.5];
+          }
         }
-        if (!prices.every(p => isFinite(p))) prices = [0.5, 0.5];
+        if (!prices.every(p => isFinite(p) && p >= 0 && p <= 1)) prices = [0.5, 0.5];
       } catch { prices = [0.5, 0.5]; }
 
       const q = (m.question || m.title || '').toLowerCase();
@@ -485,6 +522,7 @@ async function fetchBTCMarkets() {
         outcomes: m.outcomes || ['Yes', 'No'],
         outcomePrices: prices,
         volume: (isFinite(parsedVol) && parsedVol > 0) ? Math.round(parsedVol) : 0,
+        startDate: m.startDate || m.startDateIso || null,
         endDate: m.endDateIso || m.endDate || m.end_date_iso,
         clobTokenIds: m.clobTokenIds || [],
         live: true,
@@ -653,7 +691,26 @@ function computeBinaryMid(market, btcOverride) {
 
   // Parse strike from question: "Will BTC be above $97,000 in 15 min?"
   const strikeMatch = market.question?.match(/\$([0-9,]+)/);
-  const strike = strikeMatch ? parseFloat(strikeMatch[1].replace(/,/g, '')) : btc;
+  let strike;
+  if (strikeMatch) {
+    // Explicit strike in question (e.g. "above $97,000")
+    strike = parseFloat(strikeMatch[1].replace(/,/g, ''));
+  } else {
+    // "Bitcoin Up or Down" markets: strike = BTC price at window start.
+    // The window opens at market.startDate. If startDate is in the past (window is
+    // currently active), fetch BTC from priceHistory at that timestamp.
+    // If startDate is in the future (pre-window), use oldest available price in
+    // priceHistory (best momentum proxy). Falls back to current BTC.
+    const windowOpenMs = market.startDate ? new Date(market.startDate).getTime() : 0;
+    const nowMs = Date.now();
+    if (windowOpenMs > 0 && windowOpenMs <= nowMs) {
+      // Window is open — use BTC at window start as reference price
+      strike = getPriceAt(nowMs - windowOpenMs) || state.priceHistory[0]?.price || btc;
+    } else {
+      // Window hasn't started yet — oldest price in priceHistory is best proxy
+      strike = (state.priceHistory.length > 0 ? state.priceHistory[0].price : null) || btc;
+    }
+  }
 
   const now       = Date.now();
   const msLeft    = market.endDate ? new Date(market.endDate).getTime() - now : 15 * 60000;
