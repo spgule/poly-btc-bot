@@ -173,8 +173,9 @@ const state = {
     pausedUntil:   0,
     pauseReason:   null,
     active:        false,
-    lastTradeTs: 0,
-    cooldownMs:  500,    // 500ms cooldown — high-frequency scalping mode
+    trades:        [],
+    lastTradeTs:   0,
+    cooldownMs:    500,    // 500ms cooldown — high-frequency scalping mode
   },
 
   positions:        [],   // open/recently closed positions
