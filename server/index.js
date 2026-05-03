@@ -310,33 +310,37 @@ async function pollBinanceRest() {
       broadcastMarketData();
     }
   } catch (e) {
-    // Binance REST failed — try fallback price sources (Railway IPs sometimes blocked by Binance)
-    // Throttle: only call external fallbacks at most once every 10s to avoid rate limits
+    // Binance REST failed — try fallback price sources (Railway IPs often blocked by Binance)
+    // Throttle: 3s minimum between fallback calls.
+    // Kraken is first — no rate limit on public endpoints and very reliable from cloud IPs.
+    // CoinGecko is second — free tier ~30 req/min, safe at 3s interval.
+    // Coinbase is last resort.
     const nowFb = Date.now();
-    if (nowFb - (pollBinanceRest._lastFallback || 0) < 10000) return;
+    if (nowFb - (pollBinanceRest._lastFallback || 0) < 3000) return;
     pollBinanceRest._lastFallback = nowFb;
 
-    // Fallback 1: CoinGecko (free, no auth, ~10 req/min safe)
     let fbPrice = null;
     let fbSource = 'unavailable';
+
+    // Fallback 1: Kraken (no rate limit, cloud-friendly)
     try {
-      const { data: cgData } = await axios.get(
-        'https://api.coingecko.com/api/v3/simple/price',
-        { params: { ids: 'bitcoin', vs_currencies: 'usd' }, timeout: 5000 }
+      const { data: krData } = await axios.get(
+        'https://api.kraken.com/0/public/Ticker',
+        { params: { pair: 'XBTUSD' }, timeout: 4000 }
       );
-      const p = cgData?.bitcoin?.usd;
-      if (p && !isNaN(p) && p > 1000) { fbPrice = p; fbSource = 'coingecko'; }
+      const p = parseFloat(krData?.result?.XXBTZUSD?.c?.[0]);
+      if (p && !isNaN(p) && p > 1000) { fbPrice = p; fbSource = 'kraken'; }
     } catch (_) { /* try next */ }
 
-    // Fallback 2: Kraken public ticker (no auth, usually accessible from cloud)
+    // Fallback 2: CoinGecko (free, ~30 req/min)
     if (!fbPrice) {
       try {
-        const { data: krData } = await axios.get(
-          'https://api.kraken.com/0/public/Ticker',
-          { params: { pair: 'XBTUSD' }, timeout: 5000 }
+        const { data: cgData } = await axios.get(
+          'https://api.coingecko.com/api/v3/simple/price',
+          { params: { ids: 'bitcoin', vs_currencies: 'usd' }, timeout: 4000 }
         );
-        const p = parseFloat(krData?.result?.XXBTZUSD?.c?.[0]);
-        if (p && !isNaN(p) && p > 1000) { fbPrice = p; fbSource = 'kraken'; }
+        const p = cgData?.bitcoin?.usd;
+        if (p && !isNaN(p) && p > 1000) { fbPrice = p; fbSource = 'coingecko'; }
       } catch (_) { /* try next */ }
     }
 
@@ -345,7 +349,7 @@ async function pollBinanceRest() {
       try {
         const { data: cbData } = await axios.get(
           'https://api.coinbase.com/v2/prices/BTC-USD/spot',
-          { timeout: 5000 }
+          { timeout: 4000 }
         );
         const p = parseFloat(cbData?.data?.amount);
         if (p && !isNaN(p) && p > 1000) { fbPrice = p; fbSource = 'coinbase'; }
@@ -360,11 +364,11 @@ async function pollBinanceRest() {
       state.priceHistory = state.priceHistory.filter(p => now - p.time <= PRICE_HIST_MS);
       addChartPoint(fbPrice, now);
       updateCandle(fbPrice, now);
-      if (state.trading.active && now - lastArbCheckTs >= 2000) {
+      if (state.trading.active && now - lastArbCheckTs >= 1000) {
         lastArbCheckTs = now;
         runArbitrageCheck();
       }
-      if (now - lastBroadcastTs >= 2000) {
+      if (now - lastBroadcastTs >= 500) {
         lastBroadcastTs = now;
         broadcastMarketData();
       }
