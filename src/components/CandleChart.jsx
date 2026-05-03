@@ -1,4 +1,4 @@
-import { useEffect, useRef } from 'react';
+﻿import { useEffect, useRef } from 'react';
 import {
   createChart,
   CrosshairMode,
@@ -7,46 +7,29 @@ import {
   HistogramSeries,
 } from 'lightweight-charts';
 
-/**
- * TradingView-style real-time candlestick chart.
- * Uses lightweight-charts (official TradingView open-source library).
- *
- * Props:
- *   candles       – array of closed { time(s), open, high, low, close, ticks }
- *   currentCandle – currently-forming candle, updated every ~150ms
- */
-
-// Coerce to integer seconds, return 0 for any invalid value
-function toChartTime(t) {
+// Coerce to integer seconds â€” guards against any object/non-numeric value
+function toTime(t) {
   const n = Math.floor(Number(t));
   return isFinite(n) && n > 0 ? n : 0;
 }
 
-function makeBar(c) {
-  return { time: toChartTime(c.time), open: c.open, high: c.high, low: c.low, close: c.close };
-}
-
-function makeVol(c) {
-  return {
-    time:  toChartTime(c.time),
-    value: c.ticks || 1,
-    color: c.close >= c.open ? 'rgba(0,224,130,0.28)' : 'rgba(255,68,102,0.28)',
-  };
-}
-
 export default function CandleChart({ candles = [], currentCandle = null }) {
-  const containerRef   = useRef(null);
-  const chartRef       = useRef(null);
-  const seriesRef      = useRef(null);
-  const volRef         = useRef(null);
-  const initializedRef = useRef(false);
-  const prevLenRef     = useRef(0);
-  // Tracks the highest time value ever passed to .update() or .setData(), so we
-  // can detect when a newly-closed candle arrives with time < lastChartTime and
-  // fall back to a full setData reload instead of throwing "Cannot update oldest data".
-  const lastChartTimeRef = useRef(0);
+  const containerRef = useRef(null);
+  const chartRef     = useRef(null);
+  const seriesRef    = useRef(null);
+  const volRef       = useRef(null);
 
-  // ── Create chart once ─────────────────────────────────────────────────────
+  // Keep latest props in a ref so effects always see current values (avoids stale closures)
+  const candlesRef      = useRef(candles);
+  const curCandleRef    = useRef(currentCandle);
+  candlesRef.current    = candles;
+  curCandleRef.current  = currentCandle;
+
+  // Internal chart state
+  const lastChartTimeRef = useRef(0);  // highest time pushed to the chart
+  const loadedCountRef   = useRef(0);  // # of closed candles in last setData/loadAll
+
+  // â”€â”€ Create chart once â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
   useEffect(() => {
     if (!containerRef.current) return;
 
@@ -64,14 +47,8 @@ export default function CandleChart({ candles = [], currentCandle = null }) {
       },
       crosshair: {
         mode: CrosshairMode.Normal,
-        vertLine: {
-          width: 1, color: '#4899ff50', style: 2,
-          labelBackgroundColor: '#131320',
-        },
-        horzLine: {
-          width: 1, color: '#4899ff50', style: 2,
-          labelBackgroundColor: '#131320',
-        },
+        vertLine: { width: 1, color: '#4899ff50', style: 2, labelBackgroundColor: '#131320' },
+        horzLine: { width: 1, color: '#4899ff50', style: 2, labelBackgroundColor: '#131320' },
       },
       rightPriceScale: {
         borderColor: '#202040',
@@ -91,115 +68,111 @@ export default function CandleChart({ candles = [], currentCandle = null }) {
       handleScale: { axisPressedMouseMove: true, mouseWheel: true, pinch: true },
     });
 
-    // ── Candlestick series ──────────────────────────────────────────────────
     const candleSeries = chart.addSeries(CandlestickSeries, {
-      upColor:         '#00e082',
-      downColor:       '#ff4466',
-      borderUpColor:   '#00e082',
-      borderDownColor: '#ff4466',
-      wickUpColor:     '#00e08299',
-      wickDownColor:   '#ff446699',
+      upColor: '#00e082', downColor: '#ff4466',
+      borderUpColor: '#00e082', borderDownColor: '#ff4466',
+      wickUpColor: '#00e08299', wickDownColor: '#ff446699',
     });
 
-    // ── Volume histogram (bottom 18%) ───────────────────────────────────────
     const volSeries = chart.addSeries(HistogramSeries, {
-      priceFormat:  { type: 'volume' },
+      priceFormat: { type: 'volume' },
       priceScaleId: 'vol',
     });
-    chart.priceScale('vol').applyOptions({
-      scaleMargins: { top: 0.82, bottom: 0 },
-    });
+    chart.priceScale('vol').applyOptions({ scaleMargins: { top: 0.82, bottom: 0 } });
 
     chartRef.current  = chart;
     seriesRef.current = candleSeries;
     volRef.current    = volSeries;
 
-    // ── Responsive resize ───────────────────────────────────────────────────
     const ro = new ResizeObserver(() => {
-      if (chartRef.current && containerRef.current) {
-        chartRef.current.resize(
-          containerRef.current.clientWidth,
-          containerRef.current.clientHeight,
-        );
-      }
+      if (chartRef.current && containerRef.current)
+        chartRef.current.resize(containerRef.current.clientWidth, containerRef.current.clientHeight);
     });
     ro.observe(containerRef.current);
 
     return () => {
       ro.disconnect();
       chart.remove();
-      chartRef.current       = null;
-      seriesRef.current      = null;
-      volRef.current         = null;
-      initializedRef.current = false;
-      prevLenRef.current     = 0;
-      lastChartTimeRef.current = 0;
+      chartRef.current = seriesRef.current = volRef.current = null;
+      lastChartTimeRef.current = loadedCountRef.current = 0;
     };
   }, []);
 
-  // ── Helper: bulk-load all data (closed + current forming candle) ──────────
-  function loadAll(closedCandles, forming) {
+  // â”€â”€ Full reload: always reads from refs (never stale) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+  function reloadAll() {
     if (!seriesRef.current) return;
-    const all = forming ? [...closedCandles, forming] : closedCandles;
-    const bars = all.map(makeBar).filter(b => b.time > 0);
-    const vols = all.map(makeVol).filter(v => v.time > 0);
+    const closed  = candlesRef.current;
+    const forming = curCandleRef.current;
+    const all = forming ? [...closed, forming] : closed;
+    const bars = all.map(c => ({ time: toTime(c.time), open: c.open, high: c.high, low: c.low, close: c.close })).filter(b => b.time > 0);
+    const vols = all.map(c => ({
+      time: toTime(c.time), value: c.ticks || 1,
+      color: c.close >= c.open ? 'rgba(0,224,130,0.28)' : 'rgba(255,68,102,0.28)',
+    })).filter(v => v.time > 0);
     if (bars.length === 0) return;
     seriesRef.current.setData(bars);
     if (volRef.current) volRef.current.setData(vols);
     lastChartTimeRef.current = bars[bars.length - 1].time;
+    loadedCountRef.current   = closed.length;
   }
 
-  // ── Load historical candles (once) or append newly-closed candle ──────────
+  // â”€â”€ Effect: handle closed candles array changes â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
   useEffect(() => {
     if (!seriesRef.current || candles.length === 0) return;
 
-    if (!initializedRef.current) {
-      // First render: bulk-load all closed candles + current forming candle
-      loadAll(candles, currentCandle);
-      initializedRef.current = true;
-      prevLenRef.current = candles.length;
-    } else if (candles.length > prevLenRef.current) {
-      const c = candles[candles.length - 1];
-      const t = toChartTime(c.time);
+    // First load
+    if (loadedCountRef.current === 0) {
+      reloadAll();
+      return;
+    }
 
-      if (t === 0) {
-        // Invalid time — just update the count and move on
-        prevLenRef.current = candles.length;
-        return;
-      }
+    // New closed candle appended
+    if (candles.length > loadedCountRef.current) {
+      const c = candles[candles.length - 1];
+      const t = toTime(c.time);
+
+      if (t === 0) { loadedCountRef.current = candles.length; return; }
 
       if (t <= lastChartTimeRef.current) {
-        // Newly-closed candle has a time ≤ the last time we fed the chart.
-        // This happens when currentCandle already advanced to the next bucket
-        // and then the now-closed candle arrives via the 3s HTTP poll.
-        // Solution: full reload so the chart is always self-consistent.
-        loadAll(candles, currentCandle);
+        // Out-of-order: closed candle arrived with time behind current chart time.
+        // This happens when currentCandle already moved to next bucket via WS tick
+        // before this HTTP poll delivered the now-closed candle.
+        // Safe fix: full setData reload which is self-consistent.
+        reloadAll();
       } else {
-        seriesRef.current.update({ time: t, open: c.open, high: c.high, low: c.low, close: c.close });
-        if (volRef.current) volRef.current.update(makeVol(c));
-        lastChartTimeRef.current = t;
+        try {
+          seriesRef.current.update({ time: t, open: c.open, high: c.high, low: c.low, close: c.close });
+          if (volRef.current) volRef.current.update({
+            time: t, value: c.ticks || 1,
+            color: c.close >= c.open ? 'rgba(0,224,130,0.28)' : 'rgba(255,68,102,0.28)',
+          });
+          lastChartTimeRef.current = t;
+        } catch (_) { reloadAll(); }
       }
-      prevLenRef.current = candles.length;
+      loadedCountRef.current = candles.length;
     }
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [candles]);
 
-  // ── Real-time tick: update forming candle every ~150ms ────────────────────
+  // â”€â”€ Effect: real-time forming candle tick (every ~150ms from WS) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
   useEffect(() => {
-    if (!seriesRef.current || !currentCandle || !initializedRef.current) return;
-    const t = toChartTime(currentCandle.time);
+    if (!seriesRef.current || !currentCandle || loadedCountRef.current === 0) return;
+    const t = toTime(currentCandle.time);
     if (t === 0) return;
 
     try {
       seriesRef.current.update({ time: t, open: currentCandle.open, high: currentCandle.high, low: currentCandle.low, close: currentCandle.close });
-      if (volRef.current) volRef.current.update(makeVol(currentCandle));
+      if (volRef.current) volRef.current.update({
+        time: t, value: currentCandle.ticks || 1,
+        color: currentCandle.close >= currentCandle.open ? 'rgba(0,224,130,0.28)' : 'rgba(255,68,102,0.28)',
+      });
       if (t > lastChartTimeRef.current) lastChartTimeRef.current = t;
     } catch (_) {
-      // Fallback: reload all data if update fails for any reason
-      loadAll(candles, currentCandle);
+      // Any error (including "Cannot update oldest data") â†’ full reload
+      reloadAll();
     }
-  }, [currentCandle]); // eslint-disable-line react-hooks/exhaustive-deps
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [currentCandle]);
 
   return <div ref={containerRef} style={{ width: '100%', height: '100%' }} />;
 }
-
