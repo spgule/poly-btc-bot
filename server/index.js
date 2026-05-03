@@ -246,13 +246,6 @@ function connectBinance() {
     } catch (e) { /* ignore */ }
   });
 
-  ws.on('close', () => {
-    state.binanceConnected = false;
-    broadcast({ type: 'CONNECTION', data: { binanceConnected: false, priceSource: 'binance-rest' } });
-    console.log('[Binance WS] Disconnected – reconnecting in 4s');
-    binanceTimer = setTimeout(connectBinance, 4000);
-  });
-
   ws.on('error', (err) => {
     console.error('[Binance WS] Error:', err.message);
     try { ws.terminate(); } catch (_) {}
@@ -272,9 +265,9 @@ function connectBinance() {
     }
   }, 5000);
 
+  // Single close handler — prevents double-reconnect from duplicate listeners
   ws.on('close', () => {
     clearInterval(heartbeatGuard);
-    // heartbeatGuard already set binanceTimer + logged — skip double-reconnect
     if (!heartbeatGuardFired) {
       state.binanceConnected = false;
       broadcast({ type: 'CONNECTION', data: { binanceConnected: false, priceSource: 'binance-rest' } });
@@ -1166,13 +1159,21 @@ function openPosition(signal) {
   const fillSize = fill.fillSize;
   const shares   = Math.round(fillSize / fillOdds * 100) / 100;
 
+  // Record the raw mid-price at entry time (before spread/impact) so that
+  // monitorPositions marks against the same reference frame as the fill.
+  // Without this, every trade starts with unrealizedPnl = -(spread+impact)*shares
+  // which can immediately trigger SL.
+  const yesAtEntry = market.outcomePrices?.[0] ?? 0.5;
+  const midAtEntry = side === 'BUY_YES' ? yesAtEntry : (1 - yesAtEntry);
+
   const pos = {
     id:               nextId('p'),
     marketId,
     question:         (question || 'BTC Market').slice(0, 60),
     side,
     entryOdds:        fillOdds,
-    markOdds:         fillOdds,
+    entryMidOdds:     midAtEntry,  // raw mid at entry — used as mark baseline
+    markOdds:         fillOdds,    // start mark at fill price (no instant loss)
     shares,
     cost:             fillSize,
     unrealizedPnl:    0,
@@ -1196,7 +1197,7 @@ function openPosition(signal) {
   broadcast({ type: 'POSITION_OPENED', data: pos });
   broadcastStatus();
   const fillNote = fill.partialFill ? ` [PARTIAL ${fill.fillSize}/${betSize}]` : '';
-  console.log(`[CLOB] OPEN ${side} ${shares}sh @ ${fillOdds.toFixed(3)} | spread=${(fill.spread*100).toFixed(1)}¢ impact=${(fill.impact*100).toFixed(1)}¢ | $${fillSize}${fillNote} | edge ${(edge*100).toFixed(1)}¢`);
+  console.log(`[CLOB] OPEN ${side} ${shares}sh @ ${fillOdds.toFixed(3)} mid=${midAtEntry.toFixed(3)} | spread=${(fill.spread*100).toFixed(1)}¢ impact=${(fill.impact*100).toFixed(1)}¢ | $${fillSize}${fillNote} | edge ${(edge*100).toFixed(1)}¢`);
 }
 
 // ── SIM MARKET PRICE MODEL ───────────────────────────────────────────────────────────────
@@ -1327,11 +1328,19 @@ function monitorPositions() {
     const midOdds = pos.side === 'BUY_YES' ? yesOdds : (1 - yesOdds);
     const newMark = Math.max(0.03, Math.min(0.97, midOdds));
     pos.markOdds   = newMark;
-    pos.pnlPct     = Math.round(((newMark - pos.entryOdds) / pos.entryOdds) * 10000) / 100;
+
+    // TP/SL are based on movement from the entry MID price, not from the fill price.
+    // The fill price includes spread+impact (a known cost at entry). TP/SL should
+    // trigger on market movement, not on the built-in execution cost.
+    // entryMidOdds = mid price at the moment of entry (before spread/impact).
+    const refPrice = pos.entryMidOdds ?? pos.entryOdds; // fallback for legacy positions
+    const markDelta = newMark - refPrice;
+    pos.pnlPct     = Math.round((markDelta / refPrice) * 10000) / 100;
+    // Unrealized PnL still uses entryOdds (the actual fill) for accurate $ accounting
     pos.unrealizedPnl = Math.round((newMark - pos.entryOdds) * pos.shares * 100) / 100;
 
-    const gainPct  = (newMark - pos.entryOdds) / pos.entryOdds;
-    const lossPct  = (pos.entryOdds - newMark)  / pos.entryOdds;
+    const gainPct  = markDelta / refPrice;         // positive = market moved in our favor
+    const lossPct  = -markDelta / refPrice;         // positive = market moved against us
     const elapsed  = Date.now() - pos.entryTime;
 
     if (gainPct >= state.config.takeProfitPct / 100) {
@@ -1538,10 +1547,10 @@ app.post('/api/config', (req, res) => {
   if (minEdge       !== undefined) state.config.minEdge       = Math.min(0.5, Math.max(0.01, minEdge));
   if (killThreshold !== undefined) state.config.killThreshold = Math.min(100, Math.max(5, killThreshold));
   if (autoTrade     !== undefined) state.config.autoTrade     = Boolean(autoTrade);
-  if (takeProfitPct !== undefined) state.config.takeProfitPct = Math.min(95, Math.max(5,  takeProfitPct));
-  if (stopLossPct   !== undefined) state.config.stopLossPct   = Math.min(95, Math.max(5,  stopLossPct));
+  if (takeProfitPct !== undefined) state.config.takeProfitPct = Math.min(100, Math.max(1,  takeProfitPct));
+  if (stopLossPct   !== undefined) state.config.stopLossPct   = Math.min(100, Math.max(1,  stopLossPct));
   if (posTimeoutMs  !== undefined) state.config.posTimeoutMs  = Math.min(3600000, Math.max(30000, posTimeoutMs));
-  if (maxOpenPos    !== undefined) state.config.maxOpenPos    = Math.min(10, Math.max(1, maxOpenPos));
+  if (maxOpenPos    !== undefined) state.config.maxOpenPos    = Math.min(20, Math.max(1, maxOpenPos));
   // cooldown exposed so UI/config can tune trade frequency
   const { cooldownMs } = req.body;
   if (cooldownMs    !== undefined) state.trading.cooldownMs   = Math.min(60000, Math.max(100, cooldownMs));

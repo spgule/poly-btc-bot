@@ -14,6 +14,8 @@ dist-ssr
 
 # Bot secrets — never commit private keys or saved config
 server/bot-config.json
+server/bot-trades.json
+server/bot-session.json
 *.pem
 *.key
 
