@@ -5,7 +5,7 @@ import 'react-resizable/css/styles.css';
 import {
   Play, Square, Settings, Wifi, WifiOff, Zap,
   TrendingUp, TrendingDown, Activity, AlertTriangle, X,
-  LayoutDashboard, Eye, EyeOff, RotateCcw, GripHorizontal,
+  LayoutDashboard, Eye, EyeOff, RotateCcw, GripHorizontal, ChevronDown, ChevronRight,
 } from 'lucide-react';
 import {
   AreaChart, Area, LineChart, Line, BarChart, Bar,
@@ -17,6 +17,17 @@ import ConfigModal from './components/ConfigModal';
 import CandleChart from './components/CandleChart';
 
 const RGL = WidthProvider(GridLayout);
+
+// ─── MOBILE DETECTION ─────────────────────────────────────────────────────────
+function useIsMobile() {
+  const [isMobile, setIsMobile] = useState(() => window.innerWidth < 768);
+  useEffect(() => {
+    const handler = () => setIsMobile(window.innerWidth < 768);
+    window.addEventListener('resize', handler);
+    return () => window.removeEventListener('resize', handler);
+  }, []);
+  return isMobile;
+}
 
 // ─── GRID CONSTANTS ──────────────────────────────────────────────────────────
 const COLS      = 36;
@@ -286,6 +297,104 @@ function PanelShell({ id, label, badge, onHide, children }) {
       <div style={{ flex: 1, minHeight: 0, overflow: 'hidden', display: 'flex', flexDirection: 'column' }}>
         {children}
       </div>
+    </div>
+  );
+}
+
+// ─── TOP BAR MOBILE ───────────────────────────────────────────────────────────
+function TopBarMobile({ status, market, connected, clock, onStart, onStop, onSettings, actionPending }) {
+  const up    = (market.btcChange24h ?? 0) >= 0;
+  const stats = status.stats || {};
+  const wr    = stats.totalTrades > 0 ? Math.round(stats.wins / stats.totalTrades * 100) : 0;
+
+  return (
+    <header className="top-bar-mobile">
+      {/* Row 1: logo + price + controls */}
+      <div className="top-bar-mobile-row1">
+        <Zap size={14} color="var(--amber)" style={{ flexShrink: 0 }} />
+        <span style={{ fontWeight: 800, fontSize: 14, letterSpacing: '0.1em', color: 'var(--t1)' }}>POLY·BTC</span>
+        <span className={cn('badge', status.mode === 'LIVE' ? 'badge-red' : 'badge-blue')} style={{ fontSize: 8 }}>{status.mode}</span>
+        <span className={cn('tb-conn', connected && status.binanceConnected ? 'tb-conn-ok' : 'tb-conn-err')} style={{ fontSize: 9 }}>
+          {connected && status.binanceConnected ? <Wifi size={10} /> : <WifiOff size={10} />}
+          {connected ? (status.binanceConnected ? 'LIVE' : 'SYNC') : 'OFF'}
+        </span>
+        <div style={{ flex: 1 }} />
+        <button className="btn btn-ghost btn-sm" onClick={onSettings} title="Configurações" style={{ minHeight: 36, padding: '6px 12px' }}>
+          <Settings size={16} />
+        </button>
+        {status.active
+          ? <button className="btn btn-red" onClick={onStop} disabled={actionPending} style={{ minHeight: 36 }}>
+              <Square size={12} /> {actionPending ? '…' : 'STOP'}
+            </button>
+          : <button className="btn btn-green" onClick={onStart} disabled={actionPending} style={{ minHeight: 36 }}>
+              <Play size={12} /> {actionPending ? '…' : 'START'}
+            </button>
+        }
+      </div>
+      {/* Row 2: scrollable stats chips */}
+      <div className="top-bar-mobile-row2">
+        <div className="mobile-stat-chip">
+          <span className="mobile-stat-chip-label">BTC</span>
+          <span className="mobile-stat-chip-val" style={{ color: up ? 'var(--green)' : 'var(--red)', fontSize: 14 }}>
+            {market.btcPrice ? fmtPrice(market.btcPrice) : '—'}
+          </span>
+        </div>
+        <div className="mobile-stat-chip">
+          <span className="mobile-stat-chip-label">BALANCE</span>
+          <span className="mobile-stat-chip-val" style={{ color: status.balance >= (status.startBalance || 1000) ? 'var(--green)' : 'var(--red)' }}>
+            {fmtPrice(status.balance)}
+          </span>
+        </div>
+        <div className="mobile-stat-chip">
+          <span className="mobile-stat-chip-label">P&L</span>
+          <span className="mobile-stat-chip-val" style={{ color: (stats.totalPnl || 0) >= 0 ? 'var(--green)' : 'var(--red)' }}>
+            {fmt$(stats.totalPnl, 2)}
+          </span>
+        </div>
+        <div className="mobile-stat-chip">
+          <span className="mobile-stat-chip-label">TODAY</span>
+          <span className="mobile-stat-chip-val" style={{ color: (stats.todayPnl || 0) >= 0 ? 'var(--green)' : 'var(--red)' }}>
+            {fmt$(stats.todayPnl, 2)}
+          </span>
+        </div>
+        <div className="mobile-stat-chip">
+          <span className="mobile-stat-chip-label">WIN%</span>
+          <span className="mobile-stat-chip-val" style={{ color: wr >= 55 ? 'var(--green)' : wr >= 45 ? 'var(--amber)' : 'var(--red)' }}>
+            {wr}%
+          </span>
+        </div>
+        <div className="mobile-stat-chip">
+          <span className="mobile-stat-chip-label">DD</span>
+          <span className="mobile-stat-chip-val" style={{ color: (status.drawdown || 0) > 0.1 ? 'var(--red)' : 'var(--t2)' }}>
+            {((status.drawdown || 0) * 100).toFixed(1)}%
+          </span>
+        </div>
+        <div className="mobile-stat-chip">
+          <span className="mobile-stat-chip-label">BRT</span>
+          <span className="mobile-stat-chip-val" style={{ fontSize: 11 }}>{clock}</span>
+        </div>
+      </div>
+    </header>
+  );
+}
+
+// ─── COLLAPSIBLE MOBILE CARD ──────────────────────────────────────────────────
+function MobileCard({ title, badge, defaultOpen = true, children, bodyStyle }) {
+  const [open, setOpen] = useState(defaultOpen);
+  return (
+    <div className="mobile-card">
+      <div className="mobile-card-header" onClick={() => setOpen(v => !v)}>
+        <div style={{ display: 'flex', alignItems: 'center', gap: 7 }}>
+          <span className="mobile-card-title">{title}</span>
+          {badge}
+        </div>
+        {open ? <ChevronDown size={12} color="var(--t3)" /> : <ChevronRight size={12} color="var(--t3)" />}
+      </div>
+      {open && (
+        <div className="mobile-card-body" style={bodyStyle}>
+          {children}
+        </div>
+      )}
     </div>
   );
 }
@@ -1067,6 +1176,7 @@ export default function App() {
   const [showConfig, setShowConfig] = useState(false);
   const [showLayout, setShowLayout] = useState(false);
   const [clock, setClock]           = useState(fmtClock());
+  const isMobile                    = useIsMobile();
 
   const [layout, setLayout] = useState(() => {
     try { const s = localStorage.getItem(LS_LAYOUT); return s ? JSON.parse(s) : DEFAULT_LAYOUT; }
@@ -1174,6 +1284,142 @@ export default function App() {
     }
   };
 
+  const errorBanner = botError && (
+    <div style={{
+      position: 'fixed', top: isMobile ? 0 : 48, left: '50%', transform: 'translateX(-50%)',
+      zIndex: 999, background: 'var(--red)', color: '#fff',
+      padding: '8px 18px', borderRadius: 6, fontSize: 11, fontWeight: 600,
+      boxShadow: '0 4px 16px rgba(0,0,0,.5)', display: 'flex', alignItems: 'center', gap: 10,
+      maxWidth: '90vw',
+    }}>
+      <AlertTriangle size={13} />
+      {botError}
+      <button onClick={() => setBotError(null)} style={{ background: 'none', border: 'none', color: '#fff', cursor: 'pointer', padding: 0, marginLeft: 4 }}>
+        <X size={12} />
+      </button>
+    </div>
+  );
+
+  // ── MOBILE LAYOUT ──────────────────────────────────────────────────────────
+  if (isMobile) {
+    const isReal = markets.some(m => m.live);
+    const edge   = market.edge || 0;
+    return (
+      <div className="app-shell">
+        <TopBarMobile
+          status={status} market={market} connected={connected} clock={clock}
+          onStart={startBot} onStop={stopBot}
+          onSettings={() => setShowConfig(true)}
+          actionPending={actionPending}
+        />
+        {errorBanner}
+        <div className="mobile-body">
+
+          {/* Signal */}
+          <MobileCard
+            title="Signal"
+            badge={<span className={cn('badge', status.active ? 'badge-green' : 'badge-gray')} style={{ fontSize: 7 }}>{status.active ? '● ON' : '● OFF'}</span>}
+            defaultOpen
+          >
+            <SignalBody signal={signal} market={market} status={status} onManualTrade={manualTrade} />
+          </MobileCard>
+
+          {/* Posições abertas */}
+          <MobileCard
+            title="Posições Abertas"
+            badge={positions.length > 0 ? <span className="badge badge-amber blink" style={{ fontSize: 7 }}>{positions.length} LIVE</span> : null}
+            defaultOpen={positions.length > 0}
+            bodyStyle={{ minHeight: positions.length > 0 ? 120 : 60 }}
+          >
+            <PositionsBody positions={positions} onClose={closePosition} />
+          </MobileCard>
+
+          {/* BTC Chart */}
+          <MobileCard
+            title="BTC / USDT"
+            badge={<span style={{ fontSize: 9, fontWeight: 700, color: (market.btcChange24h ?? 0) >= 0 ? 'var(--green)' : 'var(--red)' }}>{market.btcPrice ? fmtPrice(market.btcPrice) : '—'}</span>}
+            defaultOpen
+          >
+            <div className="mobile-chart-wrap">
+              <BtcChartBody market={market} candles={candles} currentCandle={currentCandle} />
+            </div>
+          </MobileCard>
+
+          {/* Edge Chart */}
+          <MobileCard
+            title="Live Edge"
+            badge={
+              <div style={{ display: 'flex', gap: 6, alignItems: 'center', fontSize: 8 }}>
+                <span style={{ color: 'var(--blue)' }}>■ Binance</span>
+                <span style={{ color: 'var(--red)' }}>■ Poly</span>
+                <span style={{ fontWeight: 700, color: Math.abs(edge) > 0.05 ? (edge > 0 ? 'var(--green)' : 'var(--red)') : 'var(--t2)' }}>{fmtEdge(edge)}</span>
+              </div>
+            }
+            defaultOpen
+          >
+            <div className="mobile-edge-wrap">
+              <EdgeChartBody market={market} />
+            </div>
+          </MobileCard>
+
+          {/* Performance */}
+          <MobileCard title="Performance" defaultOpen>
+            <StatsBody status={status} />
+          </MobileCard>
+
+          {/* Risk */}
+          <MobileCard
+            title="Risk Monitor"
+            badge={(status.drawdown || 0) * 100 >= (status.config?.killThreshold ?? 20) * 0.75
+              ? <span className="badge badge-red blink" style={{ fontSize: 7 }}>KILL ZONE</span> : null}
+            defaultOpen
+          >
+            <RiskBody status={status} />
+          </MobileCard>
+
+          {/* Balance Curve */}
+          <MobileCard title="Balance Curve" defaultOpen={false} bodyStyle={{ height: 160 }}>
+            <BalanceCurveBody trades={trades} status={status} />
+          </MobileCard>
+
+          {/* Mercados */}
+          <MobileCard
+            title="Mercados BTC"
+            badge={<span className={cn('badge', isReal ? 'badge-green' : 'badge-amber')} style={{ fontSize: 7 }}>{isReal ? '● LIVE' : '● SIM'}</span>}
+            defaultOpen={false}
+          >
+            <MarketsBody markets={markets} />
+          </MobileCard>
+
+          {/* Trade Log */}
+          <MobileCard
+            title="Trade Log"
+            badge={<span style={{ fontSize: 8, color: 'var(--t2)' }}>{trades.length} fills</span>}
+            defaultOpen={false}
+            bodyStyle={{ maxHeight: 320, overflowY: 'auto' }}
+          >
+            <TradesBody trades={trades} />
+          </MobileCard>
+
+          {/* Histórico */}
+          <MobileCard
+            title="Histórico"
+            badge={<span style={{ fontSize: 8, color: 'var(--t2)' }}>{trades.length} trades</span>}
+            defaultOpen={false}
+          >
+            <HistoryBody trades={trades} />
+          </MobileCard>
+
+        </div>
+
+        {showConfig && (
+          <ConfigModal key={JSON.stringify(status.config)} initialConfig={status.config} onClose={() => setShowConfig(false)} />
+        )}
+      </div>
+    );
+  }
+
+  // ── DESKTOP LAYOUT ─────────────────────────────────────────────────────────
   return (
     <div className="app-shell">
       <TopBar
@@ -1184,20 +1430,7 @@ export default function App() {
         actionPending={actionPending}
       />
 
-      {botError && (
-        <div style={{
-          position: 'fixed', top: 48, left: '50%', transform: 'translateX(-50%)',
-          zIndex: 999, background: 'var(--red)', color: '#fff',
-          padding: '8px 18px', borderRadius: 6, fontSize: 11, fontWeight: 600,
-          boxShadow: '0 4px 16px rgba(0,0,0,.5)', display: 'flex', alignItems: 'center', gap: 10,
-        }}>
-          <AlertTriangle size={13} />
-          {botError}
-          <button onClick={() => setBotError(null)} style={{ background: 'none', border: 'none', color: '#fff', cursor: 'pointer', padding: 0, marginLeft: 4 }}>
-            <X size={12} />
-          </button>
-        </div>
-      )}
+      {errorBanner}
 
       <div style={{ flex: 1, overflowY: 'auto', overflowX: 'hidden', position: 'relative' }}>
         <RGL

@@ -8,10 +8,11 @@ const S = {
     position: 'fixed', inset: 0, zIndex: 100,
     display: 'flex', alignItems: 'center', justifyContent: 'center',
     background: 'rgba(0,0,0,.75)', backdropFilter: 'blur(6px)',
+    padding: '12px',
   },
   modal: {
     background: 'var(--s1)', border: '1px solid var(--border)',
-    borderRadius: 8, width: 480, maxHeight: '90vh',
+    borderRadius: 8, width: '100%', maxWidth: 480, maxHeight: '90vh',
     overflowY: 'auto', boxShadow: '0 24px 60px rgba(0,0,0,.6)',
   },
   header: {
@@ -29,8 +30,8 @@ const S = {
   field:  { marginBottom: 18 },
   input:  {
     width: '100%', background: 'var(--s2)', border: '1px solid var(--border)',
-    color: 'var(--t1)', padding: '8px 10px', borderRadius: 4,
-    fontSize: 12, fontFamily: 'JetBrains Mono, monospace', outline: 'none',
+    color: 'var(--t1)', padding: '10px 12px', borderRadius: 4,
+    fontSize: 14, fontFamily: 'JetBrains Mono, monospace', outline: 'none',
   },
   range: { width: '100%', accentColor: 'var(--blue)', cursor: 'pointer' },
 };
