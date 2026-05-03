@@ -1,4 +1,4 @@
-﻿import { useEffect, useRef } from 'react';
+import { useEffect, useRef } from 'react';
 import {
   createChart,
   CrosshairMode,
@@ -104,11 +104,17 @@ export default function CandleChart({ candles = [], currentCandle = null }) {
     const closed  = candlesRef.current;
     const forming = curCandleRef.current;
     const all = forming ? [...closed, forming] : closed;
-    const bars = all.map(c => ({ time: toTime(c.time), open: c.open, high: c.high, low: c.low, close: c.close })).filter(b => b.time > 0);
-    const vols = all.map(c => ({
-      time: toTime(c.time), value: c.ticks || 1,
-      color: c.close >= c.open ? 'rgba(0,224,130,0.28)' : 'rgba(255,68,102,0.28)',
-    })).filter(v => v.time > 0);
+    const bars = all
+      .filter(c => c != null)
+      .map(c => ({ time: toTime(c.time), open: Number(c.open), high: Number(c.high), low: Number(c.low), close: Number(c.close) }))
+      .filter(b => b.time > 0 && !isNaN(b.open) && !isNaN(b.high) && !isNaN(b.low) && !isNaN(b.close));
+    const vols = all
+      .filter(c => c != null)
+      .map(c => ({
+        time: toTime(c.time), value: Number(c.ticks) || 1,
+        color: Number(c.close) >= Number(c.open) ? 'rgba(0,224,130,0.28)' : 'rgba(255,68,102,0.28)',
+      }))
+      .filter(v => v.time > 0 && !isNaN(v.value));
     if (bars.length === 0) return;
     seriesRef.current.setData(bars);
     if (volRef.current) volRef.current.setData(vols);
@@ -141,12 +147,15 @@ export default function CandleChart({ candles = [], currentCandle = null }) {
         reloadAll();
       } else {
         try {
-          seriesRef.current.update({ time: t, open: c.open, high: c.high, low: c.low, close: c.close });
-          if (volRef.current) volRef.current.update({
-            time: t, value: c.ticks || 1,
-            color: c.close >= c.open ? 'rgba(0,224,130,0.28)' : 'rgba(255,68,102,0.28)',
-          });
-          lastChartTimeRef.current = t;
+          const o = Number(c.open), h = Number(c.high), l = Number(c.low), cl = Number(c.close), tk = Number(c.ticks) || 1;
+          if (!isNaN(o) && !isNaN(h) && !isNaN(l) && !isNaN(cl)) {
+            seriesRef.current.update({ time: t, open: o, high: h, low: l, close: cl });
+            if (volRef.current) volRef.current.update({
+              time: t, value: tk,
+              color: cl >= o ? 'rgba(0,224,130,0.28)' : 'rgba(255,68,102,0.28)',
+            });
+            lastChartTimeRef.current = t;
+          }
         } catch (_) { reloadAll(); }
       }
       loadedCountRef.current = candles.length;
@@ -155,20 +164,24 @@ export default function CandleChart({ candles = [], currentCandle = null }) {
   }, [candles]);
 
   // â”€â”€ Effect: real-time forming candle tick (every ~150ms from WS) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+  // ————————————————— Effect: real-time forming candle tick (every ~150ms from WS) —————
   useEffect(() => {
     if (!seriesRef.current || !currentCandle || loadedCountRef.current === 0) return;
     const t = toTime(currentCandle.time);
     if (t === 0) return;
 
     try {
-      seriesRef.current.update({ time: t, open: currentCandle.open, high: currentCandle.high, low: currentCandle.low, close: currentCandle.close });
-      if (volRef.current) volRef.current.update({
-        time: t, value: currentCandle.ticks || 1,
-        color: currentCandle.close >= currentCandle.open ? 'rgba(0,224,130,0.28)' : 'rgba(255,68,102,0.28)',
-      });
-      if (t > lastChartTimeRef.current) lastChartTimeRef.current = t;
+      const o = Number(currentCandle.open), h = Number(currentCandle.high), l = Number(currentCandle.low), cl = Number(currentCandle.close), tk = Number(currentCandle.ticks) || 1;
+      if (!isNaN(o) && !isNaN(h) && !isNaN(l) && !isNaN(cl)) {
+        seriesRef.current.update({ time: t, open: o, high: h, low: l, close: cl });
+        if (volRef.current) volRef.current.update({
+          time: t, value: tk,
+          color: cl >= o ? 'rgba(0,224,130,0.28)' : 'rgba(255,68,102,0.28)',
+        });
+        if (t > lastChartTimeRef.current) lastChartTimeRef.current = t;
+      }
     } catch (_) {
-      // Any error (including "Cannot update oldest data") â†’ full reload
+      // Any error (including "Cannot update oldest data") → full reload
       reloadAll();
     }
   // eslint-disable-next-line react-hooks/exhaustive-deps
