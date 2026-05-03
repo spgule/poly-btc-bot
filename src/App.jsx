@@ -127,46 +127,43 @@ function useBot() {
   useEffect(() => {
     async function poll() {
       try {
-        const [st, mkts, prices] = await Promise.all([
+        const [st, mkts, prices, candleData] = await Promise.all([
           api.getStatus(),
           api.getMarkets(),
           fetch(BASE + '/api/prices').then(r => r.json()).catch(() => null),
+          api.getCandles().catch(() => null),
         ]);
-        if (st)     setStatus(st);
-        if (mkts)   setMarkets(mkts);
+        if (st) setStatus(st);
+        if (mkts) setMarkets(mkts);
         if (prices) {
           setMarket(d => ({
             ...d,
-            btcPrice:     prices.current    ?? d.btcPrice,
-            btcChange24h: prices.change24h  ?? d.btcChange24h,
-            priceSource:  prices.source     ?? d.priceSource,
-            priceChart:   prices.chart      ?? d.priceChart,
+            btcPrice: prices.current ?? d.btcPrice,
+            btcChange24h: prices.change24h ?? d.btcChange24h,
+            priceSource: prices.source ?? d.priceSource,
+            priceChart: prices.chart ?? d.priceChart,
+          }));
+        }
+        if (candleData?.candles) setCandles(candleData.candles);
+        if (candleData?.currentCandle) setCurrentCandle(candleData.currentCandle);
+        if (candleData) {
+          setMarket(d => ({
+            ...d,
+            edgeHistory: candleData.edgeHistory ?? d.edgeHistory,
+            impliedProb: candleData.impliedProb ?? d.impliedProb,
+            polyOdds: candleData.polyOdds ?? d.polyOdds,
+            edge: candleData.edge ?? d.edge,
           }));
         }
       } catch (_) { /* ignore */ }
     }
     poll(); // immediate on mount
-    const id = setInterval(poll, connected ? 30000 : 2000);
-    return () => clearInterval(id);
-  }, [connected]);
-
-  // ── Candles + edge polling (independent of WS) ────────────────────────────
-  // Runs every 3s always — ensures chart shows data even when WS is glitchy
-  useEffect(() => {
-    async function pollCandles() {
-      try {
-        const data = await api.getCandles();
-        if (data?.candles?.length)  setCandles(data.candles);
-        if (data?.currentCandle)    setCurrentCandle(data.currentCandle);
-        if (data?.edgeHistory)      setMarket(d => ({ ...d, edgeHistory: data.edgeHistory, impliedProb: data.impliedProb, polyOdds: data.polyOdds, edge: data.edge }));
-      } catch (_) { /* ignore */ }
-    }
-    pollCandles();
-    const id = setInterval(pollCandles, 3000);
+    const id = setInterval(poll, 3000);
     return () => clearInterval(id);
   }, []);
 
-
+  // ── Candles + edge polling (independent of WS) ────────────────────────────
+  // Runs every 3s always — ensures chart shows data even when WS is glitchy
   useEffect(() => {
     let destroyed = false;
     function connect() {
