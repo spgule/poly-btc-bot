@@ -15,6 +15,25 @@ import {
  *   candles       – array of closed { time(s), open, high, low, close, ticks }
  *   currentCandle – currently-forming candle, updated every ~150ms
  */
+
+// Coerce to integer seconds, return 0 for any invalid value
+function toChartTime(t) {
+  const n = Math.floor(Number(t));
+  return isFinite(n) && n > 0 ? n : 0;
+}
+
+function makeBar(c) {
+  return { time: toChartTime(c.time), open: c.open, high: c.high, low: c.low, close: c.close };
+}
+
+function makeVol(c) {
+  return {
+    time:  toChartTime(c.time),
+    value: c.ticks || 1,
+    color: c.close >= c.open ? 'rgba(0,224,130,0.28)' : 'rgba(255,68,102,0.28)',
+  };
+}
+
 export default function CandleChart({ candles = [], currentCandle = null }) {
   const containerRef   = useRef(null);
   const chartRef       = useRef(null);
@@ -22,6 +41,10 @@ export default function CandleChart({ candles = [], currentCandle = null }) {
   const volRef         = useRef(null);
   const initializedRef = useRef(false);
   const prevLenRef     = useRef(0);
+  // Tracks the highest time value ever passed to .update() or .setData(), so we
+  // can detect when a newly-closed candle arrives with time < lastChartTime and
+  // fall back to a full setData reload instead of throwing "Cannot update oldest data".
+  const lastChartTimeRef = useRef(0);
 
   // ── Create chart once ─────────────────────────────────────────────────────
   useEffect(() => {
@@ -105,13 +128,26 @@ export default function CandleChart({ candles = [], currentCandle = null }) {
     return () => {
       ro.disconnect();
       chart.remove();
-      chartRef.current   = null;
-      seriesRef.current  = null;
-      volRef.current     = null;
+      chartRef.current       = null;
+      seriesRef.current      = null;
+      volRef.current         = null;
       initializedRef.current = false;
-      prevLenRef.current = 0;
+      prevLenRef.current     = 0;
+      lastChartTimeRef.current = 0;
     };
   }, []);
+
+  // ── Helper: bulk-load all data (closed + current forming candle) ──────────
+  function loadAll(closedCandles, forming) {
+    if (!seriesRef.current) return;
+    const all = forming ? [...closedCandles, forming] : closedCandles;
+    const bars = all.map(makeBar).filter(b => b.time > 0);
+    const vols = all.map(makeVol).filter(v => v.time > 0);
+    if (bars.length === 0) return;
+    seriesRef.current.setData(bars);
+    if (volRef.current) volRef.current.setData(vols);
+    lastChartTimeRef.current = bars[bars.length - 1].time;
+  }
 
   // ── Load historical candles (once) or append newly-closed candle ──────────
   useEffect(() => {
@@ -119,56 +155,51 @@ export default function CandleChart({ candles = [], currentCandle = null }) {
 
     if (!initializedRef.current) {
       // First render: bulk-load all closed candles + current forming candle
-      const all = currentCandle ? [...candles, currentCandle] : candles;
-      seriesRef.current.setData(
-        all.map(c => ({ time: c.time, open: c.open, high: c.high, low: c.low, close: c.close }))
-      );
-      if (volRef.current) {
-        volRef.current.setData(
-          all.map(c => ({
-            time:  c.time,
-            value: c.ticks || 1,
-            color: c.close >= c.open ? 'rgba(0,224,130,0.28)' : 'rgba(255,68,102,0.28)',
-          }))
-        );
-      }
+      loadAll(candles, currentCandle);
       initializedRef.current = true;
       prevLenRef.current = candles.length;
     } else if (candles.length > prevLenRef.current) {
-      // New closed candle — append via update (faster than setData)
       const c = candles[candles.length - 1];
-      seriesRef.current.update({ time: c.time, open: c.open, high: c.high, low: c.low, close: c.close });
-      if (volRef.current) {
-        volRef.current.update({
-          time: c.time, value: c.ticks || 1,
-          color: c.close >= c.open ? 'rgba(0,224,130,0.28)' : 'rgba(255,68,102,0.28)',
-        });
+      const t = toChartTime(c.time);
+
+      if (t === 0) {
+        // Invalid time — just update the count and move on
+        prevLenRef.current = candles.length;
+        return;
+      }
+
+      if (t <= lastChartTimeRef.current) {
+        // Newly-closed candle has a time ≤ the last time we fed the chart.
+        // This happens when currentCandle already advanced to the next bucket
+        // and then the now-closed candle arrives via the 3s HTTP poll.
+        // Solution: full reload so the chart is always self-consistent.
+        loadAll(candles, currentCandle);
+      } else {
+        seriesRef.current.update({ time: t, open: c.open, high: c.high, low: c.low, close: c.close });
+        if (volRef.current) volRef.current.update(makeVol(c));
+        lastChartTimeRef.current = t;
       }
       prevLenRef.current = candles.length;
     }
   // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [candles, currentCandle]);
+  }, [candles]);
 
   // ── Real-time tick: update forming candle every ~150ms ────────────────────
   useEffect(() => {
     if (!seriesRef.current || !currentCandle || !initializedRef.current) return;
-    seriesRef.current.update({
-      time:  currentCandle.time,
-      open:  currentCandle.open,
-      high:  currentCandle.high,
-      low:   currentCandle.low,
-      close: currentCandle.close,
-    });
-    if (volRef.current) {
-      volRef.current.update({
-        time:  currentCandle.time,
-        value: currentCandle.ticks || 1,
-        color: currentCandle.close >= currentCandle.open
-          ? 'rgba(0,224,130,0.28)'
-          : 'rgba(255,68,102,0.28)',
-      });
+    const t = toChartTime(currentCandle.time);
+    if (t === 0) return;
+
+    try {
+      seriesRef.current.update({ time: t, open: currentCandle.open, high: currentCandle.high, low: currentCandle.low, close: currentCandle.close });
+      if (volRef.current) volRef.current.update(makeVol(currentCandle));
+      if (t > lastChartTimeRef.current) lastChartTimeRef.current = t;
+    } catch (_) {
+      // Fallback: reload all data if update fails for any reason
+      loadAll(candles, currentCandle);
     }
-  }, [currentCandle]);
+  }, [currentCandle]); // eslint-disable-line react-hooks/exhaustive-deps
 
   return <div ref={containerRef} style={{ width: '100%', height: '100%' }} />;
 }
+
