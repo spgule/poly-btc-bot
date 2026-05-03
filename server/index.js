@@ -218,6 +218,25 @@ function addChartPoint(price, time) {
   }
 }
 
+function seedMinimalChartState(price, now = Date.now(), priceSource = state.priceSource) {
+  if (!price || !isFinite(price) || price <= 0) return;
+  state.btcPrice = price;
+  state.priceSource = priceSource;
+  state.priceHistory = [{ time: now, price }];
+  state.priceChart = [{ t: now, p: price }];
+  state.lastPriceChartTs = now;
+  state.candles = [];
+  state.currentCandle = {
+    time: candleBucketSec(now),
+    open: price,
+    high: price,
+    low: price,
+    close: price,
+    ticks: 1,
+    volume: 0,
+  };
+}
+
 function candleBucketSec(timestampMs) {
   return Math.floor(timestampMs / (CANDLE_SEC * 1000)) * CANDLE_SEC;
 }
@@ -663,17 +682,20 @@ async function loadBinanceHistory() {
       try {
         const { data } = await binanceRestGet('/ticker/price', { symbol: 'BTCUSDT' }, 5000);
         currentPrice       = parseFloat(data.price) || currentPrice;
-        state.btcPrice     = currentPrice;
-        const now = Date.now();
-        state.priceHistory = [{ time: now, price: currentPrice }];
+        seedMinimalChartState(currentPrice, Date.now(), 'binance-rest');
         console.log(`[Binance] Emergency seed: price=$${currentPrice} (waiting for real ticks)`);
-      } catch (_) { /* keep default state */ }
+      } catch (_) {
+        if (currentPrice && isFinite(currentPrice) && currentPrice > 0) {
+          seedMinimalChartState(currentPrice, Date.now(), state.priceSource || 'bootstrap');
+        }
+      }
     }
   }
 }
 
 // ── POLYMARKET MARKETS ────────────────────────────────────────────────────────
 async function fetchBTCMarkets() {
+  try {
   // Run ALL three fetches in parallel and MERGE results.
   // Previously we stopped at the first successful fetch — this caused the bot to miss
   // the short-term "Bitcoin Up or Down" 5/15-min markets (only in the recent-startDate slice)
@@ -798,6 +820,11 @@ async function fetchBTCMarkets() {
   // All fetches failed or no BTC markets found — fall back to sim markets
   seedSimMarkets();
   broadcast({ type: 'MARKETS', data: state.markets });
+  } catch (err) {
+    console.warn('[Polymarket] Market load failed:', err.message);
+    seedSimMarkets();
+    broadcast({ type: 'MARKETS', data: state.markets });
+  }
 }
 
 function seedSimMarkets() {
@@ -1900,6 +1927,25 @@ app.get('/api/candles', (req, res) => {
   });
 });
 
+app.get('/api/debug/feed', (_req, res) => {
+  res.json({
+    btcPrice: state.btcPrice,
+    btcChange24h: state.btcChange24h,
+    priceSource: state.priceSource,
+    binanceConnected: state.binanceConnected,
+    priceHistoryPoints: state.priceHistory.length,
+    priceChartPoints: state.priceChart.length,
+    closedCandles: state.candles.length,
+    currentCandle: state.currentCandle,
+    markets: state.markets.length,
+    liveMarkets: state.markets.filter(m => m.live).length,
+    simMarkets: state.markets.filter(m => !m.live).length,
+    bestMarket: getBestMarket()?.question || null,
+    lastPricePoint: state.priceHistory[state.priceHistory.length - 1] || null,
+    serverTime: Date.now(),
+  });
+});
+
 // ── WEBSOCKET ─────────────────────────────────────────────────────────────────
 // SPA catch-all: serve index.html for any non-API route when dist exists
 if (hasDistFolder) {
@@ -1978,6 +2024,7 @@ server.listen(PORT, async () => {
   }
 
   await loadBinanceHistory();
+  seedSimMarkets();
   connectBinance();
   await fetchBTCMarkets();
   // Refresh markets every 90s — ensures fresh Polymarket prices and valid expiry windows.
