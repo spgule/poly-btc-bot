@@ -1361,11 +1361,10 @@ function getMarketMinutesLeft(market, now = Date.now()) {
 }
 
 function getMarketDurationMinutes(market) {
-  const start = market?.startDate ? new Date(market.startDate).getTime() : NaN;
-  const end = market?.endDate ? new Date(market.endDate).getTime() : NaN;
-  if (Number.isFinite(start) && Number.isFinite(end) && end > start) {
-    return (end - start) / 60000;
-  }
+  // IMPORTANT: try question text FIRST — real Polymarket "Up or Down" markets are
+  // created ~24 hours before their resolution window, so (endDate - startDate) gives
+  // ~1440 min instead of the real 5–30 min window. The actual window is always
+  // embedded in the question: "7:30PM-7:45PM ET" = 15 min window.
   const rangeMatch = market?.question?.match(/(\d{1,2}):(\d{2})(AM|PM)-(\d{1,2}):(\d{2})(AM|PM)/i);
   if (rangeMatch) {
     const toMinutes = (hourRaw, minuteRaw, meridiemRaw) => {
@@ -1378,10 +1377,17 @@ function getMarketDurationMinutes(market) {
     const startMin = toMinutes(rangeMatch[1], rangeMatch[2], rangeMatch[3]);
     const endMin = toMinutes(rangeMatch[4], rangeMatch[5], rangeMatch[6]);
     const duration = endMin >= startMin ? endMin - startMin : (24 * 60 - startMin) + endMin;
-    if (duration > 0) return duration;
+    if (duration > 0 && duration <= 30.5) return duration;
   }
+  // SIM market question: "Will BTC be above $X in 15 min?"
   const simMatch = market?.question?.match(/in\s+(\d+)\s+min/i);
   if (simMatch) return Number(simMatch[1]);
+  // Fallback: use startDate/endDate (correct for SIM markets and point-in-time live markets)
+  const start = market?.startDate ? new Date(market.startDate).getTime() : NaN;
+  const end = market?.endDate ? new Date(market.endDate).getTime() : NaN;
+  if (Number.isFinite(start) && Number.isFinite(end) && end > start) {
+    return (end - start) / 60000;
+  }
   return NaN;
 }
 
