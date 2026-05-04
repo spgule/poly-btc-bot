@@ -554,11 +554,17 @@
 
   /* Chart height on mobile */
   .mobile-chart-wrap {
-    height: 260px;
+    height: 100%;
+    min-height: 300px;
+    display: flex;
+    flex-direction: column;
   }
 
   .mobile-edge-wrap {
-    height: 160px;
+    height: 100%;
+    min-height: 200px;
+    display: flex;
+    flex-direction: column;
   }
 
   /* Touch-friendly buttons */

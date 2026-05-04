@@ -5,7 +5,7 @@ import 'react-resizable/css/styles.css';
 import {
   Play, Square, Settings, Wifi, WifiOff, Zap,
   TrendingUp, TrendingDown, Activity, AlertTriangle, X,
-  LayoutDashboard, Eye, EyeOff, RotateCcw, GripHorizontal, ChevronDown, ChevronRight,
+  LayoutDashboard, Eye, EyeOff, RotateCcw, GripHorizontal, ChevronDown, ChevronRight, ArrowUp, ArrowDown,
 } from 'lucide-react';
 import {
   AreaChart, Area, LineChart, Line, BarChart, Bar,
@@ -35,6 +35,7 @@ const ROW_H     = 18;
 const MARGIN    = [6, 6];
 const LS_LAYOUT = 'ptb-layout-v3';
 const LS_HIDDEN = 'ptb-hidden-v4';
+const LS_MOBILE_ORDER = 'ptb-mobile-order-v1';
 
 const DEFAULT_LAYOUT = [
   { i: 'signal',    x: 0,  y: 0,  w: 8,  h: 16, minW: 6,  minH: 10 },
@@ -63,6 +64,8 @@ const PANEL_NAMES = {
 };
 
 // ─── FORMATTERS ──────────────────────────────────────────────────────────────
+const DEFAULT_MOBILE_ORDER = ['signal', 'positions', 'chart', 'edge', 'stats', 'risk', 'balance', 'markets', 'trades', 'history'];
+
 const fmt$ = (n, dec = 0) => {
   if (n == null || isNaN(n)) return '$0';
   const s = n < 0 ? '-' : n > 0 ? '+' : '';
@@ -113,7 +116,7 @@ function useBot() {
       killThreshold: 20, autoTrade: false, hasPrivateKey: false,
       takeProfitPct: 14, stopLossPct: 16, posTimeoutMs: 150000,
       maxOpenPos: 10, requireStableEdge: false, allowDuplicateMarkets: true,
-      cooldownMs: 500,
+      cooldownMs: 2000,
     },
   });
   const [trades, setTrades]       = useState([]);
@@ -303,7 +306,7 @@ function PanelShell({ id, label, badge, onHide, children }) {
 }
 
 // ─── TOP BAR MOBILE ───────────────────────────────────────────────────────────
-function TopBarMobile({ status, market, connected, clock, onStart, onStop, onSettings, actionPending }) {
+function TopBarMobile({ status, market, connected, clock, onStart, onStop, onSettings, onOrder, actionPending }) {
   const up    = (market.btcChange24h ?? 0) >= 0;
   const stats = status.stats || {};
   const wr    = stats.totalTrades > 0 ? Math.round(stats.wins / stats.totalTrades * 100) : 0;
@@ -320,6 +323,9 @@ function TopBarMobile({ status, market, connected, clock, onStart, onStop, onSet
           {connected ? (status.binanceConnected ? 'LIVE' : 'SYNC') : 'OFF'}
         </span>
         <div style={{ flex: 1 }} />
+        <button className="btn btn-ghost btn-sm" onClick={onOrder} title="Ordem dos blocos" style={{ minHeight: 36, padding: '6px 12px' }}>
+          <LayoutDashboard size={16} />
+        </button>
         <button className="btn btn-ghost btn-sm" onClick={onSettings} title="Configurações" style={{ minHeight: 36, padding: '6px 12px' }}>
           <Settings size={16} />
         </button>
@@ -536,6 +542,62 @@ function LayoutMenu({ hidden, onToggle, onReset, onClose }) {
   );
 }
 
+function MobileOrderMenu({ order, onMove, onReset, onClose }) {
+  return (
+    <div style={{
+      position: 'fixed', inset: 0, zIndex: 220,
+      background: 'rgba(0,0,0,.72)', backdropFilter: 'blur(4px)',
+      display: 'flex', alignItems: 'center', justifyContent: 'center',
+      padding: 16,
+    }}>
+      <div style={{
+        width: '100%', maxWidth: 420,
+        background: 'var(--s1)', border: '1px solid var(--border)', borderRadius: 10,
+        boxShadow: '0 24px 60px rgba(0,0,0,.45)', overflow: 'hidden',
+      }}>
+        <div style={{
+          display: 'flex', alignItems: 'center', justifyContent: 'space-between',
+          padding: '12px 14px', borderBottom: '1px solid var(--border)', background: 'var(--s2)',
+        }}>
+          <div>
+            <div style={{ fontSize: 10, letterSpacing: '0.1em', textTransform: 'uppercase', color: 'var(--t2)', fontFamily: 'Inter, sans-serif' }}>Ordem mobile</div>
+            <div style={{ fontSize: 11, color: 'var(--t3)', marginTop: 2 }}>Escolha apenas a ordem dos blocos</div>
+          </div>
+          <button className="btn btn-ghost btn-sm" onClick={onClose}>Fechar</button>
+        </div>
+        <div style={{ padding: 12, display: 'flex', flexDirection: 'column', gap: 8 }}>
+          {order.map((id, index) => (
+            <div
+              key={id}
+              style={{
+                display: 'flex', alignItems: 'center', justifyContent: 'space-between',
+                gap: 10, background: 'var(--s2)', border: '1px solid var(--border)', borderRadius: 8, padding: '10px 12px',
+              }}
+            >
+              <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
+                <span style={{ color: 'var(--t3)', minWidth: 18, textAlign: 'center' }}>{index + 1}</span>
+                <span style={{ color: 'var(--t1)', fontWeight: 700 }}>{PANEL_NAMES[id]}</span>
+              </div>
+              <div style={{ display: 'flex', gap: 6 }}>
+                <button className="btn btn-ghost btn-sm" onClick={() => onMove(id, -1)} disabled={index === 0}>
+                  <ArrowUp size={14} />
+                </button>
+                <button className="btn btn-ghost btn-sm" onClick={() => onMove(id, 1)} disabled={index === order.length - 1}>
+                  <ArrowDown size={14} />
+                </button>
+              </div>
+            </div>
+          ))}
+        </div>
+        <div style={{ padding: '12px 14px', borderTop: '1px solid var(--border)', display: 'flex', justifyContent: 'space-between' }}>
+          <button className="btn btn-ghost btn-sm" onClick={onReset}>Restaurar padrão</button>
+          <button className="btn btn-green btn-sm" onClick={onClose}>Concluir</button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
 // ─── SIGNAL BODY ──────────────────────────────────────────────────────────────
 function SignalBody({ signal, market, status, onManualTrade }) {
   const minEdge   = status.config?.minEdge ?? 0.05;
@@ -693,12 +755,34 @@ function BtcChartBody({ market, candles, currentCandle }) {
   const up   = (market.btcPrice || 0) >= (market.laggedPrice || market.btcPrice || 0);
   const diff = (market.btcPrice || 0) - (market.laggedPrice || market.btcPrice || 0);
   const pct  = market.laggedPrice > 0 ? (diff / market.laggedPrice * 100) : 0;
+  const [indicatorToggles, setIndicatorToggles] = useState(() => {
+    try {
+      const saved = localStorage.getItem('ptb-chart-indicators-v1');
+      if (saved) return JSON.parse(saved);
+    } catch (_) { /* ignore */ }
+    return { bollinger: true, vwap: false, ema9: true, ema21: true };
+  });
+
+  useEffect(() => {
+    localStorage.setItem('ptb-chart-indicators-v1', JSON.stringify(indicatorToggles));
+  }, [indicatorToggles]);
+
+  const toggleIndicator = (key) => {
+    setIndicatorToggles((prev) => ({ ...prev, [key]: !prev[key] }));
+  };
+
+  const indicatorMeta = [
+    { key: 'bollinger', label: 'BB', color: '#ff6b7f' },
+    { key: 'vwap', label: 'VWAP', color: '#c486ff' },
+    { key: 'ema9', label: 'EMA 9', color: '#f7b955' },
+    { key: 'ema21', label: 'EMA 21', color: '#6ea8ff' },
+  ];
 
   return (
     <>
       <div style={{
         padding: '4px 12px', background: 'var(--s2)', borderBottom: '1px solid var(--border)',
-        display: 'flex', justifyContent: 'space-between', alignItems: 'center', flexShrink: 0,
+        display: 'flex', justifyContent: 'space-between', alignItems: 'center', flexWrap: 'wrap', gap: 8, flexShrink: 0,
       }}>
         <div style={{ display: 'flex', gap: 10, alignItems: 'center', fontSize: 8 }}>
           <span style={{ fontWeight: 700, color: up ? 'var(--green)' : 'var(--red)' }}>
@@ -725,10 +809,37 @@ function BtcChartBody({ market, candles, currentCandle }) {
             EDGE {fmtEdge(market.edge || 0)}
           </span>
         </div>
+        <div style={{ display: 'flex', gap: 6, alignItems: 'center', flexWrap: 'wrap' }}>
+          {indicatorMeta.map((indicator) => {
+            const active = !!indicatorToggles[indicator.key];
+            return (
+              <button
+                key={indicator.key}
+                type="button"
+                onClick={() => toggleIndicator(indicator.key)}
+                style={{
+                  border: `1px solid ${active ? indicator.color : 'var(--border)'}`,
+                  background: active ? `${indicator.color}18` : 'transparent',
+                  color: active ? indicator.color : 'var(--t3)',
+                  borderRadius: 999,
+                  padding: '3px 8px',
+                  fontSize: 8,
+                  fontWeight: 700,
+                  letterSpacing: '0.05em',
+                  cursor: 'pointer',
+                  transition: 'all .15s ease',
+                }}
+                title={active ? `Ocultar ${indicator.label}` : `Mostrar ${indicator.label}`}
+              >
+                {active ? 'ON' : 'OFF'} {indicator.label}
+              </button>
+            );
+          })}
+        </div>
       </div>
       <div style={{ flex: 1, minHeight: 0 }}>
         {candles.length > 0 || currentCandle
-          ? <CandleChart candles={candles} currentCandle={currentCandle} />
+          ? <CandleChart candles={candles} currentCandle={currentCandle} indicators={indicatorToggles} />
           : <div style={{ height: '100%', display: 'flex', alignItems: 'center', justifyContent: 'center', color: 'var(--t2)', fontSize: 10 }}>
               Aguardando dados do Binance…
             </div>
@@ -1176,6 +1287,7 @@ export default function App() {
           startBot, stopBot, manualTrade, closePosition, actionPending, botError, setBotError } = useBot();
   const [showConfig, setShowConfig] = useState(false);
   const [showLayout, setShowLayout] = useState(false);
+  const [showMobileOrder, setShowMobileOrder] = useState(false);
   const [clock, setClock]           = useState(fmtClock());
   const isMobile                    = useIsMobile();
 
@@ -1186,6 +1298,14 @@ export default function App() {
   const [hidden, setHidden] = useState(() => {
     try { const s = localStorage.getItem(LS_HIDDEN); return s ? new Set(JSON.parse(s)) : new Set(); }
     catch { return new Set(); }
+  });
+  const [mobileOrder, setMobileOrder] = useState(() => {
+    try {
+      const saved = JSON.parse(localStorage.getItem(LS_MOBILE_ORDER) || 'null');
+      return Array.isArray(saved) && saved.length ? saved : DEFAULT_MOBILE_ORDER;
+    } catch {
+      return DEFAULT_MOBILE_ORDER;
+    }
   });
 
   useEffect(() => {
@@ -1223,6 +1343,23 @@ export default function App() {
     localStorage.removeItem(LS_HIDDEN);
   };
 
+  const moveMobilePanel = (id, direction) => {
+    setMobileOrder((prev) => {
+      const next = [...prev];
+      const index = next.indexOf(id);
+      const target = index + direction;
+      if (index < 0 || target < 0 || target >= next.length) return prev;
+      [next[index], next[target]] = [next[target], next[index]];
+      localStorage.setItem(LS_MOBILE_ORDER, JSON.stringify(next));
+      return next;
+    });
+  };
+
+  const resetMobileOrder = () => {
+    setMobileOrder(DEFAULT_MOBILE_ORDER);
+    localStorage.setItem(LS_MOBILE_ORDER, JSON.stringify(DEFAULT_MOBILE_ORDER));
+  };
+
   const handleResizeStop = () => setTimeout(() => window.dispatchEvent(new Event('resize')), 50);
 
   // Combine saved layout with any new panels (e.g. panels added after save)
@@ -1231,6 +1368,10 @@ export default function App() {
     const extra = DEFAULT_LAYOUT.filter(d => !savedIds.has(d.i));
     return [...layout, ...extra].filter(l => !hidden.has(l.i));
   })();
+  const mobileOrderResolved = [
+    ...mobileOrder.filter(id => DEFAULT_MOBILE_ORDER.includes(id)),
+    ...DEFAULT_MOBILE_ORDER.filter(id => !mobileOrder.includes(id)),
+  ];
 
   const panelBadge = (id) => {
     if (id === 'markets') {
@@ -1285,6 +1426,117 @@ export default function App() {
     }
   };
 
+  const renderMobilePanel = (id) => {
+    const isReal = markets.some(m => m.live);
+    const edgeValue = market.edge || 0;
+    switch (id) {
+      case 'signal':
+        return (
+          <MobileCard
+            title="Signal"
+            badge={<span className={cn('badge', status.active ? 'badge-green' : 'badge-gray')} style={{ fontSize: 7 }}>{status.active ? '● ON' : '● OFF'}</span>}
+            defaultOpen
+          >
+            <SignalBody signal={signal} market={market} status={status} onManualTrade={manualTrade} />
+          </MobileCard>
+        );
+      case 'positions':
+        return (
+          <MobileCard
+            title="Posições Abertas"
+            badge={positions.length > 0 ? <span className="badge badge-amber blink" style={{ fontSize: 7 }}>{positions.length} LIVE</span> : null}
+            defaultOpen={positions.length > 0}
+            bodyStyle={{ minHeight: positions.length > 0 ? 120 : 60 }}
+          >
+            <PositionsBody positions={positions} onClose={closePosition} />
+          </MobileCard>
+        );
+      case 'chart':
+        return (
+          <MobileCard
+            title="BTC / USDT"
+            badge={<span style={{ fontSize: 9, fontWeight: 700, color: (market.btcChange24h ?? 0) >= 0 ? 'var(--green)' : 'var(--red)' }}>{market.btcPrice ? fmtPrice(market.btcPrice) : '—'}</span>}
+            defaultOpen
+            bodyStyle={{ height: 320, display: 'flex', flexDirection: 'column' }}
+          >
+            <div className="mobile-chart-wrap">
+              <BtcChartBody market={market} candles={candles} currentCandle={currentCandle} />
+            </div>
+          </MobileCard>
+        );
+      case 'edge':
+        return (
+          <MobileCard
+            title="Live Edge"
+            badge={
+              <div style={{ display: 'flex', gap: 6, alignItems: 'center', fontSize: 8 }}>
+                <span style={{ color: 'var(--blue)' }}>■ Binance</span>
+                <span style={{ color: 'var(--red)' }}>■ Poly</span>
+                <span style={{ fontWeight: 700, color: Math.abs(edgeValue) > 0.05 ? (edgeValue > 0 ? 'var(--green)' : 'var(--red)') : 'var(--t2)' }}>{fmtEdge(edgeValue)}</span>
+              </div>
+            }
+            defaultOpen
+            bodyStyle={{ height: 220, display: 'flex', flexDirection: 'column' }}
+          >
+            <div className="mobile-edge-wrap">
+              <EdgeChartBody market={market} />
+            </div>
+          </MobileCard>
+        );
+      case 'stats':
+        return <MobileCard title="Performance" defaultOpen><StatsBody status={status} /></MobileCard>;
+      case 'risk':
+        return (
+          <MobileCard
+            title="Risk Monitor"
+            badge={(status.drawdown || 0) * 100 >= (status.config?.killThreshold ?? 20) * 0.75 ? <span className="badge badge-red blink" style={{ fontSize: 7 }}>KILL ZONE</span> : null}
+            defaultOpen
+          >
+            <RiskBody status={status} />
+          </MobileCard>
+        );
+      case 'balance':
+        return (
+          <MobileCard title="Balance Curve" defaultOpen={false} bodyStyle={{ height: 200, display: 'flex', flexDirection: 'column' }}>
+            <BalanceCurveBody trades={trades} status={status} />
+          </MobileCard>
+        );
+      case 'markets':
+        return (
+          <MobileCard
+            title="Mercados BTC"
+            badge={<span className={cn('badge', isReal ? 'badge-green' : 'badge-amber')} style={{ fontSize: 7 }}>{isReal ? '● LIVE' : '● SIM'}</span>}
+            defaultOpen={false}
+          >
+            <MarketsBody markets={markets} />
+          </MobileCard>
+        );
+      case 'trades':
+        return (
+          <MobileCard
+            title="Trade Log"
+            badge={<span style={{ fontSize: 8, color: 'var(--t2)' }}>{trades.length} fills</span>}
+            defaultOpen={false}
+            bodyStyle={{ maxHeight: 320, overflowY: 'auto' }}
+          >
+            <TradesBody trades={trades} />
+          </MobileCard>
+        );
+      case 'history':
+        return (
+          <MobileCard
+            title="Histórico"
+            badge={<span style={{ fontSize: 8, color: 'var(--t2)' }}>{trades.length} trades</span>}
+            defaultOpen={false}
+          >
+            <HistoryBody trades={trades} />
+          </MobileCard>
+        );
+      default:
+        return null;
+    }
+  };
+
   const errorBanner = botError && (
     <div style={{
       position: 'fixed', top: isMobile ? 0 : 48, left: '50%', transform: 'translateX(-50%)',
@@ -1304,17 +1556,23 @@ export default function App() {
   // ── MOBILE LAYOUT ──────────────────────────────────────────────────────────
   if (isMobile) {
     const isReal = markets.some(m => m.live);
-    const edge   = market.edge || 0;
+    const edge = market.edge || 0;
     return (
       <div className="app-shell">
         <TopBarMobile
           status={status} market={market} connected={connected} clock={clock}
           onStart={startBot} onStop={stopBot}
+          onOrder={() => setShowMobileOrder(true)}
           onSettings={() => setShowConfig(true)}
           actionPending={actionPending}
         />
         {errorBanner}
         <div className="mobile-body">
+          {mobileOrderResolved.map((id) => (
+            <React.Fragment key={id}>{renderMobilePanel(id)}</React.Fragment>
+          ))}
+          {false && (
+            <>
 
           {/* Signal */}
           <MobileCard
@@ -1410,8 +1668,18 @@ export default function App() {
           >
             <HistoryBody trades={trades} />
           </MobileCard>
-
+            </>
+          )}
         </div>
+
+        {showMobileOrder && (
+          <MobileOrderMenu
+            order={mobileOrderResolved}
+            onMove={moveMobilePanel}
+            onReset={resetMobileOrder}
+            onClose={() => setShowMobileOrder(false)}
+          />
+        )}
 
         {showConfig && (
           <ConfigModal key={JSON.stringify(status.config)} initialConfig={status.config} onClose={() => setShowConfig(false)} />

@@ -140,7 +140,7 @@ function applyConfigPatch(patch = {}) {
     state.trading.peakBalance = patch.capital;
   }
   if (patch.fixedAmount > 0) {
-    c.fixedAmount = Math.min(patch.fixedAmount, state.trading.balance || c.capital);
+    c.fixedAmount = Math.min(100000, Math.max(1, Number(patch.fixedAmount) || c.fixedAmount));
   }
   if (patch.maxBetPct !== undefined) c.maxBetPct = Math.min(50, Math.max(1, Number(patch.maxBetPct) || c.maxBetPct));
   if (patch.minEdge !== undefined) c.minEdge = Math.min(0.5, Math.max(0.01, Number(patch.minEdge) || c.minEdge));
@@ -148,7 +148,7 @@ function applyConfigPatch(patch = {}) {
   if (patch.autoTrade !== undefined) c.autoTrade = Boolean(patch.autoTrade);
   if (patch.takeProfitPct !== undefined) c.takeProfitPct = Math.min(100, Math.max(1, Number(patch.takeProfitPct) || c.takeProfitPct));
   if (patch.stopLossPct !== undefined) c.stopLossPct = Math.min(100, Math.max(1, Number(patch.stopLossPct) || c.stopLossPct));
-  if (patch.posTimeoutMs !== undefined) c.posTimeoutMs = Math.min(3600000, Math.max(30000, Number(patch.posTimeoutMs) || c.posTimeoutMs));
+  if (patch.posTimeoutMs !== undefined) c.posTimeoutMs = Math.min(86400000, Math.max(30000, Number(patch.posTimeoutMs) || c.posTimeoutMs));
   if (patch.maxOpenPos !== undefined) c.maxOpenPos = Math.min(20, Math.max(1, Number(patch.maxOpenPos) || c.maxOpenPos));
   if (patch.requireStableEdge !== undefined) c.requireStableEdge = Boolean(patch.requireStableEdge);
   if (patch.allowDuplicateMarkets !== undefined) c.allowDuplicateMarkets = Boolean(patch.allowDuplicateMarkets);
@@ -1993,6 +1993,7 @@ function openPosition(signal) {
   const yesAtEntry = market.outcomePrices?.[0] ?? 0.5;
   const midAtEntry = side === 'BUY_YES' ? yesAtEntry : (1 - yesAtEntry);
 
+  const entryTime = Date.now();
   const pos = {
     id:               nextId('p'),
     marketId,
@@ -2006,7 +2007,7 @@ function openPosition(signal) {
     unrealizedPnl:    0,
     pnlPct:           0,
     edge:             Math.round(edge * 10000) / 10000,
-    entryTime:        Date.now(),
+    entryTime,
     btcPriceAtEntry:  state.btcPrice,
     // CLOB execution metadata (shown in trade log)
     spread:           fill.spread,
@@ -2015,6 +2016,7 @@ function openPosition(signal) {
     requestedSize:    betSize,
     status:           'OPEN',
   };
+  pos.closeDeadline = getPositionCloseDeadline(pos, market);
 
   state.trading.balance = Math.round((state.trading.balance - fillSize) * 100) / 100;
   state.positions.push(pos);
@@ -2056,6 +2058,14 @@ function updateSimMarketPrices() {
     m.outcomePrices[0] = Math.round(newYes * 1000) / 1000;
     m.outcomePrices[1] = Math.round((1 - m.outcomePrices[0]) * 1000) / 1000;
   }
+}
+
+function getPositionCloseDeadline(pos, market) {
+  const timeoutAt = pos.entryTime + Math.max(30000, Number(state.config.posTimeoutMs) || 0);
+  const marketCloseAt = market?.endDate ? new Date(market.endDate).getTime() : NaN;
+  if (!Number.isFinite(marketCloseAt) || marketCloseAt <= pos.entryTime) return timeoutAt;
+  const nearExpiryAt = Math.max(pos.entryTime + 30000, marketCloseAt - 5000);
+  return Math.max(timeoutAt, nearExpiryAt);
 }
 
 // ── POSITION CLOSE ───────────────────────────────────────────────────────────────
@@ -2206,7 +2216,8 @@ function monitorPositions() {
 
     const gainPct  = triggerDelta / entryMarkBaseline; // positive = market moved in our favor
     const lossPct  = -triggerDelta / entryMarkBaseline; // positive = market moved against us
-    const elapsed  = Date.now() - pos.entryTime;
+    const nowMs = Date.now();
+    const elapsed  = nowMs - pos.entryTime;
 
     if (gainPct >= state.config.takeProfitPct / 100 && pos.unrealizedPnl > 0) {
       closePosition(pos, newMark, 'TP'); continue;
@@ -2214,7 +2225,9 @@ function monitorPositions() {
     if (lossPct >= state.config.stopLossPct / 100) {
       closePosition(pos, newMark, 'SL'); continue;
     }
-    if (elapsed >= state.config.posTimeoutMs) {
+    const closeDeadline = getPositionCloseDeadline(pos, mktForPos);
+    pos.closeDeadline = closeDeadline;
+    if (nowMs >= closeDeadline) {
       closePosition(pos, newMark, 'TIMEOUT'); continue;
     }
   }

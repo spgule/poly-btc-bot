@@ -52,7 +52,7 @@ export default function ConfigModal({ onClose, initialConfig }) {
     maxOpenPos:            initialConfig?.maxOpenPos     || 10,
     requireStableEdge:     initialConfig?.requireStableEdge ?? false,
     allowDuplicateMarkets: initialConfig?.allowDuplicateMarkets ?? true,
-    cooldownMs:            initialConfig?.cooldownMs || 500,
+    cooldownMs:            initialConfig?.cooldownMs || 2000,
     privateKey:            '',
   });
   const [showKey, setShowKey] = useState(false);
@@ -283,9 +283,9 @@ export default function ConfigModal({ onClose, initialConfig }) {
             {/* Timeout */}
             <div style={{ marginBottom: 14 }}>
               <label style={S.label}>Position Timeout</label>
-              <span style={S.hint}>Force-close position at market price after this time, regardless of TP/SL.</span>
+              <span style={S.hint}>Minimum hold window. If the market has a scheduled end, the bot now waits until near expiry when that is later than this timeout.</span>
               <div style={{ display: 'flex', gap: 6, flexWrap: 'wrap' }}>
-                {[[30000,'30s'],[60000,'1m'],[120000,'2m'],[240000,'4m'],[600000,'10m'],[1800000,'30m']].map(([ms, label]) => (
+                {[[120000,'2m'],[300000,'5m'],[600000,'10m'],[1800000,'30m'],[3600000,'1h'],[14400000,'4h']].map(([ms, label]) => (
                   <button key={ms} onClick={() => set('posTimeoutMs', ms)}
                     className={cn('btn btn-sm', cfg.posTimeoutMs === ms ? 'btn-green' : 'btn-ghost')}
                     style={{ fontSize: 11 }}>
@@ -315,9 +315,9 @@ export default function ConfigModal({ onClose, initialConfig }) {
               <label style={S.label}>Entry Cooldown: <strong style={{ color: 'var(--t1)' }}>
                 {cfg.cooldownMs >= 1000 ? `${cfg.cooldownMs / 1000}s` : `${cfg.cooldownMs}ms`}
               </strong></label>
-              <span style={S.hint}>Minimum time between entries. Lower = higher trade frequency.</span>
+              <span style={S.hint}>Minimum time between entries. Shared with LIVE safety rules, so the practical minimum is 2s.</span>
               <div style={{ display: 'flex', gap: 6, flexWrap: 'wrap' }}>
-                {[[300,'300ms'],[500,'500ms'],[1000,'1s'],[2000,'2s'],[5000,'5s'],[10000,'10s']].map(([ms, label]) => (
+                {[[2000,'2s'],[5000,'5s'],[10000,'10s'],[15000,'15s'],[30000,'30s'],[60000,'60s']].map(([ms, label]) => (
                   <button key={ms} onClick={() => set('cooldownMs', ms)}
                     className={cn('btn btn-sm', cfg.cooldownMs === ms ? 'btn-green' : 'btn-ghost')}
                     style={{ flex: '1 1 auto', fontSize: 11 }}>

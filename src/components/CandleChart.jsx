@@ -5,39 +5,141 @@ import {
   ColorType,
   CandlestickSeries,
   HistogramSeries,
+  LineSeries,
+  LineStyle,
 } from 'lightweight-charts';
 
-// Coerce to integer seconds â€” guards against any object/non-numeric value
 function toTime(t) {
   const n = Math.floor(Number(t));
-  return isFinite(n) && n > 0 ? n : 0;
+  return Number.isFinite(n) && n > 0 ? n : 0;
 }
 
 function candleVolume(candle) {
   const volume = Number(candle?.volume);
-  if (isFinite(volume) && volume >= 0) return volume;
+  if (Number.isFinite(volume) && volume >= 0) return volume;
   return Number(candle?.ticks) || 1;
 }
 
-export default function CandleChart({ candles = [], currentCandle = null }) {
+function buildChartRows(candles = [], currentCandle = null) {
+  const all = currentCandle ? [...candles, currentCandle] : candles;
+  const rows = all
+    .filter(Boolean)
+    .map((candle) => ({
+      time: toTime(candle.time),
+      open: Number(candle.open),
+      high: Number(candle.high),
+      low: Number(candle.low),
+      close: Number(candle.close),
+      volume: candleVolume(candle),
+    }))
+    .filter((bar) => (
+      bar.time > 0
+      && Number.isFinite(bar.open)
+      && Number.isFinite(bar.high)
+      && Number.isFinite(bar.low)
+      && Number.isFinite(bar.close)
+    ));
+
+  const byTime = new Map();
+  for (const row of rows) byTime.set(row.time, row);
+  return [...byTime.values()].sort((a, b) => a.time - b.time);
+}
+
+function calcEma(rows, period) {
+  if (!rows.length) return [];
+  const alpha = 2 / (period + 1);
+  let ema = rows[0].close;
+  return rows.map((row, index) => {
+    ema = index === 0 ? row.close : ((row.close - ema) * alpha) + ema;
+    return { time: row.time, value: ema };
+  });
+}
+
+function calcVwap(rows) {
+  let cumulativePV = 0;
+  let cumulativeVol = 0;
+  return rows.map((row) => {
+    const typical = (row.high + row.low + row.close) / 3;
+    const volume = row.volume > 0 ? row.volume : 1;
+    cumulativePV += typical * volume;
+    cumulativeVol += volume;
+    return {
+      time: row.time,
+      value: cumulativeVol > 0 ? cumulativePV / cumulativeVol : row.close,
+    };
+  });
+}
+
+function calcBollinger(rows, period = 20, mult = 2) {
+  const upper = [];
+  const middle = [];
+  const lower = [];
+
+  for (let i = 0; i < rows.length; i += 1) {
+    if (i + 1 < period) continue;
+    const slice = rows.slice(i + 1 - period, i + 1).map((row) => row.close);
+    const mean = slice.reduce((sum, value) => sum + value, 0) / slice.length;
+    const variance = slice.reduce((sum, value) => sum + ((value - mean) ** 2), 0) / slice.length;
+    const stdDev = Math.sqrt(variance);
+    const time = rows[i].time;
+    middle.push({ time, value: mean });
+    upper.push({ time, value: mean + (stdDev * mult) });
+    lower.push({ time, value: mean - (stdDev * mult) });
+  }
+
+  return { upper, middle, lower };
+}
+
+export default function CandleChart({
+  candles = [],
+  currentCandle = null,
+  indicators = {},
+}) {
   const containerRef = useRef(null);
-  const chartRef     = useRef(null);
-  const seriesRef    = useRef(null);
-  const volRef       = useRef(null);
+  const chartRef = useRef(null);
+  const candleSeriesRef = useRef(null);
+  const volumeSeriesRef = useRef(null);
+  const overlaySeriesRef = useRef({});
+  const latestRowsRef = useRef([]);
 
-  // Keep latest props in a ref so effects always see current values (avoids stale closures)
-  const candlesRef      = useRef(candles);
-  const curCandleRef    = useRef(currentCandle);
-  candlesRef.current    = candles;
-  curCandleRef.current  = currentCandle;
+  function syncChart() {
+    const candleSeries = candleSeriesRef.current;
+    if (!candleSeries) return;
 
-  // Internal chart state
-  const lastChartTimeRef = useRef(0);  // highest time pushed to the chart
-  const loadedCountRef   = useRef(0);  // # of closed candles in last setData/loadAll
+    const rows = buildChartRows(candles, currentCandle);
+    latestRowsRef.current = rows;
+    if (!rows.length) return;
 
-  // â”€â”€ Create chart once â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    candleSeries.setData(rows.map((row) => ({
+      time: row.time,
+      open: row.open,
+      high: row.high,
+      low: row.low,
+      close: row.close,
+    })));
+
+    volumeSeriesRef.current?.setData(rows.map((row) => ({
+      time: row.time,
+      value: row.volume,
+      color: row.close >= row.open ? 'rgba(0,224,130,0.28)' : 'rgba(255,68,102,0.28)',
+    })));
+
+    const overlays = overlaySeriesRef.current;
+    const ema9 = calcEma(rows, 9);
+    const ema21 = calcEma(rows, 21);
+    const vwap = calcVwap(rows);
+    const bollinger = calcBollinger(rows, 20, 2);
+
+    overlays.ema9?.setData(indicators.ema9 ? ema9 : []);
+    overlays.ema21?.setData(indicators.ema21 ? ema21 : []);
+    overlays.vwap?.setData(indicators.vwap ? vwap : []);
+    overlays.bbUpper?.setData(indicators.bollinger ? bollinger.upper : []);
+    overlays.bbMiddle?.setData(indicators.bollinger ? bollinger.middle : []);
+    overlays.bbLower?.setData(indicators.bollinger ? bollinger.lower : []);
+  }
+
   useEffect(() => {
-    if (!containerRef.current) return;
+    if (!containerRef.current) return undefined;
 
     const chart = createChart(containerRef.current, {
       autoSize: true,
@@ -74,159 +176,87 @@ export default function CandleChart({ candles = [], currentCandle = null }) {
       handleScale: { axisPressedMouseMove: true, mouseWheel: true, pinch: true },
     });
 
-    const candleSeries = chart.addSeries(CandlestickSeries, {
-      upColor: '#00e082', downColor: '#ff4466',
-      borderUpColor: '#00e082', borderDownColor: '#ff4466',
-      wickUpColor: '#00e08299', wickDownColor: '#ff446699',
+    candleSeriesRef.current = chart.addSeries(CandlestickSeries, {
+      upColor: '#00e082',
+      downColor: '#ff4466',
+      borderUpColor: '#00e082',
+      borderDownColor: '#ff4466',
+      wickUpColor: '#00e08299',
+      wickDownColor: '#ff446699',
     });
 
-    const volSeries = chart.addSeries(HistogramSeries, {
+    volumeSeriesRef.current = chart.addSeries(HistogramSeries, {
       priceFormat: { type: 'volume' },
       priceScaleId: 'vol',
     });
     chart.priceScale('vol').applyOptions({ scaleMargins: { top: 0.82, bottom: 0 } });
 
-    chartRef.current  = chart;
-    seriesRef.current = candleSeries;
-    volRef.current    = volSeries;
+    overlaySeriesRef.current = {
+      ema9: chart.addSeries(LineSeries, {
+        color: '#f7b955',
+        lineWidth: 1,
+        lastValueVisible: false,
+        priceLineVisible: false,
+      }),
+      ema21: chart.addSeries(LineSeries, {
+        color: '#6ea8ff',
+        lineWidth: 1,
+        lastValueVisible: false,
+        priceLineVisible: false,
+      }),
+      vwap: chart.addSeries(LineSeries, {
+        color: '#c486ff',
+        lineWidth: 1,
+        lastValueVisible: false,
+        priceLineVisible: false,
+      }),
+      bbUpper: chart.addSeries(LineSeries, {
+        color: 'rgba(255,68,102,0.78)',
+        lineWidth: 1,
+        lineStyle: LineStyle.Dashed,
+        lastValueVisible: false,
+        priceLineVisible: false,
+      }),
+      bbMiddle: chart.addSeries(LineSeries, {
+        color: 'rgba(130,130,190,0.85)',
+        lineWidth: 1,
+        lastValueVisible: false,
+        priceLineVisible: false,
+      }),
+      bbLower: chart.addSeries(LineSeries, {
+        color: 'rgba(0,224,130,0.78)',
+        lineWidth: 1,
+        lineStyle: LineStyle.Dashed,
+        lastValueVisible: false,
+        priceLineVisible: false,
+      }),
+    };
 
-    const ro = new ResizeObserver(() => {
-      if (chartRef.current && containerRef.current)
+    chartRef.current = chart;
+    syncChart();
+
+    const resizeObserver = new ResizeObserver(() => {
+      if (chartRef.current && containerRef.current) {
         chartRef.current.resize(containerRef.current.clientWidth, containerRef.current.clientHeight);
+      }
     });
-    ro.observe(containerRef.current);
+    resizeObserver.observe(containerRef.current);
 
     return () => {
-      ro.disconnect();
+      resizeObserver.disconnect();
       chart.remove();
-      chartRef.current = seriesRef.current = volRef.current = null;
-      lastChartTimeRef.current = loadedCountRef.current = 0;
+      chartRef.current = null;
+      candleSeriesRef.current = null;
+      volumeSeriesRef.current = null;
+      overlaySeriesRef.current = {};
     };
+  // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  // â”€â”€ Full reload: always reads from refs (never stale) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
-  function reloadAll() {
-    if (!seriesRef.current) return;
-    const closed  = candlesRef.current;
-    const forming = curCandleRef.current;
-    const all = forming ? [...closed, forming] : closed;
-    const rawBars = all
-      .filter(c => c != null)
-      .map(c => ({ time: toTime(c.time), open: Number(c.open), high: Number(c.high), low: Number(c.low), close: Number(c.close) }))
-      .filter(b => b.time > 0 && !isNaN(b.open) && !isNaN(b.high) && !isNaN(b.low) && !isNaN(b.close));
-    const rawVols = all
-      .filter(c => c != null)
-      .map(c => ({
-        time: toTime(c.time), value: candleVolume(c),
-        color: Number(c.close) >= Number(c.open) ? 'rgba(0,224,130,0.28)' : 'rgba(255,68,102,0.28)',
-      }))
-      .filter(v => v.time > 0 && !isNaN(v.value));
-
-    // Deduplicate by time and sort
-    const seenTimes = new Set();
-    const bars = [];
-    for (const b of rawBars) {
-      if (!seenTimes.has(b.time)) {
-        seenTimes.add(b.time);
-        bars.push(b);
-      }
-    }
-    bars.sort((a, b) => a.time - b.time);
-
-    const seenVolTimes = new Set();
-    const vols = [];
-    for (const v of rawVols) {
-      if (!seenVolTimes.has(v.time)) {
-        seenVolTimes.add(v.time);
-        vols.push(v);
-      }
-    }
-    vols.sort((a, b) => a.time - b.time);
-    if (bars.length === 0) return;
-    try {
-      seriesRef.current.setData(bars);
-      if (volRef.current) volRef.current.setData(vols);
-      lastChartTimeRef.current = bars[bars.length - 1].time;
-      loadedCountRef.current   = closed.length;
-    } catch (e) {
-      console.warn('[Chart] setData failed:', e);
-    }
-  }
-
-  // â”€â”€ Effect: handle closed candles array changes â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
   useEffect(() => {
-    if (!seriesRef.current || candles.length === 0) return;
-
-    // First load
-    if (loadedCountRef.current === 0) {
-      reloadAll();
-      return;
-    }
-
-    // New closed candle appended
-    if (candles.length > loadedCountRef.current) {
-      const c = candles[candles.length - 1];
-      const t = toTime(c.time);
-
-      if (t === 0) { loadedCountRef.current = candles.length; return; }
-
-      if (t <= lastChartTimeRef.current) {
-        // Out-of-order: closed candle arrived with time behind current chart time.
-        // This happens when currentCandle already moved to next bucket via WS tick
-        // before this HTTP poll delivered the now-closed candle.
-        // Safe fix: full setData reload which is self-consistent.
-        reloadAll();
-      } else {
-        try {
-          const o = Number(c.open), h = Number(c.high), l = Number(c.low), cl = Number(c.close), vol = candleVolume(c);
-          if (!isNaN(o) && !isNaN(h) && !isNaN(l) && !isNaN(cl)) {
-            seriesRef.current.update({ time: t, open: o, high: h, low: l, close: cl });
-            if (volRef.current) volRef.current.update({
-              time: t, value: vol,
-              color: cl >= o ? 'rgba(0,224,130,0.28)' : 'rgba(255,68,102,0.28)',
-            });
-            lastChartTimeRef.current = t;
-          }
-        } catch (_) { reloadAll(); }
-      }
-      loadedCountRef.current = candles.length;
-    }
+    syncChart();
   // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [candles]);
-
-  // â”€â”€ Effect: real-time forming candle tick (every ~150ms from WS) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
-  // ————————————————— Effect: real-time forming candle tick (every ~150ms from WS) —————
-  useEffect(() => {
-    if (!seriesRef.current || !currentCandle) return;
-    const t = toTime(currentCandle.time);
-    if (t === 0) return;
-
-    try {
-      const o = Number(currentCandle.open), h = Number(currentCandle.high), l = Number(currentCandle.low), cl = Number(currentCandle.close), vol = candleVolume(currentCandle);
-      if (!isNaN(o) && !isNaN(h) && !isNaN(l) && !isNaN(cl)) {
-        // Bootstrap chart with the forming candle when no closed candles exist yet.
-        if (loadedCountRef.current === 0 && (!candlesRef.current || candlesRef.current.length === 0)) {
-          seriesRef.current.setData([{ time: t, open: o, high: h, low: l, close: cl }]);
-          if (volRef.current) volRef.current.setData([{
-            time: t, value: vol,
-            color: cl >= o ? 'rgba(0,224,130,0.28)' : 'rgba(255,68,102,0.28)',
-          }]);
-          lastChartTimeRef.current = t;
-          return;
-        }
-        seriesRef.current.update({ time: t, open: o, high: h, low: l, close: cl });
-        if (volRef.current) volRef.current.update({
-          time: t, value: vol,
-          color: cl >= o ? 'rgba(0,224,130,0.28)' : 'rgba(255,68,102,0.28)',
-        });
-        if (t > lastChartTimeRef.current) lastChartTimeRef.current = t;
-      }
-    } catch (_) {
-      // Any error (including "Cannot update oldest data") → full reload
-      reloadAll();
-    }
-  // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [currentCandle]);
+  }, [candles, currentCandle, indicators]);
 
   return <div ref={containerRef} style={{ width: '100%', height: '100%' }} />;
 }
