@@ -1286,47 +1286,58 @@ async function fetchBTCMarkets() {
 }
 
 function seedSimMarkets() {
-  const btc = state.btcPrice || 0;
-  const base = Math.round(btc / 10) * 10 || 50000;
-  // Ladder of sim markets across all valid trading durations (5–30 min).
-  // Volumes calibrated to real Polymarket BTC binary markets (~$50k–$80k).
-  // Strike offset scales with sqrt(minutes) so each market starts near 50% probability.
-  const strikes = [
-    // 5-minute markets — tightest strikes, highest priority
-    { id: 'sim-1',  strike: base - 20,  minutes: 5,  volume: 75000 },
-    { id: 'sim-2',  strike: base,        minutes: 5,  volume: 80000 },
-    { id: 'sim-3',  strike: base + 20,  minutes: 5,  volume: 65000 },
-    { id: 'sim-4',  strike: base + 40,  minutes: 5,  volume: 55000 },
-    // 10-minute markets
-    { id: 'sim-5',  strike: base - 50,  minutes: 10, volume: 70000 },
-    { id: 'sim-6',  strike: base + 50,  minutes: 10, volume: 65000 },
-    // 15-minute markets
-    { id: 'sim-7',  strike: base - 100, minutes: 15, volume: 75000 },
-    { id: 'sim-8',  strike: base + 100, minutes: 15, volume: 70000 },
-    // 20-minute markets
-    { id: 'sim-9',  strike: base - 150, minutes: 20, volume: 65000 },
-    { id: 'sim-10', strike: base + 150, minutes: 20, volume: 60000 },
-    // 25-minute markets
-    { id: 'sim-11', strike: base - 200, minutes: 25, volume: 57000 },
-    { id: 'sim-12', strike: base + 200, minutes: 25, volume: 55000 },
-    // 30-minute markets
-    { id: 'sim-13', strike: base - 250, minutes: 30, volume: 52000 },
-    { id: 'sim-14', strike: base + 250, minutes: 30, volume: 50000 },
+  // Generate SIM markets with the EXACT same format as real Polymarket "Up or Down"
+  // markets: question = "Bitcoin Up or Down - May 4, 8:00PM-8:15PM ET", no fixed $
+  // strike in question. Strike = BTC price at window open (stored in _strikeSnapshot),
+  // identical to how computeBinaryMid handles real live markets.
+  const nowMs  = Date.now();
+  const btcNow = state.btcPrice || 50000;
+
+  // Align window start to the next 5-min UTC boundary (mirrors ET clock alignment).
+  const FIVE_MIN = 5 * 60000;
+  const alignedStartMs = Math.ceil(nowMs / FIVE_MIN) * FIVE_MIN;
+
+  // Format timestamp as "H:MMAM/PM" in ET (America/New_York handles DST automatically).
+  function fmtET(ms) {
+    const parts = new Intl.DateTimeFormat('en-US', {
+      timeZone: 'America/New_York',
+      hour: 'numeric', minute: '2-digit', hour12: true,
+    }).formatToParts(new Date(ms));
+    const hour      = parts.find(p => p.type === 'hour').value;
+    const minute    = parts.find(p => p.type === 'minute').value;
+    const dayPeriod = parts.find(p => p.type === 'dayPeriod').value.toUpperCase();
+    return `${hour}:${minute}${dayPeriod}`;
+  }
+
+  // Date label in ET: "May 4"
+  const dateLabel = new Intl.DateTimeFormat('en-US', {
+    timeZone: 'America/New_York', month: 'short', day: 'numeric',
+  }).format(new Date(alignedStartMs));
+
+  // One market per duration — same set of window sizes real Polymarket publishes.
+  // Volumes calibrated to real Polymarket BTC binary market range (~$50k–$80k).
+  const slots = [
+    { id: 'sim-1', minutes: 5,  volume: 80000 },
+    { id: 'sim-2', minutes: 10, volume: 70000 },
+    { id: 'sim-3', minutes: 15, volume: 75000 },
+    { id: 'sim-4', minutes: 20, volume: 65000 },
+    { id: 'sim-5', minutes: 25, volume: 57000 },
+    { id: 'sim-6', minutes: 30, volume: 52000 },
   ];
-  // Keep real (live) markets intact — only replace/refresh sim markets
+
   const liveMarkets = state.markets.filter(m => m.live);
-  const nowSeed = Date.now();
   state.markets = [
     ...liveMarkets,
-    ...strikes.map(({ id, strike, minutes, volume }) => {
-      const startDate = new Date(nowSeed).toISOString();
-      const endDate   = new Date(nowSeed + minutes * 60000).toISOString();
-      const question  = `Will BTC be above $${strike.toLocaleString('en-US')} in ${minutes} min?`;
-      // Initialise at binary-option fair value (same model as updateSimMarketPrices),
-      // not always 0.5 — mirrors how real Polymarket markets open at consensus price.
-      const tempMarket = { question, startDate, endDate };
-      const rawProb    = computeBinaryMid(tempMarket, state.btcPrice);
-      const initYes    = Math.round(clampProb(rawProb) / SIM_PRICE_STEP) * SIM_PRICE_STEP;
+    ...slots.map(({ id, minutes, volume }) => {
+      const windowStart = alignedStartMs;
+      const endMs       = alignedStartMs + minutes * 60000;
+      const startDate   = new Date(windowStart).toISOString();
+      const endDate     = new Date(endMs).toISOString();
+      const question    = `Bitcoin Up or Down - ${dateLabel}, ${fmtET(windowStart)}-${fmtET(endMs)} ET`;
+      // Strike = BTC price at window open — fair value starts at 0.5 (BTC hasn't moved yet).
+      const tempMarket  = { question, startDate, endDate, _strikeSnapshot: btcNow };
+      const rawProb     = computeBinaryMid(tempMarket, btcNow);
+      const initYes     = Math.round(clampProb(rawProb) / SIM_PRICE_STEP) * SIM_PRICE_STEP;
       return {
         id,
         question,
@@ -1336,10 +1347,11 @@ function seedSimMarkets() {
         startDate,
         endDate,
         live: false,
+        _strikeSnapshot: btcNow,
       };
     }),
   ];
-  console.log('[Polymarket] Sim markets seeded (5–30 min ladder)');
+  console.log(`[Polymarket] Sim markets seeded — Up/Down format, ${slots.length} markets, window start ${fmtET(alignedStartMs)} ET`);
 }
 
 // ── PRICE HELPERS ─────────────────────────────────────────────────────────────
@@ -2447,11 +2459,14 @@ function updateSimMarketPrices() {
   // back to 0.50 and hides the true SIM edge.
   const nowMs = Date.now();
   const activeSims = state.markets.filter(m => !m.live && getMarketMinutesLeft(m, nowMs) > 1);
+  // Reseed when all SIM markets expired, or when BTC has drifted >1.2% from the
+  // strike at which any market was seeded (_strikeSnapshot). "Up or Down" markets
+  // have no fixed $ strike in the question, so use _strikeSnapshot set at seed time.
   const ladderTooFar = activeSims.length > 0 && activeSims.every(m => {
-    const strike = getSimStrike(m);
+    const strike = getSimStrike(m) ?? m._strikeSnapshot;
     return strike && state.btcPrice
       ? Math.abs(strike - state.btcPrice) / state.btcPrice > 0.012
-      : true;
+      : false;  // no strike data — assume still valid
   });
   if (activeSims.length === 0 || ladderTooFar) seedSimMarkets();
   if (state.markets.length === 0) return;
