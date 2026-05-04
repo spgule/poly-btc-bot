@@ -1269,43 +1269,55 @@ function seedSimMarkets() {
   const btc = state.btcPrice || 0;
   const base = Math.round(btc / 10) * 10 || 50000;
   // Ladder of sim markets across all valid trading durations (5–30 min).
+  // Volumes calibrated to real Polymarket BTC binary markets (~$50k–$80k).
   // Strike offset scales with sqrt(minutes) so each market starts near 50% probability.
   const strikes = [
     // 5-minute markets — tightest strikes, highest priority
-    { id: 'sim-1',  strike: base - 20,  minutes: 5,  volume: 185000 },
-    { id: 'sim-2',  strike: base,        minutes: 5,  volume: 235000 },
-    { id: 'sim-3',  strike: base + 20,  minutes: 5,  volume: 310000 },
-    { id: 'sim-4',  strike: base + 40,  minutes: 5,  volume: 420000 },
+    { id: 'sim-1',  strike: base - 20,  minutes: 5,  volume: 75000 },
+    { id: 'sim-2',  strike: base,        minutes: 5,  volume: 80000 },
+    { id: 'sim-3',  strike: base + 20,  minutes: 5,  volume: 65000 },
+    { id: 'sim-4',  strike: base + 40,  minutes: 5,  volume: 55000 },
     // 10-minute markets
-    { id: 'sim-5',  strike: base - 50,  minutes: 10, volume: 150000 },
-    { id: 'sim-6',  strike: base + 50,  minutes: 10, volume: 150000 },
+    { id: 'sim-5',  strike: base - 50,  minutes: 10, volume: 70000 },
+    { id: 'sim-6',  strike: base + 50,  minutes: 10, volume: 65000 },
     // 15-minute markets
-    { id: 'sim-7',  strike: base - 100, minutes: 15, volume: 120000 },
-    { id: 'sim-8',  strike: base + 100, minutes: 15, volume: 120000 },
+    { id: 'sim-7',  strike: base - 100, minutes: 15, volume: 75000 },
+    { id: 'sim-8',  strike: base + 100, minutes: 15, volume: 70000 },
     // 20-minute markets
-    { id: 'sim-9',  strike: base - 150, minutes: 20, volume: 90000 },
-    { id: 'sim-10', strike: base + 150, minutes: 20, volume: 90000 },
+    { id: 'sim-9',  strike: base - 150, minutes: 20, volume: 65000 },
+    { id: 'sim-10', strike: base + 150, minutes: 20, volume: 60000 },
     // 25-minute markets
-    { id: 'sim-11', strike: base - 200, minutes: 25, volume: 75000 },
-    { id: 'sim-12', strike: base + 200, minutes: 25, volume: 75000 },
+    { id: 'sim-11', strike: base - 200, minutes: 25, volume: 57000 },
+    { id: 'sim-12', strike: base + 200, minutes: 25, volume: 55000 },
     // 30-minute markets
-    { id: 'sim-13', strike: base - 250, minutes: 30, volume: 60000 },
-    { id: 'sim-14', strike: base + 250, minutes: 30, volume: 60000 },
+    { id: 'sim-13', strike: base - 250, minutes: 30, volume: 52000 },
+    { id: 'sim-14', strike: base + 250, minutes: 30, volume: 50000 },
   ];
   // Keep real (live) markets intact — only replace/refresh sim markets
   const liveMarkets = state.markets.filter(m => m.live);
+  const nowSeed = Date.now();
   state.markets = [
     ...liveMarkets,
-    ...strikes.map(({ id, strike, minutes, volume }) => ({
-      id,
-      question: `Will BTC be above $${strike.toLocaleString('en-US')} in ${minutes} min?`,
-      outcomes: ['Yes', 'No'],
-      outcomePrices: [0.5, 0.5],
-      volume,
-      startDate: new Date().toISOString(),
-      endDate: new Date(Date.now() + minutes * 60000).toISOString(),
-      live: false,
-    })),
+    ...strikes.map(({ id, strike, minutes, volume }) => {
+      const startDate = new Date(nowSeed).toISOString();
+      const endDate   = new Date(nowSeed + minutes * 60000).toISOString();
+      const question  = `Will BTC be above $${strike.toLocaleString('en-US')} in ${minutes} min?`;
+      // Initialise at binary-option fair value (same model as updateSimMarketPrices),
+      // not always 0.5 — mirrors how real Polymarket markets open at consensus price.
+      const tempMarket = { question, startDate, endDate };
+      const rawProb    = computeBinaryMid(tempMarket, state.btcPrice);
+      const initYes    = Math.round(clampProb(rawProb) / SIM_PRICE_STEP) * SIM_PRICE_STEP;
+      return {
+        id,
+        question,
+        outcomes: ['Yes', 'No'],
+        outcomePrices: [clampProb(initYes), Math.round((1 - clampProb(initYes)) * 1000) / 1000],
+        volume,
+        startDate,
+        endDate,
+        live: false,
+      };
+    }),
   ];
   console.log('[Polymarket] Sim markets seeded (5–30 min ladder)');
 }
@@ -2392,6 +2404,12 @@ function updateSimMarketPrices() {
   });
   if (activeSims.length === 0 || ladderTooFar) seedSimMarkets();
   if (state.markets.length === 0) return;
+
+  // Throttle price-model computation to every 90s — matches Gamma API poll cadence in
+  // LIVE mode so SIM and LIVE have identical price-staleness characteristics.
+  const SIM_PRICE_REFRESH_MS = 90 * 1000;
+  if (nowMs - (updateSimMarketPrices._lastUpdateTs || 0) < SIM_PRICE_REFRESH_MS) return;
+  updateSimMarketPrices._lastUpdateTs = nowMs;
 
   for (const m of state.markets) {
     if (m.live) continue;
