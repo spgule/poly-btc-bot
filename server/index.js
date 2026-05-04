@@ -2370,14 +2370,19 @@ function closePosition(pos, exitOdds, reason) {
   const dayDrawdown = (state.trading.peakBalanceDay - state.trading.balance) / state.trading.peakBalanceDay;
   const monthDrawdown = (state.trading.peakBalanceMonth - state.trading.balance) / state.trading.peakBalanceMonth;
 
-  if (monthDrawdown > 0.15 && state.trading.pausedUntil <= Date.now()) {
-    state.trading.pausedUntil = Date.now() + 30 * 24 * 60 * 60 * 1000;
-    state.trading.pauseReason = '15% Monthly Drawdown';
-    console.log('[Risk] Monthly drawdown limit reached. Paused for 30d.');
-  } else if (dayDrawdown > 0.05 && state.trading.pausedUntil <= Date.now()) {
-    state.trading.pausedUntil = Date.now() + 60 * 60 * 1000;
-    state.trading.pauseReason = '5% Daily Drawdown';
-    console.log('[Risk] Daily drawdown limit reached. Paused for 60m.');
+  if (state.config.mode === 'LIVE') {
+    if (monthDrawdown > 0.15 && state.trading.pausedUntil <= Date.now()) {
+      state.trading.pausedUntil = Date.now() + 30 * 24 * 60 * 60 * 1000;
+      state.trading.pauseReason = '15% Monthly Drawdown';
+      console.log('[Risk] Monthly drawdown limit reached. Paused for 30d.');
+    } else if (dayDrawdown > 0.05 && state.trading.pausedUntil <= Date.now()) {
+      state.trading.pausedUntil = Date.now() + 60 * 60 * 1000;
+      state.trading.pauseReason = '5% Daily Drawdown';
+      console.log('[Risk] Daily drawdown limit reached. Paused for 60m.');
+    }
+  } else if (state.trading.pausedUntil > 0 || state.trading.pauseReason) {
+    state.trading.pausedUntil = 0;
+    state.trading.pauseReason = null;
   }
 
   state.stats.totalTrades++;
@@ -2879,6 +2884,10 @@ server.listen(PORT, async () => {
   }
   // Session restores balance/stats AFTER config applied — saved progress wins over default capital
   loadSavedSession();
+  if (state.config.mode === 'SIM' && (state.trading.pausedUntil > 0 || state.trading.pauseReason)) {
+    state.trading.pausedUntil = 0;
+    state.trading.pauseReason = null;
+  }
 
   // Auto-resume: if autoTrade was enabled when the server last ran, restart trading automatically.
   // This ensures a Railway redeploy / crash-restart resumes without manual intervention.
