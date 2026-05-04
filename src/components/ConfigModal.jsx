@@ -3,6 +3,14 @@ import { X, ShieldAlert, Eye, EyeOff, Settings } from 'lucide-react';
 import { cn } from '../lib/utils';
 import { api } from '../services/api';
 
+function formatMs(ms) {
+  if (!ms) return '0m';
+  const totalMinutes = Math.round(ms / 60000);
+  if (totalMinutes >= 1440) return `${Math.round(totalMinutes / 1440)}d`;
+  if (totalMinutes >= 60) return `${Math.round(totalMinutes / 60)}h`;
+  return `${totalMinutes}m`;
+}
+
 const S = {
   overlay: {
     position: 'fixed', inset: 0, zIndex: 100,
@@ -36,7 +44,7 @@ const S = {
   range: { width: '100%', accentColor: 'var(--blue)', cursor: 'pointer' },
 };
 
-export default function ConfigModal({ onClose, initialConfig }) {
+export default function ConfigModal({ onClose, initialConfig, status }) {
   const [cfg, setCfg] = useState({
     mode:                  initialConfig?.mode || 'SIM',
     capital:               initialConfig?.capital || 1000,
@@ -53,6 +61,14 @@ export default function ConfigModal({ onClose, initialConfig }) {
     requireStableEdge:     initialConfig?.requireStableEdge ?? false,
     allowDuplicateMarkets: initialConfig?.allowDuplicateMarkets ?? true,
     cooldownMs:            initialConfig?.cooldownMs || 2000,
+    liveRiskEnabled:       initialConfig?.liveRiskEnabled ?? true,
+    liveDailyPauseDrawdownPct: initialConfig?.liveDailyPauseDrawdownPct || 5,
+    liveDailyPauseMs:      initialConfig?.liveDailyPauseMs || 3600000,
+    liveMonthlyPauseDrawdownPct: initialConfig?.liveMonthlyPauseDrawdownPct || 15,
+    liveMonthlyPauseMs:    initialConfig?.liveMonthlyPauseMs || 2592000000,
+    livePauseLossStreak:   initialConfig?.livePauseLossStreak ?? 0,
+    livePauseRequireStreak: initialConfig?.livePauseRequireStreak ?? false,
+    liveManualRearm:       initialConfig?.liveManualRearm ?? false,
     privateKey:            '',
   });
   const [showKey, setShowKey] = useState(false);
@@ -60,6 +76,7 @@ export default function ConfigModal({ onClose, initialConfig }) {
   const [error,   setError]   = useState(null);
   const [resetting, setResetting] = useState(false);
   const [resetConfirm, setResetConfirm] = useState(false);
+  const [rearming, setRearming] = useState(false);
 
   const set = (k, v) => setCfg(c => ({ ...c, [k]: v }));
 
@@ -87,6 +104,18 @@ export default function ConfigModal({ onClose, initialConfig }) {
       setError(e.message);
     } finally {
       setSaving(false);
+    }
+  }
+
+  async function handleRearm() {
+    setRearming(true); setError(null);
+    try {
+      await api.riskRearm();
+      onClose();
+    } catch (e) {
+      setError(e.message);
+    } finally {
+      setRearming(false);
     }
   }
 
@@ -144,6 +173,142 @@ export default function ConfigModal({ onClose, initialConfig }) {
           </div>
 
           {/* ── ENTRY SIZE MODE ── */}
+          {cfg.mode === 'LIVE' && (
+            <div style={{ ...S.field, background: 'var(--s2)', border: '1px solid var(--border)', borderRadius: 6, padding: '14px 16px', marginBottom: 18 }}>
+              <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 12, marginBottom: 12 }}>
+                <div>
+                  <span style={{ ...S.label, marginBottom: 2 }}>LIVE Risk Pause</span>
+                  <span style={{ ...S.hint, marginBottom: 0 }}>Configura como o LIVE desacelera ou pausa quando o risco sai do controle.</span>
+                </div>
+                <button
+                  onClick={() => set('liveRiskEnabled', !cfg.liveRiskEnabled)}
+                  style={{
+                    width: 44, height: 24, borderRadius: 12, border: 'none', cursor: 'pointer',
+                    background: cfg.liveRiskEnabled ? 'var(--amber)' : 'var(--s4)',
+                    position: 'relative', transition: 'background .2s', flexShrink: 0,
+                  }}>
+                  <span style={{
+                    position: 'absolute', top: 3, borderRadius: '50%', width: 18, height: 18,
+                    background: 'var(--t1)', transition: 'left .2s',
+                    left: cfg.liveRiskEnabled ? 23 : 3,
+                  }} />
+                </button>
+              </div>
+
+              <div style={{ marginBottom: 14 }}>
+                <label style={S.label}>Daily LIVE drawdown pause: <strong style={{ color: 'var(--amber)' }}>{cfg.liveDailyPauseDrawdownPct}%</strong></label>
+                <span style={S.hint}>Quando o drawdown diario bater esse nivel, o bot pausa novas entradas LIVE pelo tempo configurado.</span>
+                <input style={S.range} type="range" min={1} max={20} step={1}
+                  value={cfg.liveDailyPauseDrawdownPct}
+                  onChange={e => set('liveDailyPauseDrawdownPct', Number(e.target.value))} />
+              </div>
+
+              <div style={{ marginBottom: 14 }}>
+                <label style={S.label}>Daily pause duration: <strong style={{ color: 'var(--t1)' }}>{formatMs(cfg.liveDailyPauseMs)}</strong></label>
+                <div style={{ display: 'flex', gap: 6, flexWrap: 'wrap' }}>
+                  {[[300000, '5m'], [900000, '15m'], [1800000, '30m'], [3600000, '1h'], [14400000, '4h'], [86400000, '24h']].map(([ms, label]) => (
+                    <button key={ms} onClick={() => set('liveDailyPauseMs', ms)}
+                      className={cn('btn btn-sm', cfg.liveDailyPauseMs === ms ? 'btn-green' : 'btn-ghost')}
+                      style={{ fontSize: 11 }}>
+                      {label}
+                    </button>
+                  ))}
+                </div>
+              </div>
+
+              <div style={{ marginBottom: 14 }}>
+                <label style={S.label}>Monthly LIVE drawdown pause: <strong style={{ color: 'var(--red)' }}>{cfg.liveMonthlyPauseDrawdownPct}%</strong></label>
+                <span style={S.hint}>Protecao mais forte para descolar o bot quando o modelo passar por um regime ruim.</span>
+                <input style={S.range} type="range" min={5} max={40} step={1}
+                  value={cfg.liveMonthlyPauseDrawdownPct}
+                  onChange={e => set('liveMonthlyPauseDrawdownPct', Number(e.target.value))} />
+              </div>
+
+              <div style={{ marginBottom: 14 }}>
+                <label style={S.label}>Monthly pause duration: <strong style={{ color: 'var(--t1)' }}>{formatMs(cfg.liveMonthlyPauseMs)}</strong></label>
+                <div style={{ display: 'flex', gap: 6, flexWrap: 'wrap' }}>
+                  {[[3600000, '1h'], [14400000, '4h'], [86400000, '24h'], [604800000, '7d'], [2592000000, '30d']].map(([ms, label]) => (
+                    <button key={ms} onClick={() => set('liveMonthlyPauseMs', ms)}
+                      className={cn('btn btn-sm', cfg.liveMonthlyPauseMs === ms ? 'btn-green' : 'btn-ghost')}
+                      style={{ fontSize: 11 }}>
+                      {label}
+                    </button>
+                  ))}
+                </div>
+              </div>
+
+              <div style={{ marginBottom: 14 }}>
+                <label style={S.label}>Loss streak gate: <strong style={{ color: 'var(--t1)' }}>{cfg.livePauseLossStreak || 0}</strong></label>
+                <span style={S.hint}>Use 0 para ignorar sequencia de perdas. Com valor maior, voce pode pedir drawdown + N losses seguidas.</span>
+                <div style={{ display: 'flex', gap: 6, flexWrap: 'wrap' }}>
+                  {[0, 2, 3, 4, 5, 6].map(n => (
+                    <button key={n} onClick={() => set('livePauseLossStreak', n)}
+                      className={cn('btn btn-sm', cfg.livePauseLossStreak === n ? 'btn-green' : 'btn-ghost')}
+                      style={{ fontSize: 11, minWidth: 38 }}>
+                      {n === 0 ? 'Off' : `${n}L`}
+                    </button>
+                  ))}
+                </div>
+              </div>
+
+              <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 12, marginBottom: 12 }}>
+                <div>
+                  <span style={S.label}>Require drawdown + streak</span>
+                  <span style={{ ...S.hint, marginBottom: 0 }}>ON = so pausa quando o drawdown e a sequencia de perdas acontecerem juntos.</span>
+                </div>
+                <button
+                  onClick={() => set('livePauseRequireStreak', !cfg.livePauseRequireStreak)}
+                  style={{
+                    width: 44, height: 24, border: 'none', borderRadius: 12, cursor: 'pointer',
+                    background: cfg.livePauseRequireStreak ? 'var(--amber)' : 'var(--s4)',
+                    position: 'relative', transition: 'background .2s', flexShrink: 0,
+                  }}>
+                  <span style={{
+                    position: 'absolute', top: 3, borderRadius: '50%', width: 18, height: 18,
+                    background: 'var(--t1)', transition: 'left .2s',
+                    left: cfg.livePauseRequireStreak ? 23 : 3,
+                  }} />
+                </button>
+              </div>
+
+              <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 12, marginBottom: status?.isPaused ? 12 : 0 }}>
+                <div>
+                  <span style={S.label}>Manual rearm after pause</span>
+                  <span style={{ ...S.hint, marginBottom: 0 }}>ON = depois de uma pausa, o LIVE so volta quando voce revisar e rearmar.</span>
+                </div>
+                <button
+                  onClick={() => set('liveManualRearm', !cfg.liveManualRearm)}
+                  style={{
+                    width: 44, height: 24, border: 'none', borderRadius: 12, cursor: 'pointer',
+                    background: cfg.liveManualRearm ? 'var(--amber)' : 'var(--s4)',
+                    position: 'relative', transition: 'background .2s', flexShrink: 0,
+                  }}>
+                  <span style={{
+                    position: 'absolute', top: 3, borderRadius: '50%', width: 18, height: 18,
+                    background: 'var(--t1)', transition: 'left .2s',
+                    left: cfg.liveManualRearm ? 23 : 3,
+                  }} />
+                </button>
+              </div>
+
+              {status?.mode === 'LIVE' && status?.isPaused && (
+                <div style={{ marginTop: 12, background: 'var(--red-bg)', border: '1px solid var(--red-b)', borderRadius: 5, padding: '10px 12px' }}>
+                  <div style={{ fontSize: 10, color: 'var(--red)', marginBottom: 4 }}>
+                    <strong>LIVE currently paused.</strong> {status.pauseReason || 'Risk protection active.'}
+                  </div>
+                  <div style={{ fontSize: 9, color: 'var(--t2)', marginBottom: 10 }}>
+                    {status.manualRearmRequired
+                      ? 'Manual rearm is required before LIVE can trade again.'
+                      : `Remaining pause: ${formatMs(status.pausedRemainingMs || 0)}.`}
+                  </div>
+                  <button className="btn btn-red" onClick={handleRearm} disabled={rearming}>
+                    {rearming ? 'Rearming…' : 'Clear Pause / Rearm LIVE'}
+                  </button>
+                </div>
+              )}
+            </div>
+          )}
+
           <div style={{ ...S.field, background: 'var(--s2)', border: '1px solid var(--border)', borderRadius: 6, padding: '14px 16px', marginBottom: 18 }}>
             <span style={{ ...S.label, marginBottom: 10 }}>Entry Size Mode</span>
 

@@ -55,4 +55,5 @@ export const api = {
   getFees:        ()        => get('/api/fees'),
   getCandles:     ()        => get('/api/candles'),
   simReset:       ()        => post('/api/sim/reset'),
+  riskRearm:      ()        => post('/api/risk/rearm'),
 };

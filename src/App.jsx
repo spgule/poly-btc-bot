@@ -117,6 +117,14 @@ function useBot() {
       takeProfitPct: 14, stopLossPct: 16, posTimeoutMs: 150000,
       maxOpenPos: 10, requireStableEdge: false, allowDuplicateMarkets: true,
       cooldownMs: 2000,
+      liveRiskEnabled: true,
+      liveDailyPauseDrawdownPct: 5,
+      liveDailyPauseMs: 3600000,
+      liveMonthlyPauseDrawdownPct: 15,
+      liveMonthlyPauseMs: 2592000000,
+      livePauseLossStreak: 0,
+      livePauseRequireStreak: false,
+      liveManualRearm: false,
     },
   });
   const [trades, setTrades]       = useState([]);
@@ -1682,7 +1690,7 @@ export default function App() {
         )}
 
         {showConfig && (
-          <ConfigModal key={JSON.stringify(status.config)} initialConfig={status.config} onClose={() => setShowConfig(false)} />
+          <ConfigModal key={JSON.stringify(status.config)} initialConfig={status.config} status={status} onClose={() => setShowConfig(false)} />
         )}
       </div>
     );
@@ -1731,7 +1739,7 @@ export default function App() {
       )}
 
       {showConfig && (
-        <ConfigModal key={JSON.stringify(status.config)} initialConfig={status.config} onClose={() => setShowConfig(false)} />
+        <ConfigModal key={JSON.stringify(status.config)} initialConfig={status.config} status={status} onClose={() => setShowConfig(false)} />
       )}
     </div>
   );

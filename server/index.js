@@ -84,6 +84,9 @@ function saveSession() {
       peakBalance:  state.trading.peakBalance,
       stats:        state.stats,
       active:       state.trading.active,
+      pausedUntil:  state.trading.pausedUntil,
+      pauseReason:  state.trading.pauseReason,
+      manualRearmRequired: state.trading.manualRearmRequired,
     };
     fs.writeFileSync(SESSION_FILE, JSON.stringify(s, null, 2), 'utf8');
   } catch (e) { console.warn('[Session] Failed to save session:', e.message); }
@@ -97,6 +100,9 @@ function loadSavedSession() {
       if (s.startBalance !== undefined) state.trading.startBalance = s.startBalance;
       if (s.peakBalance  !== undefined) state.trading.peakBalance  = s.peakBalance;
       if (s.active       !== undefined) state.trading.active       = s.active;
+      if (s.pausedUntil  !== undefined) state.trading.pausedUntil  = s.pausedUntil;
+      if (s.pauseReason  !== undefined) state.trading.pauseReason  = s.pauseReason;
+      if (s.manualRearmRequired !== undefined) state.trading.manualRearmRequired = Boolean(s.manualRearmRequired);
       // Stats overridden by loadSavedTrades — only apply if no trades file
       if (!fs.existsSync(TRADES_FILE) && s.stats) Object.assign(state.stats, s.stats);
       console.log(`[Session] Restored balance: $${state.trading.balance}`);
@@ -122,11 +128,36 @@ function saveConfig() {
       requireStableEdge:     state.config.requireStableEdge,
       allowDuplicateMarkets: state.config.allowDuplicateMarkets,
       cooldownMs:            Math.max(2000, state.trading.cooldownMs),
+      liveRiskEnabled:       state.config.liveRiskEnabled,
+      liveDailyPauseDrawdownPct: state.config.liveDailyPauseDrawdownPct,
+      liveDailyPauseMs:      state.config.liveDailyPauseMs,
+      liveMonthlyPauseDrawdownPct: state.config.liveMonthlyPauseDrawdownPct,
+      liveMonthlyPauseMs:    state.config.liveMonthlyPauseMs,
+      livePauseLossStreak:   state.config.livePauseLossStreak,
+      livePauseRequireStreak: state.config.livePauseRequireStreak,
+      liveManualRearm:       state.config.liveManualRearm,
     };
     fs.writeFileSync(CONFIG_FILE, JSON.stringify(toSave, null, 2), 'utf8');
   } catch (e) {
     console.warn('[Config] Failed to save config:', e.message);
   }
+}
+
+function clearTradingPause() {
+  state.trading.pausedUntil = 0;
+  state.trading.pauseReason = null;
+  state.trading.manualRearmRequired = false;
+}
+
+function armLiveRiskPause(reason, pauseMs) {
+  const durationMs = Math.max(60000, Number(pauseMs) || 0);
+  state.trading.pausedUntil = Date.now() + durationMs;
+  state.trading.pauseReason = reason;
+  state.trading.manualRearmRequired = Boolean(state.config.liveManualRearm);
+}
+
+function isTradingPaused(now = Date.now()) {
+  return state.trading.manualRearmRequired || state.trading.pausedUntil > now;
 }
 
 function applyConfigPatch(patch = {}) {
@@ -153,6 +184,20 @@ function applyConfigPatch(patch = {}) {
   if (patch.requireStableEdge !== undefined) c.requireStableEdge = Boolean(patch.requireStableEdge);
   if (patch.allowDuplicateMarkets !== undefined) c.allowDuplicateMarkets = Boolean(patch.allowDuplicateMarkets);
   if (patch.cooldownMs !== undefined) state.trading.cooldownMs = Math.min(60000, Math.max(2000, Number(patch.cooldownMs) || state.trading.cooldownMs));
+  if (patch.liveRiskEnabled !== undefined) c.liveRiskEnabled = Boolean(patch.liveRiskEnabled);
+  if (patch.liveDailyPauseDrawdownPct !== undefined) c.liveDailyPauseDrawdownPct = Math.min(50, Math.max(1, Number(patch.liveDailyPauseDrawdownPct) || c.liveDailyPauseDrawdownPct));
+  if (patch.liveDailyPauseMs !== undefined) c.liveDailyPauseMs = Math.min(7 * 24 * 60 * 60 * 1000, Math.max(60000, Number(patch.liveDailyPauseMs) || c.liveDailyPauseMs));
+  if (patch.liveMonthlyPauseDrawdownPct !== undefined) c.liveMonthlyPauseDrawdownPct = Math.min(80, Math.max(1, Number(patch.liveMonthlyPauseDrawdownPct) || c.liveMonthlyPauseDrawdownPct));
+  if (patch.liveMonthlyPauseMs !== undefined) c.liveMonthlyPauseMs = Math.min(90 * 24 * 60 * 60 * 1000, Math.max(60000, Number(patch.liveMonthlyPauseMs) || c.liveMonthlyPauseMs));
+  if (patch.livePauseLossStreak !== undefined) c.livePauseLossStreak = Math.min(10, Math.max(0, Number(patch.livePauseLossStreak) || 0));
+  if (patch.livePauseRequireStreak !== undefined) c.livePauseRequireStreak = Boolean(patch.livePauseRequireStreak);
+  if (patch.liveManualRearm !== undefined) c.liveManualRearm = Boolean(patch.liveManualRearm);
+  if (patch.liveRiskEnabled !== undefined && !c.liveRiskEnabled) clearTradingPause();
+  if (!c.liveManualRearm && state.trading.manualRearmRequired && state.trading.pausedUntil <= Date.now()) {
+    state.trading.manualRearmRequired = false;
+    state.trading.pauseReason = null;
+  }
+  if (c.mode === 'SIM') clearTradingPause();
 }
 
 function buildTradeSignal(market, now = Date.now()) {
@@ -247,6 +292,14 @@ const state = {
     maxOpenPos:    10,
     requireStableEdge: false,
     allowDuplicateMarkets: true,
+    liveRiskEnabled: true,
+    liveDailyPauseDrawdownPct: 5,
+    liveDailyPauseMs: 60 * 60 * 1000,
+    liveMonthlyPauseDrawdownPct: 15,
+    liveMonthlyPauseMs: 30 * 24 * 60 * 60 * 1000,
+    livePauseLossStreak: 0,
+    livePauseRequireStreak: false,
+    liveManualRearm: false,
   },
 
   trading: {
@@ -257,6 +310,7 @@ const state = {
     peakBalanceMonth: 0,
     pausedUntil:   0,
     pauseReason:   null,
+    manualRearmRequired: false,
     active:        false,
     trades:        [],
     lastTradeTs:   0,
@@ -306,6 +360,7 @@ const state = {
     trendBias: 'neutral',
     pausedUntil: 0,
     pauseReason: null,
+    manualRearmRequired: false,
   },
   binanceConnected: false,
   priceSource:      'binance',  // 'binance' | 'binance-rest' | 'unavailable'
@@ -1846,7 +1901,7 @@ function runArbitrageCheck() {
   const now = Date.now();
   const market = getBestMarket();
   // 4-layer loss limit check
-  if (state.trading.pausedUntil > now) {
+  if (isTradingPaused(now)) {
     state.currentSignal = null;
     const context = buildSignalContext(market, now);
     setSignalDiagnostics({
@@ -1863,8 +1918,9 @@ function runArbitrageCheck() {
       trendBias: context?.trendBias ?? 'neutral',
       pausedUntil: state.trading.pausedUntil,
       pauseReason: state.trading.pauseReason,
-      blockReason: 'PAUSED_UNTIL',
-      blockers: ['paused_until'],
+      manualRearmRequired: state.trading.manualRearmRequired,
+      blockReason: state.trading.manualRearmRequired ? 'MANUAL_REARM' : 'PAUSED_UNTIL',
+      blockers: [state.trading.manualRearmRequired ? 'manual_rearm' : 'paused_until'],
     });
     return;
   }
@@ -2004,6 +2060,7 @@ function runArbitrageCheck() {
     vpin: 0,
     pausedUntil: state.trading.pausedUntil,
     pauseReason: state.trading.pauseReason,
+    manualRearmRequired: state.trading.manualRearmRequired,
     polyLiveFresh: isPolyLiveFresh(),
     polyLiveStaleMs: getPolyLiveAgeMs(),
   };
@@ -2371,18 +2428,21 @@ function closePosition(pos, exitOdds, reason) {
   const monthDrawdown = (state.trading.peakBalanceMonth - state.trading.balance) / state.trading.peakBalanceMonth;
 
   if (state.config.mode === 'LIVE') {
-    if (monthDrawdown > 0.15 && state.trading.pausedUntil <= Date.now()) {
-      state.trading.pausedUntil = Date.now() + 30 * 24 * 60 * 60 * 1000;
-      state.trading.pauseReason = '15% Monthly Drawdown';
-      console.log('[Risk] Monthly drawdown limit reached. Paused for 30d.');
-    } else if (dayDrawdown > 0.05 && state.trading.pausedUntil <= Date.now()) {
-      state.trading.pausedUntil = Date.now() + 60 * 60 * 1000;
-      state.trading.pauseReason = '5% Daily Drawdown';
-      console.log('[Risk] Daily drawdown limit reached. Paused for 60m.');
+    if (state.config.liveRiskEnabled && !isTradingPaused()) {
+      const consecutiveLosses = state.stats.streak < 0 ? Math.abs(state.stats.streak) : 0;
+      const requireStreak = state.config.livePauseRequireStreak && state.config.livePauseLossStreak > 0;
+      const streakOk = !requireStreak || consecutiveLosses >= state.config.livePauseLossStreak;
+      const streakSuffix = requireStreak ? ` + ${state.config.livePauseLossStreak} losses streak` : '';
+      if (monthDrawdown > state.config.liveMonthlyPauseDrawdownPct / 100 && streakOk) {
+        armLiveRiskPause(`${state.config.liveMonthlyPauseDrawdownPct}% Monthly Drawdown${streakSuffix}`, state.config.liveMonthlyPauseMs);
+        console.log(`[Risk] Monthly live drawdown limit reached. Paused for ${Math.round(state.config.liveMonthlyPauseMs / 60000)}m.`);
+      } else if (dayDrawdown > state.config.liveDailyPauseDrawdownPct / 100 && streakOk) {
+        armLiveRiskPause(`${state.config.liveDailyPauseDrawdownPct}% Daily Drawdown${streakSuffix}`, state.config.liveDailyPauseMs);
+        console.log(`[Risk] Daily live drawdown limit reached. Paused for ${Math.round(state.config.liveDailyPauseMs / 60000)}m.`);
+      }
     }
-  } else if (state.trading.pausedUntil > 0 || state.trading.pauseReason) {
-    state.trading.pausedUntil = 0;
-    state.trading.pauseReason = null;
+  } else if (state.trading.pausedUntil > 0 || state.trading.pauseReason || state.trading.manualRearmRequired) {
+    clearTradingPause();
   }
 
   state.stats.totalTrades++;
@@ -2590,10 +2650,11 @@ function buildStatusPayload() {
   return {
     mode:          state.config.mode,
     active:        state.trading.active,
-    isPaused:      state.trading.pausedUntil > Date.now(),
+    isPaused:      isTradingPaused(),
     pausedUntil:   state.trading.pausedUntil,
     pausedRemainingMs: Math.max(0, state.trading.pausedUntil - Date.now()),
     pauseReason:   state.trading.pauseReason,
+    manualRearmRequired: state.trading.manualRearmRequired,
     balance:       effectiveBalance,
     cashBalance:   state.trading.balance,
     startBalance:  state.trading.startBalance,
@@ -2622,6 +2683,14 @@ function buildStatusPayload() {
       requireStableEdge:     state.config.requireStableEdge,
       allowDuplicateMarkets: state.config.allowDuplicateMarkets,
       cooldownMs:            state.trading.cooldownMs,
+      liveRiskEnabled:       state.config.liveRiskEnabled,
+      liveDailyPauseDrawdownPct: state.config.liveDailyPauseDrawdownPct,
+      liveDailyPauseMs:      state.config.liveDailyPauseMs,
+      liveMonthlyPauseDrawdownPct: state.config.liveMonthlyPauseDrawdownPct,
+      liveMonthlyPauseMs:    state.config.liveMonthlyPauseMs,
+      livePauseLossStreak:   state.config.livePauseLossStreak,
+      livePauseRequireStreak: state.config.livePauseRequireStreak,
+      liveManualRearm:       state.config.liveManualRearm,
     },
     openPositions: state.positions.filter(p => p.status === 'OPEN').length,
   };
@@ -2722,6 +2791,16 @@ app.post('/api/config', (req, res) => {
   res.json({ success: true, config: buildStatusPayload().config });
 });
 
+app.post('/api/risk/rearm', (_req, res) => {
+  clearTradingPause();
+  saveSession();
+  broadcastStatus();
+  if (state.trading.active && state.config.autoTrade && state.priceHistory.length >= 3) {
+    runArbitrageCheck();
+  }
+  res.json({ success: true, isPaused: isTradingPaused(), pausedUntil: state.trading.pausedUntil, pauseReason: state.trading.pauseReason });
+});
+
 app.get('/api/fees', (_req, res) => {
   res.json({
     source:        'Polymarket CLOB (documented)',
@@ -2811,10 +2890,11 @@ app.get('/api/debug/feed', (_req, res) => {
     signalDiagnostics: state.signalDiagnostics,
     bollinger: computeBollinger(),
     trendIndicators: computeChartTrendIndicators(),
-    isPaused: state.trading.pausedUntil > Date.now(),
+    isPaused: isTradingPaused(),
     pausedUntil: state.trading.pausedUntil,
     pausedRemainingMs: Math.max(0, state.trading.pausedUntil - Date.now()),
     pauseReason: state.trading.pauseReason,
+    manualRearmRequired: state.trading.manualRearmRequired,
     polyLiveMarketId: state.polyLive.marketId,
     polyLiveMarketIds: state.polyLive.marketIds,
     polyLiveAssetIds: state.polyLive.assetIds,
@@ -2884,9 +2964,8 @@ server.listen(PORT, async () => {
   }
   // Session restores balance/stats AFTER config applied — saved progress wins over default capital
   loadSavedSession();
-  if (state.config.mode === 'SIM' && (state.trading.pausedUntil > 0 || state.trading.pauseReason)) {
-    state.trading.pausedUntil = 0;
-    state.trading.pauseReason = null;
+  if (state.config.mode === 'SIM' && (state.trading.pausedUntil > 0 || state.trading.pauseReason || state.trading.manualRearmRequired)) {
+    clearTradingPause();
   }
 
   // Auto-resume: if autoTrade was enabled when the server last ran, restart trading automatically.
