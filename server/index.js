@@ -2412,7 +2412,6 @@ function openPosition(signal) {
 
   // Simulate CLOB fill with spread + price impact + partial fill
   const fill = simulateClobFill(side, betSize, market);
-  pos.orderType = fill.orderType; // record order type on position for exit consistency
 
   if (fill.partialFill) {
     console.log(`[CLOB] Partial fill: $${fill.fillSize} of $${betSize} requested (depth cap)`);
@@ -2451,6 +2450,7 @@ function openPosition(signal) {
     impact:           fill.impact,
     partialFill:      fill.partialFill,
     requestedSize:    betSize,
+    orderType:        fill.orderType,
     status:           'OPEN',
   };
   pos.closeDeadline = getPositionCloseDeadline(pos, market);
