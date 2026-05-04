@@ -778,7 +778,9 @@ function getDesiredPolyLiveMarket() {
   for (const pos of state.positions.filter(p => p.status === 'OPEN')) {
     pushMarket(state.markets.find(m => m.id === pos.marketId));
   }
-  pushMarket(getBestObservationMarket(true));
+  for (const obsMarket of getObservationMarkets(4, true)) {
+    pushMarket(obsMarket);
+  }
   pushMarket(getBestMarket());
 
   if (assetIds.length === 0) return null;
@@ -1259,6 +1261,20 @@ function getMarketDurationMinutes(market) {
   if (Number.isFinite(start) && Number.isFinite(end) && end > start) {
     return (end - start) / 60000;
   }
+  const rangeMatch = market?.question?.match(/(\d{1,2}):(\d{2})(AM|PM)-(\d{1,2}):(\d{2})(AM|PM)/i);
+  if (rangeMatch) {
+    const toMinutes = (hourRaw, minuteRaw, meridiemRaw) => {
+      let hour = Number(hourRaw) % 12;
+      const minute = Number(minuteRaw);
+      const meridiem = String(meridiemRaw).toUpperCase();
+      if (meridiem === 'PM') hour += 12;
+      return hour * 60 + minute;
+    };
+    const startMin = toMinutes(rangeMatch[1], rangeMatch[2], rangeMatch[3]);
+    const endMin = toMinutes(rangeMatch[4], rangeMatch[5], rangeMatch[6]);
+    const duration = endMin >= startMin ? endMin - startMin : (24 * 60 - startMin) + endMin;
+    if (duration > 0) return duration;
+  }
   const simMatch = market?.question?.match(/in\s+(\d+)\s+min/i);
   if (simMatch) return Number(simMatch[1]);
   return NaN;
@@ -1267,6 +1283,12 @@ function getMarketDurationMinutes(market) {
 function isFiveMinuteMarket(market) {
   const duration = getMarketDurationMinutes(market);
   return Number.isFinite(duration) && duration >= 4.5 && duration <= 5.5;
+}
+
+function isShortObservationMarket(market) {
+  const duration = getMarketDurationMinutes(market);
+  if (!Number.isFinite(duration)) return false;
+  return duration >= 4.5 && duration <= 20.5;
 }
 
 function getMarketYesPrice(market) {
@@ -1340,7 +1362,7 @@ function getBestObservationMarket(preferLiveOnly = false) {
   const now = Date.now();
   const scored = state.markets.map(m => {
     if (preferLiveOnly && !m.live) return { m, score: -1 };
-    if (!isFiveMinuteMarket(m)) return { m, score: -1 };
+    if (!isShortObservationMarket(m)) return { m, score: -1 };
     const minLeft = getMarketMinutesLeft(m, now);
     if (minLeft < 1 || minLeft > 1440) return { m, score: -1 };
     if (m.priceIsEstimated) return { m, score: -1 };
@@ -1355,6 +1377,32 @@ function getBestObservationMarket(preferLiveOnly = false) {
   }).filter(x => x.score >= 0).sort((a, b) => b.score - a.score || b.m.volume - a.m.volume);
 
   return scored[0]?.m || null;
+}
+
+function getObservationMarkets(limit = 3, preferLiveOnly = false) {
+  if (state.markets.length === 0) return [];
+  const now = Date.now();
+  return state.markets
+    .map(m => {
+      if (preferLiveOnly && !m.live) return { m, score: -1 };
+      if (!isShortObservationMarket(m)) return { m, score: -1 };
+      const minLeft = getMarketMinutesLeft(m, now);
+      if (minLeft < 1 || minLeft > 1440) return { m, score: -1 };
+      if (m.priceIsEstimated) return { m, score: -1 };
+      const q = (m.question || '').toLowerCase();
+      const isUpOrDown = /up or down/.test(q);
+      const priceDist = getMarketPriceDistance(m);
+      if (priceDist > 0.42) return { m, score: -1 };
+      const duration = getMarketDurationMinutes(m);
+      const durationScore = duration <= 5.5 ? 5 : duration <= 10.5 ? 4 : duration <= 15.5 ? 3 : 2;
+      const volumeScore = m.volume >= 20000 ? 3 : m.volume >= 5000 ? 2 : m.volume > 0 ? 1 : 0;
+      const priceScore = priceDist < 0.10 ? 3 : priceDist < 0.25 ? 2 : 1;
+      return { m, score: durationScore + volumeScore + priceScore + (isUpOrDown ? 3 : 0) };
+    })
+    .filter(x => x.score >= 0)
+    .sort((a, b) => b.score - a.score || b.m.volume - a.m.volume)
+    .slice(0, Math.max(1, limit))
+    .map(x => x.m);
 }
 
 // ── ARBITRAGE ENGINE ──────────────────────────────────────────────────────────
