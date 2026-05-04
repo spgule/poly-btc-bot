@@ -1212,10 +1212,10 @@ function seedSimMarkets() {
   const btc = state.btcPrice || 0;
   const base = Math.round(btc / 10) * 10 || 50000;
   const strikes = [
-    { id: 'sim-1', strike: base,       minutes: 5,  volume: 185000 },
-    { id: 'sim-2', strike: base + 20,  minutes: 10, volume: 235000 },
-    { id: 'sim-3', strike: base - 20,  minutes: 15, volume: 310000 },
-    { id: 'sim-4', strike: base + 40,  minutes: 30, volume: 420000 },
+    { id: 'sim-1', strike: base - 20, minutes: 5, volume: 185000 },
+    { id: 'sim-2', strike: base,      minutes: 5, volume: 235000 },
+    { id: 'sim-3', strike: base + 20, minutes: 5, volume: 310000 },
+    { id: 'sim-4', strike: base + 40, minutes: 5, volume: 420000 },
   ];
   // Keep real (live) markets intact — only replace/refresh sim markets
   const liveMarkets = state.markets.filter(m => m.live);
@@ -1253,6 +1253,22 @@ function getMarketMinutesLeft(market, now = Date.now()) {
   return (new Date(market.endDate).getTime() - now) / 60000;
 }
 
+function getMarketDurationMinutes(market) {
+  const start = market?.startDate ? new Date(market.startDate).getTime() : NaN;
+  const end = market?.endDate ? new Date(market.endDate).getTime() : NaN;
+  if (Number.isFinite(start) && Number.isFinite(end) && end > start) {
+    return (end - start) / 60000;
+  }
+  const simMatch = market?.question?.match(/in\s+(\d+)\s+min/i);
+  if (simMatch) return Number(simMatch[1]);
+  return NaN;
+}
+
+function isFiveMinuteMarket(market) {
+  const duration = getMarketDurationMinutes(market);
+  return Number.isFinite(duration) && duration >= 4.5 && duration <= 5.5;
+}
+
 function getMarketYesPrice(market) {
   return market?.outcomePrices?.[0] ?? 0.5;
 }
@@ -1269,6 +1285,7 @@ function getSimStrike(market) {
 function hasUsableSimMarket(now = Date.now()) {
   return state.markets.some(m => {
     if (m.live) return false;
+    if (!isFiveMinuteMarket(m)) return false;
     const minutesLeft = getMarketMinutesLeft(m, now);
     const strike = getSimStrike(m);
     const strikeGap = strike && state.btcPrice ? Math.abs(strike - state.btcPrice) / state.btcPrice : 0;
@@ -1284,6 +1301,7 @@ function hasUsableSimMarket(now = Date.now()) {
 function pickBestSimMarket(now = Date.now()) {
   const sims = state.markets.filter(m => {
     if (m.live) return false;
+    if (!isFiveMinuteMarket(m)) return false;
     const minutesLeft = getMarketMinutesLeft(m, now);
     const strike = getSimStrike(m);
     const strikeGap = strike && state.btcPrice ? Math.abs(strike - state.btcPrice) / state.btcPrice : 0;
@@ -1309,6 +1327,7 @@ function pickBestSimMarket(now = Date.now()) {
 function hasTradableLiveMarket(now = Date.now()) {
   return state.markets.some(m => {
     if (!m.live || m.priceIsEstimated) return false;
+    if (!isFiveMinuteMarket(m)) return false;
     const minLeft = getMarketMinutesLeft(m, now);
     if (minLeft < 1 || minLeft > 1440) return false;
     if (Number(m.volume || 0) < 50000) return false;
@@ -1321,6 +1340,7 @@ function getBestObservationMarket(preferLiveOnly = false) {
   const now = Date.now();
   const scored = state.markets.map(m => {
     if (preferLiveOnly && !m.live) return { m, score: -1 };
+    if (!isFiveMinuteMarket(m)) return { m, score: -1 };
     const minLeft = getMarketMinutesLeft(m, now);
     if (minLeft < 1 || minLeft > 1440) return { m, score: -1 };
     if (m.priceIsEstimated) return { m, score: -1 };
@@ -1556,20 +1576,20 @@ function getBestMarket(preferLiveOnly = false) {
   if (state.markets.length === 0) return null;
   const now = Date.now();
   const liveAvailable = hasTradableLiveMarket(now);
-  // "Up or Down" short-term binaries are created ~24h in advance — allow up to 24h window.
-  // Other live markets: up to 24h in LIVE. SIM fallback should stay short-dated and near ATM.
-  const maxMinutes = state.config.mode === 'SIM' ? 1440 : 1440;
+  // Strategy lock: trade only 5-minute BTC markets.
+  const maxMinutes = 5.5;
   const minMinutes = 1;
   const scored = state.markets.map(m => {
     if (preferLiveOnly && !m.live) return { m, score: -1 };
+    if (!isFiveMinuteMarket(m)) return { m, score: -1 };
     const minLeft = getMarketMinutesLeft(m, now);
     if (minLeft < minMinutes || minLeft > maxMinutes) return { m, score: -1 };
     // Block markets with no real price data — would generate false signals against 0.5
     if (m.priceIsEstimated) return { m, score: -1 };
     const isSim = !m.live;
     if (!preferLiveOnly && liveAvailable && isSim) return { m, score: -1 };
-    // Prefer short-term (5–30 min window) for momentum arb.
-    const timeScore = minLeft <= 15 ? 4 : minLeft <= 30 ? 3 : minLeft <= 60 ? 2 : minLeft <= 1440 ? 1 : 0;
+    // All candidates are 5-minute markets by design, so keep the time score flat.
+    const timeScore = 4;
     const volScore  = m.volume >= 100000 ? 2 : m.volume >= 20000 ? 1 : 0;
     // Filter out near-certain markets (YES > 0.92 or YES < 0.08).
     const yesPrice  = getMarketYesPrice(m);
@@ -1578,7 +1598,7 @@ function getBestMarket(preferLiveOnly = false) {
     const q = (m.question || '').toLowerCase();
     const isUpOrDown = /up or down/.test(q);
     if (m.live && Number(m.volume || 0) < 50000) return { m, score: -1 };
-    if (isSim && minLeft > 45) return { m, score: -1 };
+    if (isSim && minLeft > 5.5) return { m, score: -1 };
     const strike = getSimStrike(m);
     const strikeGap = isSim && strike && state.btcPrice
       ? Math.abs(strike - state.btcPrice) / state.btcPrice
