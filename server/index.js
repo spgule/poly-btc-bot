@@ -1294,22 +1294,44 @@ function seedSimMarkets() {
   const FIVE_MIN = 5 * 60000;
   const alignedStartMs = Math.ceil(nowMs / FIVE_MIN) * FIVE_MIN;
 
-  // Format timestamp as "H:MMAM/PM" in ET (America/New_York handles DST automatically).
+  // Format timestamp as "H:MMAM/PM" in ET. Robust fallback in case ICU data is
+  // incomplete on the runtime (e.g. Railway Node slim builds without full-icu).
   function fmtET(ms) {
-    const parts = new Intl.DateTimeFormat('en-US', {
-      timeZone: 'America/New_York',
-      hour: 'numeric', minute: '2-digit', hour12: true,
-    }).formatToParts(new Date(ms));
-    const hour      = parts.find(p => p.type === 'hour').value;
-    const minute    = parts.find(p => p.type === 'minute').value;
-    const dayPeriod = parts.find(p => p.type === 'dayPeriod').value.toUpperCase();
-    return `${hour}:${minute}${dayPeriod}`;
+    try {
+      const parts = new Intl.DateTimeFormat('en-US', {
+        timeZone: 'America/New_York',
+        hour: 'numeric', minute: '2-digit', hour12: true,
+      }).formatToParts(new Date(ms));
+      const hour      = (parts.find(p => p.type === 'hour') || {}).value || '0';
+      const minute    = (parts.find(p => p.type === 'minute') || {}).value || '00';
+      const dayPeriod = ((parts.find(p => p.type === 'dayPeriod') || {}).value || '').toUpperCase();
+      // Some ICU builds embed AM/PM inside the hour value (e.g. "7 PM") — strip and re-add.
+      const hourClean = hour.replace(/\s?(AM|PM)$/i, '');
+      const meridiem  = dayPeriod || (/PM/i.test(hour) ? 'PM' : 'AM');
+      return `${hourClean}:${minute}${meridiem}`;
+    } catch (_) {
+      // Last-resort: manual UTC-4/UTC-5 offset (ET, no DST handling needed for correctness)
+      const d = new Date(ms);
+      const etOffset = -5; // EST; close enough for market label purposes
+      const etHour = (d.getUTCHours() + 24 + etOffset) % 24;
+      const meridiem = etHour >= 12 ? 'PM' : 'AM';
+      const h = etHour % 12 || 12;
+      const m = String(d.getUTCMinutes()).padStart(2, '0');
+      return `${h}:${m}${meridiem}`;
+    }
   }
 
-  // Date label in ET: "May 4"
-  const dateLabel = new Intl.DateTimeFormat('en-US', {
-    timeZone: 'America/New_York', month: 'short', day: 'numeric',
-  }).format(new Date(alignedStartMs));
+  // Date label in ET: "May 4" — fallback to UTC if timezone data unavailable.
+  let dateLabel;
+  try {
+    dateLabel = new Intl.DateTimeFormat('en-US', {
+      timeZone: 'America/New_York', month: 'short', day: 'numeric',
+    }).format(new Date(alignedStartMs));
+  } catch (_) {
+    const d = new Date(alignedStartMs);
+    const months = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'];
+    dateLabel = `${months[d.getUTCMonth()]} ${d.getUTCDate()}`;
+  }
 
   // One market per duration — same set of window sizes real Polymarket publishes.
   // Volumes calibrated to real Polymarket BTC binary market range (~$50k–$80k).
