@@ -56,7 +56,6 @@ export default function ConfigModal({ onClose, initialConfig, status }) {
     autoTrade:             initialConfig?.autoTrade || false,
     takeProfitPct:         initialConfig?.takeProfitPct || 14,
     stopLossPct:           initialConfig?.stopLossPct   || 16,
-    posTimeoutMs:          initialConfig?.posTimeoutMs  || 150000,
     maxOpenPos:            initialConfig?.maxOpenPos     || 10,
     requireStableEdge:     initialConfig?.requireStableEdge ?? false,
     allowDuplicateMarkets: initialConfig?.allowDuplicateMarkets ?? true,
@@ -443,21 +442,6 @@ export default function ConfigModal({ onClose, initialConfig, status }) {
               <span style={{ color: 'var(--t3)', marginLeft: 8 }}>
                 Breakeven winrate: {(cfg.stopLossPct / (cfg.takeProfitPct + cfg.stopLossPct) * 100).toFixed(0)}%
               </span>
-            </div>
-
-            {/* Timeout */}
-            <div style={{ marginBottom: 14 }}>
-              <label style={S.label}>Position Timeout</label>
-              <span style={S.hint}>Minimum hold window. If the market has a scheduled end, the bot now waits until near expiry when that is later than this timeout.</span>
-              <div style={{ display: 'flex', gap: 6, flexWrap: 'wrap' }}>
-                {[[120000,'2m'],[300000,'5m'],[600000,'10m'],[1800000,'30m'],[3600000,'1h'],[14400000,'4h']].map(([ms, label]) => (
-                  <button key={ms} onClick={() => set('posTimeoutMs', ms)}
-                    className={cn('btn btn-sm', cfg.posTimeoutMs === ms ? 'btn-green' : 'btn-ghost')}
-                    style={{ fontSize: 11 }}>
-                    {label}
-                  </button>
-                ))}
-              </div>
             </div>
 
             {/* Max open positions */}

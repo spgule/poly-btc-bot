@@ -123,7 +123,6 @@ function saveConfig() {
       autoTrade:             state.config.autoTrade,
       takeProfitPct:         state.config.takeProfitPct,
       stopLossPct:           state.config.stopLossPct,
-      posTimeoutMs:          state.config.posTimeoutMs,
       maxOpenPos:            state.config.maxOpenPos,
       requireStableEdge:     state.config.requireStableEdge,
       allowDuplicateMarkets: state.config.allowDuplicateMarkets,
@@ -180,7 +179,6 @@ function applyConfigPatch(patch = {}) {
   if (patch.autoTrade !== undefined) c.autoTrade = Boolean(patch.autoTrade);
   if (patch.takeProfitPct !== undefined) c.takeProfitPct = Math.min(100, Math.max(1, Number(patch.takeProfitPct) || c.takeProfitPct));
   if (patch.stopLossPct !== undefined) c.stopLossPct = Math.min(100, Math.max(1, Number(patch.stopLossPct) || c.stopLossPct));
-  if (patch.posTimeoutMs !== undefined) c.posTimeoutMs = Math.min(86400000, Math.max(30000, Number(patch.posTimeoutMs) || c.posTimeoutMs));
   if (patch.maxOpenPos !== undefined) c.maxOpenPos = Math.min(20, Math.max(1, Number(patch.maxOpenPos) || c.maxOpenPos));
   if (patch.requireStableEdge !== undefined) c.requireStableEdge = Boolean(patch.requireStableEdge);
   if (patch.allowDuplicateMarkets !== undefined) c.allowDuplicateMarkets = Boolean(patch.allowDuplicateMarkets);
@@ -292,7 +290,6 @@ const state = {
     privateKey: null,
     takeProfitPct: 14,
     stopLossPct:   16,
-    posTimeoutMs:  150000,
     maxOpenPos:    10,
     requireStableEdge: false,
     allowDuplicateMarkets: true,
@@ -2493,11 +2490,14 @@ function updateSimMarketPrices() {
 }
 
 function getPositionCloseDeadline(pos, market) {
-  const timeoutAt = pos.entryTime + Math.max(30000, Number(state.config.posTimeoutMs) || 0);
+  // Deadline = market expiry (endDate - 5s), with a 30s minimum hold from entry.
+  // posTimeoutMs is no longer user-configurable: all markets (SIM and real) have a
+  // real endDate that defines the trading window, so the timeout is always market-driven.
   const marketCloseAt = market?.endDate ? new Date(market.endDate).getTime() : NaN;
-  if (!Number.isFinite(marketCloseAt) || marketCloseAt <= pos.entryTime) return timeoutAt;
-  const nearExpiryAt = Math.max(pos.entryTime + 30000, marketCloseAt - 5000);
-  return Math.max(timeoutAt, nearExpiryAt);
+  const minHoldAt = pos.entryTime + 30000;
+  if (!Number.isFinite(marketCloseAt) || marketCloseAt <= pos.entryTime) return minHoldAt;
+  const nearExpiryAt = Math.max(minHoldAt, marketCloseAt - 5000);
+  return nearExpiryAt;
 }
 
 // ── POSITION CLOSE ───────────────────────────────────────────────────────────────
@@ -2795,7 +2795,6 @@ function buildStatusPayload() {
       hasPrivateKey:         Boolean(state.config.privateKey),
       takeProfitPct:         state.config.takeProfitPct,
       stopLossPct:           state.config.stopLossPct,
-      posTimeoutMs:          state.config.posTimeoutMs,
       maxOpenPos:            state.config.maxOpenPos,
       requireStableEdge:     state.config.requireStableEdge,
       allowDuplicateMarkets: state.config.allowDuplicateMarkets,
