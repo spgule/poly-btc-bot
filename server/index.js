@@ -215,6 +215,7 @@ const POLY_CLOB_WSS  = 'wss://ws-subscriptions-clob.polymarket.com/ws/market';
 const LAG_MS         = 2700;   // Polymarket average update lag
 const WS_STALE_MS    = 7000;   // If no WS tick in this window, treat feed as stale
 const POLY_WS_STALE_MS = 20000; // If no Polymarket book event arrives in this window, force reconnect
+const SIM_PRICE_STEP = 0.01;   // SIM fallback markets trade in coarse 1¢ ticks, not continuous fair value
 let _idSeq = 0; // Monotonic counter — prevents Date.now() collisions at SIM 10 Hz
 const nextId = (prefix) => `${prefix}-${Date.now()}-${++_idSeq}`;
 const PRICE_HIST_MS  = 300000; // 5 minutes of price history for charts
@@ -1482,11 +1483,23 @@ function getTrendIndicatorBias(side, indicators) {
   return 'neutral';
 }
 
+function getMarketMinEdge(market, volScale = 1) {
+  const base = Math.max(0.0015, Number(state.config.minEdge) || 0.02);
+  if (!market?.live && state.config.mode === 'SIM') {
+    // SIM fallback prices are refreshed every 2s in discrete ticks, so a live-grade
+    // 2¢ threshold suppresses almost every opportunity. Keep SIM strict, but scaled
+    // to the coarser/staler simulated tape.
+    const simBase = Math.min(base, 0.004);
+    return Math.max(0.003, simBase * Math.min(1.10, volScale));
+  }
+  return base * volScale;
+}
+
 function buildSignalContext(market, now = Date.now()) {
   if (!market) return null;
   const { implied, poly, edge } = computeEdge(market);
   const volScale = Math.max(1.0, Math.min(1.5, recentVolatility(20000) / 0.0015));
-  const dynMinEdge = state.config.minEdge * volScale;
+  const dynMinEdge = getMarketMinEdge(market, volScale);
   const side = edge > 0 ? 'BUY_YES' : 'BUY_NO';
   const bollinger = computeBollinger();
   const bollingerBias = getBollingerBias(side, bollinger);
@@ -2230,8 +2243,13 @@ function updateSimMarketPrices() {
   for (const m of state.markets) {
     if (m.live) continue;
     if (!m.outcomePrices) m.outcomePrices = [0.5, 0.5];
-    const rawProb = computeBinaryMid(m, state.btcPrice);
-    const newYes = clampProb(rawProb);
+    // SIM tape should behave like a venue that refreshes discretely, not like the
+    // fair-value model itself. Use a short stale BTC snapshot and 1¢ ticks so the
+    // edge engine sees realistic mispricings during fast moves.
+    const simBtcRef = getPriceAt(LAG_MS) || state.btcPrice;
+    const rawProb = computeBinaryMid(m, simBtcRef);
+    const steppedYes = Math.round(clampProb(rawProb) / SIM_PRICE_STEP) * SIM_PRICE_STEP;
+    const newYes = clampProb(steppedYes);
     m.outcomePrices[0] = Math.round(newYes * 1000) / 1000;
     m.outcomePrices[1] = Math.round((1 - m.outcomePrices[0]) * 1000) / 1000;
   }
@@ -2571,8 +2589,9 @@ app.get('/health', (_req, res) => res.json({ status: 'ok', ts: Date.now() }));
 app.post('/api/bot/start', (req, res) => {
   if (state.trading.active) return res.json({ success: true, active: true }); // idempotent
   state.trading.active      = true;
+  state.config.autoTrade    = true;
   state.trading.lastTradeTs = 0;    // reset cooldown — first trade can fire immediately
-  // NOTE: do NOT override autoTrade here — respect user config from settings
+  saveConfig();
   saveSession();
   broadcastStatus();
   // Run an immediate check so UI sees signal right away
@@ -2583,7 +2602,9 @@ app.post('/api/bot/start', (req, res) => {
 app.post('/api/bot/stop', (req, res) => {
   if (!state.trading.active) return res.json({ success: true, active: false }); // idempotent
   state.trading.active  = false;
+  state.config.autoTrade = false;
   state.currentSignal   = null;
+  saveConfig();
   saveSession();
   broadcastStatus();
   broadcastSignal();
@@ -2606,6 +2627,19 @@ app.post('/api/config', (req, res) => {
       state.config.privateKey = '0x' + clean;
     } else {
       return res.status(400).json({ error: 'Invalid private key' });
+    }
+  }
+
+  if (req.body.autoTrade !== undefined) {
+    const wantsAutoTrade = Boolean(req.body.autoTrade);
+    state.config.autoTrade = wantsAutoTrade;
+    state.trading.active = wantsAutoTrade;
+    if (wantsAutoTrade) {
+      state.trading.lastTradeTs = 0;
+      if (state.priceHistory.length >= 3) runArbitrageCheck();
+    } else {
+      state.currentSignal = null;
+      broadcastSignal();
     }
   }
 
