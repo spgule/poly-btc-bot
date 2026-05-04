@@ -156,13 +156,11 @@ function applyConfigPatch(patch = {}) {
 }
 
 function buildTradeSignal(market, now = Date.now()) {
-  if (!market) return null;
-  const { implied, poly, edge } = computeEdge(market);
-  const volScale   = Math.max(1.0, Math.min(1.5, recentVolatility(20000) / 0.0015));
-  const dynMinEdge = state.config.minEdge * volScale;
+  const context = buildSignalContext(market, now);
+  if (!context) return null;
+  const { implied, poly, edge, dynMinEdge, side, bollinger, bollingerBias, trendIndicators, trendBias } = context;
   if (Math.abs(edge) < dynMinEdge) return null;
 
-  const side       = edge > 0 ? 'BUY_YES' : 'BUY_NO';
   const winProb    = edge > 0 ? implied : (1 - implied);
   const marketYes  = market.outcomePrices?.[0] ?? 0.5;
   const entryPrice = side === 'BUY_YES' ? marketYes : (1 - marketYes);
@@ -171,23 +169,24 @@ function buildTradeSignal(market, now = Date.now()) {
     : kellySize(Math.abs(edge), winProb, entryPrice, state.trading.balance, state.config.maxBetPct);
   const velBonus   = edgeVelocity() > 0.003 ? 10 : 0;
   const qualBonus  = Math.round(edgeQuality(edge) * 20);
-  const bollinger = computeBollinger();
-  const bollingerBias = getBollingerBias(side, bollinger);
   const bollingerBonus = bollingerBias === 'favorable' ? 6 : bollingerBias === 'unfavorable' ? -8 : 0;
-  const confidence = Math.min(99, Math.max(1, 50 + Math.abs(edge) * 250 + velBonus + qualBonus + bollingerBonus));
+  const trendBonus = trendBias === 'favorable' ? 6 : trendBias === 'unfavorable' ? -8 : 0;
+  const confidence = Math.min(99, Math.max(1, 50 + Math.abs(edge) * 250 + velBonus + qualBonus + bollingerBonus + trendBonus));
 
   return {
-    marketId: market.id,
-    question: market.question,
+    marketId: context.marketId,
+    question: context.question,
     side,
     edge: Math.abs(edge),
     impliedProb: implied,
     polyOdds: poly,
     betSize,
     confidence,
-    timestamp: now,
+    timestamp: context.timestamp,
     bollinger,
     bollingerBias,
+    trendIndicators,
+    trendBias,
     _rawEdge: edge,
     _dynMinEdge: dynMinEdge,
   };
@@ -215,6 +214,7 @@ const POLY_GAMMA     = 'https://gamma-api.polymarket.com';
 const POLY_CLOB_WSS  = 'wss://ws-subscriptions-clob.polymarket.com/ws/market';
 const LAG_MS         = 2700;   // Polymarket average update lag
 const WS_STALE_MS    = 7000;   // If no WS tick in this window, treat feed as stale
+const POLY_WS_STALE_MS = 20000; // If no Polymarket book event arrives in this window, force reconnect
 let _idSeq = 0; // Monotonic counter — prevents Date.now() collisions at SIM 10 Hz
 const nextId = (prefix) => `${prefix}-${Date.now()}-${++_idSeq}`;
 const PRICE_HIST_MS  = 300000; // 5 minutes of price history for charts
@@ -301,6 +301,10 @@ const state = {
     isSpike: false,
     bollinger: null,
     bollingerBias: 'neutral',
+    trendIndicators: null,
+    trendBias: 'neutral',
+    pausedUntil: 0,
+    pauseReason: null,
   },
   binanceConnected: false,
   priceSource:      'binance',  // 'binance' | 'binance-rest' | 'unavailable'
@@ -368,6 +372,26 @@ function setSignalDiagnostics(patch = {}) {
     ...patch,
     ts: patch.ts ?? Date.now(),
   };
+}
+
+function getMarketById(marketId) {
+  if (!marketId) return null;
+  return state.markets.find(m => m.id === marketId) || null;
+}
+
+function getActiveSignalMarket() {
+  return getMarketById(state.currentSignal?.marketId)
+    || getMarketById(state.signalDiagnostics?.marketId)
+    || getBestMarket();
+}
+
+function getPolyLiveAgeMs(now = Date.now()) {
+  if (!state.polyLive.lastEventTs) return Infinity;
+  return Math.max(0, now - state.polyLive.lastEventTs);
+}
+
+function isPolyLiveFresh(now = Date.now()) {
+  return state.polyLive.connected && getPolyLiveAgeMs(now) <= POLY_WS_STALE_MS;
 }
 
 function getPolyAssetBook(assetId) {
@@ -886,6 +910,7 @@ function connectPolyMarketWs() {
 
 function syncPolyMarketSubscription() {
   const desired = getDesiredPolyLiveMarket();
+  const polyAge = getPolyLiveAgeMs();
   if (!desired) {
     state.polyLive.marketId = null;
     state.polyLive.marketIds = [];
@@ -906,6 +931,12 @@ function syncPolyMarketSubscription() {
   }
 
   if (polyMarketWs.readyState !== WebSocket.OPEN) return;
+  if (state.polyLive.lastEventTs > 0 && polyAge > POLY_WS_STALE_MS) {
+    console.warn(`[Polymarket CLOB] Feed stale for ${Math.round(polyAge / 1000)}s — reconnecting`);
+    state.polyLive.connected = false;
+    try { polyMarketWs.close(); } catch (_) {}
+    return;
+  }
   if (sameMarket && sameMarkets && sameAssets) return;
 
   if (state.polyLive.assetIds.length > 0) subscribePolyMarket(state.polyLive.assetIds, 'unsubscribe');
@@ -1379,6 +1410,105 @@ function getBollingerBias(side, bollinger) {
   return 'neutral';
 }
 
+function getChartIndicatorRows(limit = 300) {
+  const candles = state.currentCandle
+    ? [...state.candles.slice(-limit), state.currentCandle]
+    : state.candles.slice(-limit);
+  return candles
+    .filter(Boolean)
+    .map((candle) => {
+      const open = Number(candle.open);
+      const high = Number(candle.high);
+      const low = Number(candle.low);
+      const close = Number(candle.close);
+      const volume = Number(candle.volume);
+      return {
+        open,
+        high,
+        low,
+        close,
+        volume: Number.isFinite(volume) && volume >= 0 ? volume : Math.max(1, Number(candle.ticks) || 1),
+      };
+    })
+    .filter(row => [row.open, row.high, row.low, row.close].every(Number.isFinite));
+}
+
+function computeChartTrendIndicators() {
+  const rows = getChartIndicatorRows();
+  if (rows.length < 21) return null;
+
+  const calcEmaValue = (period) => {
+    const alpha = 2 / (period + 1);
+    let ema = rows[0].close;
+    for (let i = 1; i < rows.length; i++) {
+      ema = ((rows[i].close - ema) * alpha) + ema;
+    }
+    return ema;
+  };
+
+  let cumulativePV = 0;
+  let cumulativeVol = 0;
+  for (const row of rows) {
+    const typical = (row.high + row.low + row.close) / 3;
+    const volume = row.volume > 0 ? row.volume : 1;
+    cumulativePV += typical * volume;
+    cumulativeVol += volume;
+  }
+
+  const lastClose = rows[rows.length - 1].close;
+  return {
+    lastClose,
+    ema9: calcEmaValue(9),
+    ema21: calcEmaValue(21),
+    vwap: cumulativeVol > 0 ? cumulativePV / cumulativeVol : lastClose,
+  };
+}
+
+function getTrendIndicatorBias(side, indicators) {
+  if (!indicators) return 'neutral';
+  let score = 0;
+  const { lastClose, ema9, ema21, vwap } = indicators;
+  if (side === 'BUY_YES') {
+    score += lastClose >= vwap ? 1 : -1;
+    score += ema9 >= ema21 ? 1 : -1;
+    score += lastClose >= ema9 ? 1 : -1;
+  } else {
+    score += lastClose <= vwap ? 1 : -1;
+    score += ema9 <= ema21 ? 1 : -1;
+    score += lastClose <= ema9 ? 1 : -1;
+  }
+  if (score >= 2) return 'favorable';
+  if (score <= -2) return 'unfavorable';
+  return 'neutral';
+}
+
+function buildSignalContext(market, now = Date.now()) {
+  if (!market) return null;
+  const { implied, poly, edge } = computeEdge(market);
+  const volScale = Math.max(1.0, Math.min(1.5, recentVolatility(20000) / 0.0015));
+  const dynMinEdge = state.config.minEdge * volScale;
+  const side = edge > 0 ? 'BUY_YES' : 'BUY_NO';
+  const bollinger = computeBollinger();
+  const bollingerBias = getBollingerBias(side, bollinger);
+  const trendIndicators = computeChartTrendIndicators();
+  const trendBias = getTrendIndicatorBias(side, trendIndicators);
+  return {
+    marketId: market.id,
+    question: market.question,
+    implied,
+    poly,
+    edge,
+    volScale,
+    dynMinEdge,
+    side,
+    bollinger,
+    bollingerBias,
+    trendIndicators,
+    trendBias,
+    timestamp: now,
+  };
+}
+
 // Edge velocity: is the edge currently OPENING (positive) or CLOSING (negative)?
 // Only enter when edge is expanding — avoids chasing edges that already peaked.
 // Uses relative window (last half vs first half of recent history) so it works
@@ -1534,11 +1664,11 @@ function computeEdge(market) {
 // Legacy wrappers used by broadcastMarketData — always consistent because
 // they call computeEdge with the same single getBestMarket() result.
 function computeImpliedProb() {
-  const market = getBestMarket();
+  const market = getActiveSignalMarket();
   return computeEdge(market).implied;
 }
 function computePolyOdds() {
-  const market = getBestMarket();
+  const market = getActiveSignalMarket();
   return computeEdge(market).poly;
 }
 
@@ -1632,10 +1762,29 @@ function isGoodEntry(edge) {
 function hasStableEdge(edge) { return isGoodEntry(edge); }
 
 function runArbitrageCheck() {
+  const now = Date.now();
+  const market = getBestMarket();
   // 4-layer loss limit check
-  if (state.trading.pausedUntil > Date.now()) {
+  if (state.trading.pausedUntil > now) {
     state.currentSignal = null;
-    setSignalDiagnostics({ blockReason: 'PAUSED_UNTIL', blockers: ['paused_until'] });
+    const context = buildSignalContext(market, now);
+    setSignalDiagnostics({
+      marketId: context?.marketId ?? null,
+      question: context?.question ?? null,
+      side: context?.side ?? null,
+      implied: context?.implied ?? null,
+      poly: context?.poly ?? null,
+      edge: context?.edge ?? null,
+      dynMinEdge: context?.dynMinEdge ?? null,
+      bollinger: context?.bollinger ?? null,
+      bollingerBias: context?.bollingerBias ?? 'neutral',
+      trendIndicators: context?.trendIndicators ?? null,
+      trendBias: context?.trendBias ?? 'neutral',
+      pausedUntil: state.trading.pausedUntil,
+      pauseReason: state.trading.pauseReason,
+      blockReason: 'PAUSED_UNTIL',
+      blockers: ['paused_until'],
+    });
     return;
   }
 
@@ -1644,7 +1793,6 @@ function runArbitrageCheck() {
   // inside computeImpliedProb() and computePolyOdds() can return different
   // markets on consecutive calls (scoring is time-dependent), making the edge
   // meaningless (difference between two unrelated markets' model prices).
-  const market = getBestMarket();
   if (!market) {
     state.currentSignal = null;
     setSignalDiagnostics({ blockReason: 'NO_MARKET', blockers: ['no_market'] });
@@ -1654,18 +1802,22 @@ function runArbitrageCheck() {
   const signalCandidate = buildTradeSignal(market);
   if (!signalCandidate) {
     state.currentSignal = null;
-    const { implied, poly, edge } = computeEdge(market);
-    const volScale = Math.max(1.0, Math.min(1.5, recentVolatility(20000) / 0.0015));
-    const dynMinEdgeFail = state.config.minEdge * volScale;
+    const context = buildSignalContext(market, now);
     setSignalDiagnostics({
-      marketId: market.id,
-      question: market.question,
-      side: edge > 0 ? 'BUY_YES' : 'BUY_NO',
-      implied,
-      poly,
-      edge,
-      dynMinEdge: dynMinEdgeFail,
-      edgeOk: Math.abs(edge) >= dynMinEdgeFail,
+      marketId: context?.marketId ?? market.id,
+      question: context?.question ?? market.question,
+      side: context?.side ?? null,
+      implied: context?.implied ?? null,
+      poly: context?.poly ?? null,
+      edge: context?.edge ?? null,
+      dynMinEdge: context?.dynMinEdge ?? null,
+      edgeOk: Math.abs(context?.edge ?? 0) >= (context?.dynMinEdge ?? Infinity),
+      bollinger: context?.bollinger ?? null,
+      bollingerBias: context?.bollingerBias ?? 'neutral',
+      trendIndicators: context?.trendIndicators ?? null,
+      trendBias: context?.trendBias ?? 'neutral',
+      pausedUntil: state.trading.pausedUntil,
+      pauseReason: state.trading.pauseReason,
       blockReason: 'MIN_EDGE',
       blockers: ['min_edge'],
     });
@@ -1675,18 +1827,18 @@ function runArbitrageCheck() {
   const implied = signalCandidate.impliedProb;
   const poly = signalCandidate.polyOdds;
   const edge = signalCandidate._rawEdge;
-  const now = signalCandidate.timestamp;
+  const signalTs = signalCandidate.timestamp;
   const dynMinEdge = signalCandidate._dynMinEdge;
 
   // Debug log every 10s
-  if (now - (runArbitrageCheck._lastLog || 0) > 10000) {
-    runArbitrageCheck._lastLog = now;
+  if (signalTs - (runArbitrageCheck._lastLog || 0) > 10000) {
+    runArbitrageCheck._lastLog = signalTs;
     console.log(`[ARB] implied=${implied.toFixed(4)} poly=${poly.toFixed(4)} edge=${(edge*100).toFixed(2)}¢ minEdge=${(dynMinEdge*100).toFixed(2)}¢ mkt="${market.question?.slice(0,28)}" active=${state.trading.active} autoTrade=${state.config.autoTrade}`);
   }
 
   // Always record edge history so the Binance-vs-Poly chart is always populated.
   // The stability window (hasStableEdge) filters by minEdge separately below.
-  state.edgeHistory.push({ time: now, edge, implied, poly });
+  state.edgeHistory.push({ time: signalTs, edge, implied, poly });
   if (state.edgeHistory.length > 80) state.edgeHistory.shift();
 
   state.currentSignal = {
@@ -1700,6 +1852,8 @@ function runArbitrageCheck() {
     confidence:  signalCandidate.confidence,
     bollinger:   signalCandidate.bollinger,
     bollingerBias: signalCandidate.bollingerBias,
+    trendIndicators: signalCandidate.trendIndicators,
+    trendBias: signalCandidate.trendBias,
     timestamp:   signalCandidate.timestamp,
   };
   const side = signalCandidate.side;
@@ -1746,6 +1900,8 @@ function runArbitrageCheck() {
         confidence: altSignal.confidence,
         bollinger: altSignal.bollinger,
         bollingerBias: altSignal.bollingerBias,
+        trendIndicators: altSignal.trendIndicators,
+        trendBias: altSignal.trendBias,
         timestamp: altSignal.timestamp,
       };
     }
@@ -1761,10 +1917,27 @@ function runArbitrageCheck() {
   const exposureOk = totalExposure + state.currentSignal.betSize <= effectiveBal * 0.40;
   // Keep enough cash to cover the bet
   const safeBalance = state.trading.balance >= state.currentSignal.betSize;
-  const diagnostics = { blockers: [], blockReason: null, vpin: 0 };
+  const diagnostics = {
+    blockers: [],
+    blockReason: null,
+    vpin: 0,
+    pausedUntil: state.trading.pausedUntil,
+    pauseReason: state.trading.pauseReason,
+    polyLiveFresh: isPolyLiveFresh(),
+    polyLiveStaleMs: getPolyLiveAgeMs(),
+  };
 
   // ── ENTRY QUALITY GUARDS (applied before auto-trade and signal display) ───────
   // Based on research: homerun, aulekator, gamma-trade-lab, MrFadiAi
+
+  const tradeMarketObserved = tradeMarket.live && state.polyLive.marketIds.includes(tradeMarket.id);
+  if (tradeMarketObserved && !isPolyLiveFresh()) {
+    state.currentSignal = null;
+    diagnostics.blockers.push('poly_live_stale');
+    diagnostics.blockReason = 'POLY_LIVE_STALE';
+    setSignalDiagnostics(diagnostics);
+    return broadcastSignal();
+  }
 
   // 1. SETTLEMENT TIMING GUARD
   // In the final 3 minutes of a short-term binary (≤30 min), 60-90% of informed
@@ -1827,6 +2000,10 @@ function runArbitrageCheck() {
     isSpike,
     bollinger: signalCandidate.bollinger,
     bollingerBias: signalCandidate.bollingerBias,
+    trendIndicators: state.currentSignal.trendIndicators,
+    trendBias: state.currentSignal.trendBias,
+    pausedUntil: state.trading.pausedUntil,
+    pauseReason: state.trading.pauseReason,
   });
   if (!canTrade) diagnostics.blockers.push('max_open_positions');
   if (!stableOk) diagnostics.blockers.push('stable_edge');
@@ -2277,7 +2454,7 @@ function _legacySimTrade_unused(signal) {
 
 // ── BROADCASTS ────────────────────────────────────────────────────────────────
 function broadcastMarketData() {
-  const mkt            = getBestMarket();
+  const mkt            = getActiveSignalMarket();
   const { implied, poly, edge } = computeEdge(mkt);
   // Send only live tick + current candle. Full candle history (300 candles ~39KB)
   // is fetched by the 3s HTTP pollCandles — do NOT resend every 150ms WS tick.
@@ -2294,6 +2471,7 @@ function broadcastMarketData() {
       priceChart:   state.priceChart.slice(-100),
       currentCandle:state.currentCandle,
       bollinger:    computeBollinger(),
+      trendIndicators: computeChartTrendIndicators(),
       priceSource:  state.priceSource,
       timestamp:    Date.now(),
     },
@@ -2321,6 +2499,10 @@ function buildStatusPayload() {
   return {
     mode:          state.config.mode,
     active:        state.trading.active,
+    isPaused:      state.trading.pausedUntil > Date.now(),
+    pausedUntil:   state.trading.pausedUntil,
+    pausedRemainingMs: Math.max(0, state.trading.pausedUntil - Date.now()),
+    pauseReason:   state.trading.pauseReason,
     balance:       effectiveBalance,
     cashBalance:   state.trading.balance,
     startBalance:  state.trading.startBalance,
@@ -2486,7 +2668,8 @@ app.get('/api/prices',  (req, res) => res.json({
   source:  state.priceSource,
 }));
 app.get('/api/candles', (req, res) => {
-  const { implied, poly, edge } = computeEdge(getBestMarket());
+  const market = getActiveSignalMarket();
+  const { implied, poly, edge } = computeEdge(market);
   res.json({
     candles:       state.candles.slice(-300),
     currentCandle: state.currentCandle,
@@ -2495,10 +2678,15 @@ app.get('/api/candles', (req, res) => {
     polyOdds:      poly,
     edge,
     bollinger:     computeBollinger(),
+    trendIndicators: computeChartTrendIndicators(),
+    marketId: market?.id || null,
+    marketQuestion: market?.question || null,
   });
 });
 
 app.get('/api/debug/feed', (_req, res) => {
+  const market = getActiveSignalMarket();
+  const polyLiveAgeMs = getPolyLiveAgeMs();
   res.json({
     btcPrice: state.btcPrice,
     btcChange24h: state.btcChange24h,
@@ -2511,13 +2699,22 @@ app.get('/api/debug/feed', (_req, res) => {
     markets: state.markets.length,
     liveMarkets: state.markets.filter(m => m.live).length,
     simMarkets: state.markets.filter(m => !m.live).length,
-    bestMarket: getBestMarket()?.question || null,
+    bestMarket: market?.question || null,
+    bestMarketId: market?.id || null,
     signalDiagnostics: state.signalDiagnostics,
     bollinger: computeBollinger(),
+    trendIndicators: computeChartTrendIndicators(),
+    isPaused: state.trading.pausedUntil > Date.now(),
+    pausedUntil: state.trading.pausedUntil,
+    pausedRemainingMs: Math.max(0, state.trading.pausedUntil - Date.now()),
+    pauseReason: state.trading.pauseReason,
     polyLiveMarketId: state.polyLive.marketId,
     polyLiveMarketIds: state.polyLive.marketIds,
     polyLiveAssetIds: state.polyLive.assetIds,
-    polyLiveConnected: state.polyLive.connected,
+    polyLiveConnected: isPolyLiveFresh(),
+    polyLiveSocketConnected: state.polyLive.connected,
+    polyLiveFresh: isPolyLiveFresh(),
+    polyLiveStaleMs: Number.isFinite(polyLiveAgeMs) ? polyLiveAgeMs : null,
     polyLiveLastEventTs: state.polyLive.lastEventTs,
     lastPricePoint: state.priceHistory[state.priceHistory.length - 1] || null,
     serverTime: Date.now(),
@@ -2546,7 +2743,8 @@ wss.on('connection', (ws) => {
   ws.isAlive = true;
   ws.on('pong', () => { ws.isAlive = true; });
   // Burst initial state — use single getBestMarket() call so implied/poly/edge are consistent
-  const { implied: initImp, poly: initPly, edge: initEdg } = computeEdge(getBestMarket());
+  const initMarket = getActiveSignalMarket();
+  const { implied: initImp, poly: initPly, edge: initEdg } = computeEdge(initMarket);
   ws.send(JSON.stringify({ type: 'STATUS',  data: buildStatusPayload() }));
   ws.send(JSON.stringify({ type: 'MARKETS', data: state.markets }));
   ws.send(JSON.stringify({ type: 'TRADES_HISTORY', data: state.trading.trades.slice(0, 200) }));
@@ -2559,6 +2757,7 @@ wss.on('connection', (ws) => {
     priceChart: state.priceChart.slice(-100),
     candles: state.candles.slice(-300),
     currentCandle: state.currentCandle,
+    trendIndicators: computeChartTrendIndicators(),
     priceSource: state.priceSource, timestamp: Date.now(),
   }}));
   ws.on('close', () => console.log('[WS] Client disconnected'));
