@@ -136,6 +136,7 @@ function saveConfig() {
       livePauseLossStreak:   state.config.livePauseLossStreak,
       livePauseRequireStreak: state.config.livePauseRequireStreak,
       liveManualRearm:       state.config.liveManualRearm,
+      orderType:             state.config.orderType,
     };
     fs.writeFileSync(CONFIG_FILE, JSON.stringify(toSave, null, 2), 'utf8');
   } catch (e) {
@@ -192,6 +193,7 @@ function applyConfigPatch(patch = {}) {
   if (patch.livePauseLossStreak !== undefined) c.livePauseLossStreak = Math.min(10, Math.max(0, Number(patch.livePauseLossStreak) || 0));
   if (patch.livePauseRequireStreak !== undefined) c.livePauseRequireStreak = Boolean(patch.livePauseRequireStreak);
   if (patch.liveManualRearm !== undefined) c.liveManualRearm = Boolean(patch.liveManualRearm);
+  if (patch.orderType !== undefined) c.orderType = ['TAKER', 'MAKER'].includes(patch.orderType) ? patch.orderType : c.orderType;
   if (patch.liveRiskEnabled !== undefined && !c.liveRiskEnabled) clearTradingPause();
   if (!c.liveManualRearm && state.trading.manualRearmRequired && state.trading.pausedUntil <= Date.now()) {
     state.trading.manualRearmRequired = false;
@@ -269,7 +271,9 @@ const CANDLE_SEC     = 5;      // 5-second OHLCV candles for TradingView-style c
 
 // ── STATE ─────────────────────────────────────────────────────────────────────
 const state = {
-  btcPrice:      0,
+  btcPrice:          0,
+  btcPriceCoalesced: 0,   // 100ms VWAP — used for edge computation to smooth tick noise
+  _coalesceWin:      { sumPQ: 0, sumQ: 0, start: 0 }, // accumulator for 100ms window
   btcChange24h:  0,       // % change last 24h
   priceHistory:  [],      // { price, time } – last PRICE_HIST_MS ms
   priceChart:    [],      // sampled 1/sec, last 300 pts – sent to chart
@@ -300,6 +304,7 @@ const state = {
     livePauseLossStreak: 0,
     livePauseRequireStreak: false,
     liveManualRearm: false,
+    orderType: 'TAKER',   // 'TAKER' (market order, pays spread) | 'MAKER' (GTC limit, fills at mid, 0% spread)
   },
 
   trading: {
@@ -767,6 +772,21 @@ function connectBinance() {
       state.priceHistory = state.priceHistory.filter(p => now - p.time <= PRICE_HIST_MS);
       addChartPoint(price, now);
       updateCandle(price, now, qty);
+      // 100ms VWAP coalescing — accumulate tick volume into 100ms windows.
+      // computeEdge() reads btcPriceCoalesced (VWAP) instead of raw last tick,
+      // preventing single-tick spikes from triggering false signals.
+      const w = state._coalesceWin;
+      const tickW = Math.max(qty, 0.0001); // weight by trade size, floor to avoid div-by-zero
+      if (now - w.start > 100) {
+        // Commit completed window → coalesced price
+        if (w.sumQ > 0) state.btcPriceCoalesced = Math.round((w.sumPQ / w.sumQ) * 100) / 100;
+        w.sumPQ = price * tickW;
+        w.sumQ  = tickW;
+        w.start = now;
+      } else {
+        w.sumPQ += price * tickW;
+        w.sumQ  += tickW;
+      }
       if (state.trading.active && now - lastArbCheckTs >= 100) {
         lastArbCheckTs = now;
         runArbitrageCheck();
@@ -1829,8 +1849,11 @@ function computeBinaryMid(market, btcOverride) {
 // implied < poly → market overprices  YES → BUY_NO
 function computeEdge(market) {
   if (!market) return { implied: 0.5, poly: 0.5, edge: 0 };
-  const implied = computeBinaryMid(market);          // our model: fair value at BTC_now
-  const poly    = market.outcomePrices?.[0] ?? 0.5; // real market price (Gamma API or sim)
+  // Use 100ms VWAP for edge signal — smooths single-tick outliers without losing latency.
+  // Falls back to raw btcPrice if VWAP not yet established (first 100ms of run).
+  const btcForEdge = (state.btcPriceCoalesced > 0 ? state.btcPriceCoalesced : state.btcPrice);
+  const implied = computeBinaryMid(market, btcForEdge); // fair value from VWAP-smoothed BTC
+  const poly    = market.outcomePrices?.[0] ?? 0.5;     // real market price (Gamma API or sim)
   return { implied, poly, edge: implied - poly };
 }
 
@@ -2260,13 +2283,33 @@ function maxOrderSize(marketVolume) {
   return Math.min(2000, Math.max(10, marketVolume * 0.01));
 }
 
-// Simulate CLOB fill: returns { fillOdds, fillSize, partialFill }
-// fillSize may be < requested if order exceeds available depth
+// Simulate CLOB fill: returns { fillOdds, fillSize, partialFill, spread, impact, orderType }
+// fillSize may be < requested if order exceeds available depth.
+// orderType='TAKER' (default): market order, pays bid-ask spread + price impact.
+// orderType='MAKER': GTC limit posted at mid, 0 spread, 0 impact, 0% fee — but capped at
+//   50% of taker depth (liquidity uncertainty of passive posting).
 function simulateClobFill(side, requestedSize, market) {
   const vol      = Number(market.volume || 0);
   const yesPrice = market.outcomePrices?.[0] ?? 0.50;
   const midOdds  = side === 'BUY_YES' ? yesPrice : (1 - yesPrice);
+  const orderType = state.config.orderType || 'TAKER';
 
+  if (orderType === 'MAKER') {
+    // GTC limit order posted at mid — fills at mid price (no spread, no impact).
+    // Passive fill depth is ~50% of taker depth (conservative: not all resting orders fill).
+    const makerDepth = maxOrderSize(vol) * 0.5;
+    const fillSize   = Math.min(requestedSize, makerDepth);
+    return {
+      fillOdds:    Math.round(midOdds * 10000) / 10000,
+      fillSize:    Math.round(fillSize * 100) / 100,
+      partialFill: fillSize < requestedSize,
+      spread:      0,
+      impact:      0,
+      orderType,
+    };
+  }
+
+  // TAKER: market order — pays bid-ask spread + price impact
   // 1. Half-spread: you always pay the ask (buy) or get the bid (sell)
   const spread  = clobSpread(vol);
   const askOdds = Math.min(0.97, midOdds + spread);  // you buy at ask
@@ -2286,6 +2329,7 @@ function simulateClobFill(side, requestedSize, market) {
     partialFill,
     spread,
     impact,
+    orderType,
   };
 }
 
@@ -2331,6 +2375,7 @@ function openPosition(signal) {
 
   // Simulate CLOB fill with spread + price impact + partial fill
   const fill = simulateClobFill(side, betSize, market);
+  pos.orderType = fill.orderType; // record order type on position for exit consistency
 
   if (fill.partialFill) {
     console.log(`[CLOB] Partial fill: $${fill.fillSize} of $${betSize} requested (depth cap)`);
@@ -2443,10 +2488,12 @@ function closePosition(pos, exitOdds, reason) {
   pos.closeTime   = Date.now();
   pos.holdMs      = pos.closeTime - pos.entryTime;
 
-  // Apply CLOB exit spread (selling at BID = mid − half-spread) — identical in SIM and LIVE.
+  // Apply CLOB exit spread (selling at BID = mid − half-spread).
+  // MAKER mode: posted at mid → 0 spread on exit (fills at mid on the way out too).
   // clobSpread() returns the half-spread (distance from mid to ask/bid).
   const market = state.markets.find(m => m.id === pos.marketId);
-  const exitSpread    = reason === 'MERGE' ? 0 : clobSpread(Number(market?.volume || 0));
+  const isMaker = (pos.orderType === 'MAKER') || (state.config.orderType === 'MAKER');
+  const exitSpread    = (reason === 'MERGE' || isMaker) ? 0 : clobSpread(Number(market?.volume || 0));
   const effectiveExit = Math.max(0.01, exitOdds - exitSpread);
 
   // P&L = (effectiveExit − entryOdds) × shares
@@ -2540,7 +2587,10 @@ function closePosition(pos, exitOdds, reason) {
 }
 
 function getNetExitOdds(market, rawMarkOdds) {
-  return Math.max(0.01, rawMarkOdds - clobSpread(Number(market?.volume || 0)));
+  // MAKER mode exits at mid (no spread cost). TAKER mode pays half-spread on exit.
+  const isMaker = state.config.orderType === 'MAKER';
+  const exitHalfSpread = isMaker ? 0 : clobSpread(Number(market?.volume || 0));
+  return Math.max(0.01, rawMarkOdds - exitHalfSpread);
 }
 
 function monitorPositions() {
@@ -2737,6 +2787,7 @@ function buildStatusPayload() {
       livePauseLossStreak:   state.config.livePauseLossStreak,
       livePauseRequireStreak: state.config.livePauseRequireStreak,
       liveManualRearm:       state.config.liveManualRearm,
+      orderType:             state.config.orderType,
     },
     openPositions: state.positions.filter(p => p.status === 'OPEN').length,
   };
