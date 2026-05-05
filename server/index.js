@@ -214,14 +214,38 @@ function buildTradeSignal(market, now = Date.now()) {
   const winProb    = edge > 0 ? implied : (1 - implied);
   const marketYes  = market.outcomePrices?.[0] ?? 0.5;
   const entryPrice = side === 'BUY_YES' ? marketYes : (1 - marketYes);
-  const betSize = state.config.entryMode === 'fixed'
+  // ── Kelly sizing base ────────────────────────────────────────────────────────
+  const rawBetSize = state.config.entryMode === 'fixed'
     ? Math.min(state.config.fixedAmount, state.trading.balance)
     : kellySize(cappedEdge, winProb, entryPrice, state.trading.balance, state.config.maxBetPct);
-  const velBonus   = edgeVelocity() > 0.003 ? 10 : 0;
-  const qualBonus  = Math.round(edgeQuality(cappedEdge) * 20);
+
+  // ── Time-decay sizing (Gabagool / polybot pattern) ────────────────────────────
+  // Reduz tamanho nos primeiros 90s de vida do mercado (liquidez tende a ser menor
+  // logo após abertura) e nos primeiros 60s após qualquer re-seed de mercado SIM.
+  // Aplica igual em SIM e LIVE pois ambos têm startDate ou _seedTs.
+  const marketOpenTs = market.startDate ? new Date(market.startDate).getTime()
+                     : (market._seedTs || 0);
+  const secsAlive    = marketOpenTs > 0 ? (Date.now() - marketOpenTs) / 1000 : 9999;
+  const timeMult     = secsAlive < 60 ? 0.65 : secsAlive < 120 ? 0.80 : 1.0;
+  const betSize      = Math.round(rawBetSize * timeMult * 100) / 100;
+
+  // ── Confidence score ──────────────────────────────────────────────────────────
+  const velBonus      = edgeVelocity() > 0.003 ? 10 : 0;
+  const qualBonus     = Math.round(edgeQuality(cappedEdge) * 20);
   const bollingerBonus = bollingerBias === 'favorable' ? 6 : bollingerBias === 'unfavorable' ? -8 : 0;
-  const trendBonus = trendBias === 'favorable' ? 6 : trendBias === 'unfavorable' ? -8 : 0;
-  const confidence = Math.min(99, Math.max(1, 50 + cappedEdge * 250 + velBonus + qualBonus + bollingerBonus + trendBonus));
+  const trendBonus    = trendBias === 'favorable' ? 6 : trendBias === 'unfavorable' ? -8 : 0;
+
+  // Flow imbalance bonus: pressão de compra/venda alinhada com direção do trade → +7
+  // contra → -7. Usa Binance aggTrades (isSell flag), populado igual em SIM e LIVE.
+  // Fonte: Polymarket-BTC-15-Minute-Trading-Bot order_book_imbalance_processor.py
+  const imb = flowImbalance();
+  const imbBonus = Math.abs(imb) >= 0.30
+    ? ((side === 'BUY_YES' && imb > 0) || (side === 'BUY_NO' && imb < 0) ? 7 : -7)
+    : 0;
+
+  const confidence = Math.min(99, Math.max(1,
+    50 + cappedEdge * 250 + velBonus + qualBonus + bollingerBonus + trendBonus + imbBonus
+  ));
 
   return {
     marketId: context.marketId,
@@ -232,6 +256,8 @@ function buildTradeSignal(market, now = Date.now()) {
     polyOdds: poly,
     betSize,
     confidence,
+    flowImbalance: Math.round(imb * 1000) / 1000,
+    timeMult,
     timestamp: context.timestamp,
     bollinger,
     bollingerBias,
@@ -334,6 +360,7 @@ const state = {
     todayPnl:    0,
     streak:      0,
     totalFees:   0,
+    todayCost:   0,  // custo acumulado de todas as apostas do dia (reset meia-noite UTC)
   },
 
   markets:          [],
@@ -1429,7 +1456,13 @@ function getMarketDurationMinutes(market) {
 
 function isValidTradingMarket(market) {
   const duration = getMarketDurationMinutes(market);
-  return Number.isFinite(duration) && duration >= 4.5 && duration <= 30.5;
+  if (!Number.isFinite(duration) || duration < 4.5 || duration > 30.5) return false;
+  // Volume 24h filter (fontes: kalshi-deep-trading-bot, poly-market-maker)
+  // Gamma API retorna volume_24hr em mercados reais. SIM markets não têm esse campo
+  // → Number(undefined) = 0 → skip check. Requer pelo menos $500 de volume recente.
+  const vol24h = Number(market.volume_24hr || market.volume24hr || 0);
+  if (vol24h > 0 && vol24h < 500) return false;
+  return true;
 }
 
 function isShortObservationMarket(market) {
@@ -1983,6 +2016,25 @@ function computeVPIN() {
   return totalVol === 0 ? 0 : Math.abs(buyVol - sellVol) / totalVol;
 }
 
+// ── FLOW IMBALANCE (direcional, janela 30s) ──────────────────────────────────
+// Diferente do VPIN (que é imbalance absoluto / toxicidade), este retorna
+// um score -1 a +1: positivo = pressão de compra, negativo = pressão de venda.
+// Usa o mesmo state.volHistory (Binance aggTrades, isSell flag), populado
+// identicamente em SIM e LIVE.
+// Fonte: Polymarket-BTC-15-Minute-Trading-Bot / order_book_imbalance_processor.py
+function flowImbalance() {
+  const now = Date.now();
+  let buyVol = 0, sellVol = 0;
+  for (const v of state.volHistory) {
+    if (now - v.time <= 30000) {  // janela 30s — mais responsiva que VPIN (60s)
+      if (v.isSell) sellVol += v.qty;
+      else          buyVol  += v.qty;
+    }
+  }
+  const total = buyVol + sellVol;
+  return total === 0 ? 0 : (buyVol - sellVol) / total;  // -1 a +1
+}
+
 function isGoodEntry(edge) {
   const vel   = edgeVelocity();
   const qual  = edgeQuality(edge);
@@ -2229,14 +2281,29 @@ function runArbitrageCheck() {
   const btcSpike = btc3sAgo > 0 ? Math.abs(state.btcPrice - btc3sAgo) / btc3sAgo : 0;
   const isSpike = btcSpike > 0.0015;
 
-  // Multi-signal: exigir 2-de-3 sinais concordando
+  // Multi-signal: exigir 2-de-4 sinais concordando
   const btc10sAgo   = getPriceAt(10000);
   const btcTrend10s = btc10sAgo > 0 ? (state.btcPrice - btc10sAgo) / btc10sAgo : 0;
   const trendMatches = side === 'BUY_YES' ? btcTrend10s > 0 : btcTrend10s < 0;
   const velOk = edgeVelocity() > 0.001;
-  const edgeOk = Math.abs(edge) >= dynMinEdge;
 
-  const confirmedSignals = [trendMatches, velOk, edgeOk].filter(Boolean).length;
+  // Confidence-adjusted edge threshold (kalshi-ai-trading-bot pattern):
+  // Alta confiança (≥80%) → exige menos edge (3/4 do mínimo).
+  // Baixa confiança (<60%) → exige mais edge (4/3 do mínimo).
+  // Permite mais trades em sinais fortes sem abrir ruído em sinais fracos.
+  const conf = signalCandidate.confidence;
+  const confAdjMinEdge = conf >= 80 ? dynMinEdge * 0.75
+                       : conf <  60 ? dynMinEdge * 1.33
+                       : dynMinEdge;
+  const edgeOk = Math.abs(edge) >= confAdjMinEdge;
+
+  // Flow imbalance como 4º sinal de confirmação (polymarket-btc-15min pattern).
+  // Pressão de ordem alinhada com a direção do trade = confirmação extra de fluxo real.
+  const imb = flowImbalance();
+  const flowConfirms = Math.abs(imb) >= 0.25 &&
+    ((side === 'BUY_YES' && imb > 0) || (side === 'BUY_NO' && imb < 0));
+
+  const confirmedSignals = [trendMatches, velOk, edgeOk, flowConfirms].filter(Boolean).length;
   Object.assign(diagnostics, {
     marketId: state.currentSignal.marketId,
     question: state.currentSignal.question,
@@ -2381,6 +2448,21 @@ function simulateClobFill(side, requestedSize, market) {
   const fillSize    = Math.min(requestedSize, maxSize);
   const partialFill = fillSize < requestedSize;
 
+  // 4. Partial fill guard (pmxt pattern): se menos de 50% do tamanho solicitado
+  // for preenchido, o spread % efetivo dobra e a edge evapora — melhor não entrar.
+  // Retorna fillSize=0 para sinalizar ao openPosition que deve abortar.
+  if (partialFill && fillSize < requestedSize * 0.50) {
+    console.log(`[CLOB] Skip — partial fill seria ${Math.round(fillSize)}/${Math.round(requestedSize)} (<50%), edge evaporaria`);
+    return {
+      fillOdds:    Math.round(rawFill * 10000) / 10000,
+      fillSize:    0,
+      partialFill: true,
+      spread,
+      impact,
+      orderType,
+    };
+  }
+
   return {
     fillOdds:    Math.round(rawFill * 10000) / 10000,
     fillSize:    Math.round(fillSize * 100) / 100,
@@ -2396,6 +2478,26 @@ function simulateClobFill(side, requestedSize, market) {
 function openPosition(signal) {
   const { side, betSize, edge, marketId, question } = signal;
   if (!betSize || betSize < 1) return;
+
+  // ── Entry dedup lock (polymarket-copy-trading-bot pattern) ─────────────────
+  // Bloqueia double-execution no mesmo mercado/lado em menos de 500ms.
+  // Previne race condition quando runArbitrageCheck dispara em paralelo (400ms timer
+  // + Binance tick handler). Aplica igual em SIM e LIVE.
+  const lockKey = `${marketId}:${side}`;
+  const lastEntry = openPosition._lastEntryTs?.[lockKey] || 0;
+  if (Date.now() - lastEntry < 500) return;
+  if (!openPosition._lastEntryTs) openPosition._lastEntryTs = {};
+  openPosition._lastEntryTs[lockKey] = Date.now();
+
+  // ── Daily spending cap ──────────────────────────────────────────────────────
+  // Limita o custo total apostado por dia (não apenas perdas) a 20% do capital.
+  // Protege contra over-trading em dias de muitos sinais. Aplica em SIM e LIVE.
+  const dailyCapPct = 20;  // 20% do capital por dia
+  const dailyCap    = (state.config.capital || 1000) * dailyCapPct / 100;
+  if ((state.stats.todayCost || 0) + betSize > dailyCap) {
+    console.log(`[CLOB] Skip — daily spend cap atingido: $${(state.stats.todayCost || 0).toFixed(2)} + $${betSize} > $${dailyCap.toFixed(2)}`);
+    return;
+  }
 
   // NEVER open opposite direction on same market — prevents self-canceling trades
   if (state.positions.some(p => p.status === 'OPEN' && p.marketId === marketId && p.side !== side)) return;
@@ -2476,6 +2578,7 @@ function openPosition(signal) {
   pos.closeDeadline = getPositionCloseDeadline(pos, market);
 
   state.trading.balance = Math.round((state.trading.balance - fillSize) * 100) / 100;
+  state.stats.todayCost  = Math.round(((state.stats.todayCost || 0) + fillSize) * 100) / 100;
   state.positions.push(pos);
   // Keep history bounded
   if (state.positions.length > 500) state.positions = state.positions.slice(-500);
@@ -3195,8 +3298,9 @@ server.listen(PORT, async () => {
   // Reset today P&L at midnight UTC
   const msToMidnight = new Date().setUTCHours(24, 0, 0, 0) - Date.now();
   setTimeout(function resetDay() {
-    state.stats.todayPnl = 0;
-    state.trading.peakBalanceDay = state.trading.balance; // Reset daily peak limit
+    state.stats.todayPnl  = 0;
+    state.stats.todayCost = 0;  // Reset daily spending cap
+    state.trading.peakBalanceDay = state.trading.balance; // Reset daily peak reference
     broadcastStatus();
     setTimeout(resetDay, 86400000);
   }, msToMidnight);
