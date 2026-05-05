@@ -395,6 +395,9 @@ const state = {
     pausedUntil: 0,
     pauseReason: null,
     manualRearmRequired: false,
+    trendAgainst: false,
+    flowAgainst: false,
+    vetoCount: 0,
   },
   binanceConnected: false,
   priceSource:      'binance',  // 'binance' | 'binance-rest' | 'unavailable'
@@ -2307,8 +2310,18 @@ function runArbitrageCheck() {
   const flowConfirms = Math.abs(imb) >= 0.15 &&
     ((side === 'BUY_YES' && imb > 0) || (side === 'BUY_NO' && imb < 0));
 
-  // 2-de-5 sinais necessários. edgeOk=true garante ao menos 1 — precisa de 1 mais.
+  // Confirmação de sinal: bloqueia apenas se MÚLTIPLOS sinais forem explicitamente
+  // CONTRÁRIOS ao trade (veto por contradição, não por ausência de confirmação).
+  // Antes era 2-de-5 favoráveis — isso bloqueava o bot em mercado calmo por horas
+  // porque velOk/trendMatches/flowConfirms só se confirmam durante spikes.
+  // Agora: bloqueia se ≥2 sinais contrários estiverem ativos simultaneamente.
+  // edgeOk sempre é true aqui (buildTradeSignal já filtrou). O score mantém
+  // todos os 5 sinais para diagnóstico e logging.
   const confirmedSignals = [trendMatches, velOk, edgeOk, confEdgeOk, flowConfirms].filter(Boolean).length;
+  const trendAgainst = !trendMatches && btc10sAgo > 0 && Math.abs(btcTrend10s) > 0.0005;
+  const flowAgainst  = Math.abs(imb) >= 0.20 &&
+    ((side === 'BUY_YES' && imb < 0) || (side === 'BUY_NO' && imb > 0));
+  const vetoCount    = [trendAgainst, flowAgainst].filter(Boolean).length;
   Object.assign(diagnostics, {
     marketId: state.currentSignal.marketId,
     question: state.currentSignal.question,
@@ -2335,6 +2348,9 @@ function runArbitrageCheck() {
     trendBias: state.currentSignal.trendBias,
     pausedUntil: state.trading.pausedUntil,
     pauseReason: state.trading.pauseReason,
+    trendAgainst,
+    flowAgainst,
+    vetoCount,
   });
   if (!canTrade) diagnostics.blockers.push('max_open_positions');
   if (!stableOk) diagnostics.blockers.push('stable_edge');
@@ -2342,10 +2358,10 @@ function runArbitrageCheck() {
   if (!exposureOk) diagnostics.blockers.push('exposure_limit');
   if (hasOpposite) diagnostics.blockers.push('opposite_position');
   
-  if (confirmedSignals < 2 && !isSpike) {
+  if (vetoCount >= 2 && !isSpike) {
     state.currentSignal = null;
     diagnostics.blockers.push('signal_confirmation');
-    diagnostics.blockReason = 'SIGNAL_CONFIRMATION';
+    diagnostics.blockReason = 'SIGNAL_VETO';
     setSignalDiagnostics(diagnostics);
     return broadcastSignal();
   }
