@@ -2018,7 +2018,9 @@ function kellySize(edge, winProb, entryPrice, balance, maxBetPct) {
   const vMult     = vol > 0.003 ? 0.70 : vol > 0.0015 ? 0.85 : 1.0;
   const capped    = Math.min(scaled, maxBetPct / 100) * sMult * vMult;
   const raw       = Math.round(balance * capped * 100) / 100;
-  return raw >= 2 ? raw : 0;
+  // Minimum $1 — consistent with fixedAmount:1 config; lower threshold allows the
+  // bot to trade at typical 0.3-0.5% edge levels without needing a spike.
+  return raw >= 1 ? raw : 0;
 }
 
 function computeVPIN() {
@@ -2425,13 +2427,13 @@ function runArbitrageCheck() {
   }
 
   if (!state.config.autoTrade) diagnostics.blockers.push('auto_trade_disabled');
-  if (state.currentSignal.betSize < 2) diagnostics.blockers.push('bet_too_small');
+  if (state.currentSignal.betSize < 1) diagnostics.blockers.push('bet_too_small');
   const liveVolumeMin = 50000;
   const liveVolume = Number(tradeMarket?.volume || 0);
   const volumeOk = !tradeMarket.live || liveVolume >= liveVolumeMin;
   if (!volumeOk) diagnostics.blockers.push('market_volume');
 
-  if (state.config.autoTrade && state.currentSignal.betSize >= 2 && canTrade && stableOk && safeBalance && !hasOpposite && exposureOk && volumeOk) {
+  if (state.config.autoTrade && state.currentSignal.betSize >= 1 && canTrade && stableOk && safeBalance && !hasOpposite && exposureOk && volumeOk) {
     diagnostics.blockReason = 'READY';
     setSignalDiagnostics(diagnostics);
     executeTrade(state.currentSignal);
@@ -2673,9 +2675,9 @@ function updateSimMarketPrices() {
   if (activeSims.length === 0 || ladderTooFar) seedSimMarkets();
   if (state.markets.length === 0) return;
 
-  // Throttle price-model computation to every 90s — matches Gamma API poll cadence in
-  // LIVE mode so SIM and LIVE have identical price-staleness characteristics.
-  const SIM_PRICE_REFRESH_MS = 90 * 1000;
+  // Throttle price-model computation to every 15s — short enough to reopen edge windows
+  // frequently, preventing the "burst-then-silence" pattern from 90s resets.
+  const SIM_PRICE_REFRESH_MS = 15 * 1000;
   if (nowMs - (updateSimMarketPrices._lastUpdateTs || 0) < SIM_PRICE_REFRESH_MS) return;
   updateSimMarketPrices._lastUpdateTs = nowMs;
 
