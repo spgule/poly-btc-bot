@@ -206,23 +206,28 @@ function buildTradeSignal(market, now = Date.now()) {
   const { implied, poly, edge, dynMinEdge, side, bollinger, bollingerBias, trendIndicators, trendBias } = context;
   if (Math.abs(edge) < dynMinEdge) return null;
 
+  // Cap edge at 15¢: in a real CLOB institutional arbitrageurs would eliminate
+  // anything larger within seconds. Anything above 15¢ is a model artefact
+  // (missing friction, stale poly price, or unrealistic vol estimate).
+  const cappedEdge = Math.min(0.15, Math.abs(edge));
+
   const winProb    = edge > 0 ? implied : (1 - implied);
   const marketYes  = market.outcomePrices?.[0] ?? 0.5;
   const entryPrice = side === 'BUY_YES' ? marketYes : (1 - marketYes);
   const betSize = state.config.entryMode === 'fixed'
     ? Math.min(state.config.fixedAmount, state.trading.balance)
-    : kellySize(Math.abs(edge), winProb, entryPrice, state.trading.balance, state.config.maxBetPct);
+    : kellySize(cappedEdge, winProb, entryPrice, state.trading.balance, state.config.maxBetPct);
   const velBonus   = edgeVelocity() > 0.003 ? 10 : 0;
-  const qualBonus  = Math.round(edgeQuality(edge) * 20);
+  const qualBonus  = Math.round(edgeQuality(cappedEdge) * 20);
   const bollingerBonus = bollingerBias === 'favorable' ? 6 : bollingerBias === 'unfavorable' ? -8 : 0;
   const trendBonus = trendBias === 'favorable' ? 6 : trendBias === 'unfavorable' ? -8 : 0;
-  const confidence = Math.min(99, Math.max(1, 50 + Math.abs(edge) * 250 + velBonus + qualBonus + bollingerBonus + trendBonus));
+  const confidence = Math.min(99, Math.max(1, 50 + cappedEdge * 250 + velBonus + qualBonus + bollingerBonus + trendBonus));
 
   return {
     marketId: context.marketId,
     question: context.question,
     side,
-    edge: Math.abs(edge),
+    edge: cappedEdge,
     impliedProb: implied,
     polyOdds: poly,
     betSize,
@@ -2674,32 +2679,62 @@ function monitorPositions() {
     const mktForPos = state.markets.find(m => m.id === pos.marketId);
     if (!mktForPos) continue;
 
+    const nowMs = Date.now();
+
+    // Minimum hold: 2s before any TP/SL can fire.
+    // In LIVE, order submission + confirmation takes 1-3s — you physically cannot
+    // exit before your entry fill confirms. Prevents unrealistic 127ms round-trips.
+    if (nowMs - pos.entryTime < 2000) continue;
+
     // For SIM markets: compute YES probability in real-time from BTC price + strike.
-    // This keeps P&L and TP/SL responsive every 150ms instead of waiting 90s for the
-    // price-model refresh. For LIVE markets: use outcomePrices from CLOB (already live).
-    let effectiveYesOdds;
+    // For LIVE markets: use outcomePrices from CLOB (already live).
+    let rawYesOdds;
     if (!mktForPos.live) {
-      effectiveYesOdds = computeBinaryMid(mktForPos, state.btcPrice);
+      rawYesOdds = computeBinaryMid(mktForPos, state.btcPrice);
     } else {
-      effectiveYesOdds = mktForPos.outcomePrices?.[0] ?? 0.5;
+      rawYesOdds = mktForPos.outcomePrices?.[0] ?? 0.5;
     }
 
-    const midOdds = pos.side === 'BUY_YES'
-      ? effectiveYesOdds
-      : (1 - effectiveYesOdds);
-    const newMark = Math.max(0.03, Math.min(0.97, midOdds));
-    const netExitOdds = getNetExitOdds(mktForPos, newMark);
-    pos.markOdds   = newMark;
+    // ── Gap 5: Market resistance — EMA smoothing ─────────────────────────────
+    // Real CLOB order books resist sudden BTC moves: market makers reprice
+    // incrementally, not tick-by-tick. alpha=0.12 per 150ms tick ≈ tau ~1.1s.
+    // For LIVE markets outcomePrices already carry this natural lag (90s poll).
+    if (!mktForPos.live) {
+      if (pos._markEMA == null) pos._markEMA = rawYesOdds;
+      pos._markEMA = pos._markEMA * 0.88 + rawYesOdds * 0.12;
+      rawYesOdds = pos._markEMA;
+    }
 
+    const rawMidOdds = pos.side === 'BUY_YES' ? rawYesOdds : (1 - rawYesOdds);
+
+    // ── Gap 4: Mark cap by time-to-expiry ────────────────────────────────────
+    // Institutional market makers keep bids well below 100¢ until the last
+    // 2 minutes when outcome is near-certain. A 0.97 bid at T-10 min never
+    // exists in real CLOB — you would be walking into an empty order book.
+    const msLeft = mktForPos.endDate
+      ? new Date(mktForPos.endDate).getTime() - nowMs
+      : Infinity;
+    const maxMark = msLeft > 5 * 60000 ? 0.88   // T > 5 min: arb ceiling
+                  : msLeft > 2 * 60000 ? 0.92   // T 2-5 min: approaching resolution
+                  : 0.97;                        // T < 2 min: near settlement, full range
+    const newMark = Math.max(0.03, Math.min(maxMark, rawMidOdds));
+
+    // ── Gap 2: Exit liquidity penalty near expiry ─────────────────────────────
+    // Order book thins as market approaches expiry: fewer resting bids,
+    // wider effective spread. Models the cost of liquidating a position
+    // in a drying-out book. Penalty ramps from 0¢ at T=2min to 3¢ at T=30s.
+    const liquidityPenalty = (Number.isFinite(msLeft) && msLeft < 120000)
+      ? Math.min(0.03, 0.03 * (1 - Math.max(0, msLeft) / 120000))
+      : 0;
+    const netExitOdds = Math.max(0.01, getNetExitOdds(mktForPos, newMark) - liquidityPenalty);
+
+    pos.markOdds = newMark;
     pos.unrealizedPnl = Math.round((netExitOdds - pos.entryOdds) * pos.shares * 100) / 100;
     pos.pnlPct = pos.cost > 0
       ? Math.round((pos.unrealizedPnl / pos.cost) * 10000) / 100
       : 0;
 
     // TP/SL trigger based on pnlPct — the same number the user sees in the UI.
-    // This is intuitive: SL=16% fires when unrealized loss reaches 16% of entry cost.
-    const nowMs = Date.now();
-
     if (pos.pnlPct >= state.config.takeProfitPct) {
       closePosition(pos, newMark, 'TP'); continue;
     }
@@ -2742,9 +2777,13 @@ async function executeTrade(signal) {
   if (Date.now() - state.trading.lastTradeTs < minCooldown) return;
   state.trading.lastTradeTs = Date.now();
 
-  // ── Simulate execution latency (CLOB order roundtrip: 50–300ms) ───────────
-  // In LIVE this would be real network + chain latency; in SIM we model it.
-  const latencyMs = 50 + Math.floor(Math.random() * 250);
+  // ── Simulate execution latency (CLOB order roundtrip) ─────────────────────
+  // LIVE: real network + chain confirmation: ~50-300ms.
+  // SIM:  order submission → matching engine → confirmation round-trip: 800-2500ms.
+  //       This prevents unrealistically fast exits (holdMs=127ms never happens in LIVE).
+  const latencyMs = state.config.mode === 'LIVE'
+    ? (50 + Math.floor(Math.random() * 250))
+    : (800 + Math.floor(Math.random() * 1700));
   await new Promise(r => setTimeout(r, latencyMs));
 
   openPosition(signal);
