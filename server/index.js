@@ -2127,7 +2127,11 @@ function runArbitrageCheck() {
       if (msLeft < 60000 || msLeft > 30.5 * 60000) return false; // respect duration window
       return !state.positions.some(p => p.status === 'OPEN' && p.marketId === m.id && p.side !== side);
     });
-    if (alternatives.length > 0) {
+    if (alternatives.length === 0) {
+      // No clean alternative exists — skip entirely rather than stacking on same market
+      state.currentSignal = null;
+      return broadcastSignal();
+    } else {
       tradeMarket = alternatives[0];
       hasOpposite = false; // cleared — alternative has no conflicting position
       const altHasSameSide = state.positions.some(p =>
@@ -2396,10 +2400,9 @@ function openPosition(signal) {
   // NEVER open opposite direction on same market — prevents self-canceling trades
   if (state.positions.some(p => p.status === 'OPEN' && p.marketId === marketId && p.side !== side)) return;
 
-  // In strict mode: also block same-direction duplicate
-  if (!state.config.allowDuplicateMarkets) {
-    if (state.positions.some(p => p.status === 'OPEN' && p.marketId === marketId && p.side === side)) return;
-  }
+  // Block same-direction duplicate on the SAME market regardless of allowDuplicateMarkets.
+  // allowDuplicateMarkets only permits stacking across *different* markets.
+  if (state.positions.some(p => p.status === 'OPEN' && p.marketId === marketId && p.side === side)) return;
 
   // Total exposure hard cap: max 40% of effective balance in all open positions combined
   const totalExposure = state.positions
