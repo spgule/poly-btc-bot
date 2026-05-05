@@ -1540,7 +1540,10 @@ function hasTradableLiveMarket(now = Date.now()) {
     if (!m.live || m.priceIsEstimated) return false;
     if (!isValidTradingMarket(m)) return false;
     const minLeft = getMarketMinutesLeft(m, now);
-    if (minLeft < 1 || minLeft > 1440) return false;
+    // Only count markets that are currently active (< 30.5 min left) — not future windows.
+    // A market 400 min away is not "available" for trading right now and should not
+    // block SIM fallback.
+    if (minLeft < 1 || minLeft > 30.5) return false;
     if (Number(m.volume || 0) < 50000) return false;
     return getMarketPriceDistance(m) <= 0.42;
   });
@@ -1824,11 +1827,16 @@ function getBestMarket(preferLiveOnly = false) {
     // Block markets with no real price data — would generate false signals against 0.5
     if (m.priceIsEstimated) return { m, score: -1 };
     const isSim = !m.live;
-    if (!preferLiveOnly && liveAvailable && isSim) return { m, score: -1 };
+    // Do NOT hard-exclude SIM when live markets exist — live dynMinEdge = 2% (minEdge),
+    // which requires a BTC spike to trade. In calm markets BTC rarely moves 2% in 90s,
+    // so live-only mode would block the bot indefinitely. Let scoring decide:
+    // live markets score +3 bonus (liveBonus) so they naturally win when both have edge.
+    // SIM markets fill in when live edge is insufficient.
     // Prefer shorter-duration markets — they resolve faster and edge is more predictable.
     const totalDuration = getMarketDurationMinutes(m);
     const timeScore = totalDuration <= 5.5 ? 4 : totalDuration <= 10.5 ? 3 : totalDuration <= 20.5 ? 2 : 1;
     const volScore  = m.volume >= 100000 ? 2 : m.volume >= 20000 ? 1 : 0;
+    const liveBonus = (!isSim && liveAvailable) ? 3 : 0;
     // Filter out near-certain markets (YES > 0.92 or YES < 0.08).
     const yesPrice  = getMarketYesPrice(m);
     const priceDist = getMarketPriceDistance(m);
@@ -1847,7 +1855,7 @@ function getBestMarket(preferLiveOnly = false) {
     // Bonus score for Up or Down markets (these are the ideal arb target)
     const upOrDownBonus = isUpOrDown ? 2 : 0;
     const edgeBonus = Math.min(4, Math.abs(computeEdge(m).edge) / Math.max(0.005, state.config.minEdge / 2));
-    return { m, score: timeScore + volScore + priceScore + upOrDownBonus + edgeBonus };
+    return { m, score: timeScore + volScore + priceScore + upOrDownBonus + liveBonus + edgeBonus };
   }).filter(x => x.score >= 0).sort((a, b) => b.score - a.score);
 
   if (scored.length === 0) {
