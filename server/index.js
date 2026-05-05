@@ -2098,13 +2098,17 @@ function runArbitrageCheck() {
   const stableOk  = !state.config.requireStableEdge || isGoodEntry(edge);
 
   // Guard: NEVER open opposite direction on the same market — self-canceling trades.
-  // BUT: if the best market has a conflicting open position, try an alternative market
-  // from the available list so YES and NO entries can both happen simultaneously.
+  // Also block same-side duplicate on the same market: concentrates risk with zero
+  // diversification benefit. Use allowDuplicateMarkets to permit stacking only across
+  // different markets, never on the same market+side.
   let tradeMarket = market;
+  const hasSameSide = state.positions.some(p =>
+    p.status === 'OPEN' && p.marketId === tradeMarket.id && p.side === side
+  );
   let hasOpposite = state.positions.some(p =>
     p.status === 'OPEN' && p.marketId === tradeMarket.id && p.side !== side
   );
-  if (hasOpposite) {
+  if (hasSameSide || hasOpposite) {
     // Try to find an alternative market without a conflicting position for this side.
     // Must pass the same duration filter as getBestMarket — prevents long-dated markets leaking in.
     const alternatives = state.markets.filter(m => {
@@ -2121,6 +2125,14 @@ function runArbitrageCheck() {
     if (alternatives.length > 0) {
       tradeMarket = alternatives[0];
       hasOpposite = false; // cleared — alternative has no conflicting position
+      const altHasSameSide = state.positions.some(p =>
+        p.status === 'OPEN' && p.marketId === tradeMarket.id && p.side === side
+      );
+      if (altHasSameSide) {
+        // Alternative also has same-side position — no clean market found, skip
+        state.currentSignal = null;
+        return broadcastSignal();
+      }
       const altSignal = buildTradeSignal(tradeMarket, now);
       if (!altSignal) {
         state.currentSignal = null;
@@ -2662,34 +2674,36 @@ function monitorPositions() {
     const mktForPos = state.markets.find(m => m.id === pos.marketId);
     if (!mktForPos) continue;
 
-    const effectiveYesOdds = mktForPos.outcomePrices?.[0];
+    // For SIM markets: compute YES probability in real-time from BTC price + strike.
+    // This keeps P&L and TP/SL responsive every 150ms instead of waiting 90s for the
+    // price-model refresh. For LIVE markets: use outcomePrices from CLOB (already live).
+    let effectiveYesOdds;
+    if (!mktForPos.live) {
+      effectiveYesOdds = computeBinaryMid(mktForPos, state.btcPrice);
+    } else {
+      effectiveYesOdds = mktForPos.outcomePrices?.[0] ?? 0.5;
+    }
+
     const midOdds = pos.side === 'BUY_YES'
       ? effectiveYesOdds
       : (1 - effectiveYesOdds);
-    const newMark = Math.max(0.03, Math.min(0.97, midOdds ?? pos.markOdds));
+    const newMark = Math.max(0.03, Math.min(0.97, midOdds));
     const netExitOdds = getNetExitOdds(mktForPos, newMark);
     pos.markOdds   = newMark;
 
-    // Execution cost should not immediately trip TP/SL. We compare the current
-    // exitable mark against the exitable mark that existed at entry time:
-    // entry MID minus the same exit spread. This keeps TP/SL tied to real market
-    // movement while unrealized PnL still reflects true liquidation value.
-    const entryMarkBaseline = getNetExitOdds(mktForPos, pos.entryMidOdds ?? pos.entryOdds);
-    const triggerDelta = netExitOdds - entryMarkBaseline;
     pos.unrealizedPnl = Math.round((netExitOdds - pos.entryOdds) * pos.shares * 100) / 100;
     pos.pnlPct = pos.cost > 0
       ? Math.round((pos.unrealizedPnl / pos.cost) * 10000) / 100
       : 0;
 
-    const gainPct  = triggerDelta / entryMarkBaseline; // positive = market moved in our favor
-    const lossPct  = -triggerDelta / entryMarkBaseline; // positive = market moved against us
+    // TP/SL trigger based on pnlPct — the same number the user sees in the UI.
+    // This is intuitive: SL=16% fires when unrealized loss reaches 16% of entry cost.
     const nowMs = Date.now();
-    const elapsed  = nowMs - pos.entryTime;
 
-    if (gainPct >= state.config.takeProfitPct / 100 && pos.unrealizedPnl > 0) {
+    if (pos.pnlPct >= state.config.takeProfitPct) {
       closePosition(pos, newMark, 'TP'); continue;
     }
-    if (lossPct >= state.config.stopLossPct / 100) {
+    if (pos.pnlPct <= -state.config.stopLossPct) {
       closePosition(pos, newMark, 'SL'); continue;
     }
     const closeDeadline = getPositionCloseDeadline(pos, mktForPos);
