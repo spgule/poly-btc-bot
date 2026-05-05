@@ -2287,23 +2287,28 @@ function runArbitrageCheck() {
   const trendMatches = side === 'BUY_YES' ? btcTrend10s > 0 : btcTrend10s < 0;
   const velOk = edgeVelocity() > 0.001;
 
-  // Confidence-adjusted edge threshold (kalshi-ai-trading-bot pattern):
-  // Alta confiança (≥80%) → exige menos edge (3/4 do mínimo).
-  // Baixa confiança (<60%) → exige mais edge (4/3 do mínimo).
-  // Permite mais trades em sinais fortes sem abrir ruído em sinais fracos.
+  // edgeOk: sempre true aqui pois buildTradeSignal já filtrou |edge| < dynMinEdge.
+  // Preserva o baseline do código original (edgeOk garantido = 1 sinal confirmado).
+  const edgeOk = Math.abs(edge) >= dynMinEdge;
+
+  // Confidence-adjusted edge como 4º sinal (kalshi-ai-trading-bot pattern):
+  // Conta como confirmação extra quando o edge supera o limiar escalonado por confiança.
+  // NÃO substitui edgeOk — apenas acrescenta. Assim o baseline de 1 sinal nunca cai.
   const conf = signalCandidate.confidence;
   const confAdjMinEdge = conf >= 80 ? dynMinEdge * 0.75
                        : conf <  60 ? dynMinEdge * 1.33
                        : dynMinEdge;
-  const edgeOk = Math.abs(edge) >= confAdjMinEdge;
+  const confEdgeOk = Math.abs(edge) >= confAdjMinEdge;
 
-  // Flow imbalance como 4º sinal de confirmação (polymarket-btc-15min pattern).
+  // Flow imbalance como 5º sinal de confirmação (polymarket-btc-15min pattern).
+  // Limiar 0.15 (15%) é realista para BTC aggTrades em janelas de 30s.
   // Pressão de ordem alinhada com a direção do trade = confirmação extra de fluxo real.
   const imb = flowImbalance();
-  const flowConfirms = Math.abs(imb) >= 0.25 &&
+  const flowConfirms = Math.abs(imb) >= 0.15 &&
     ((side === 'BUY_YES' && imb > 0) || (side === 'BUY_NO' && imb < 0));
 
-  const confirmedSignals = [trendMatches, velOk, edgeOk, flowConfirms].filter(Boolean).length;
+  // 2-de-5 sinais necessários. edgeOk=true garante ao menos 1 — precisa de 1 mais.
+  const confirmedSignals = [trendMatches, velOk, edgeOk, confEdgeOk, flowConfirms].filter(Boolean).length;
   Object.assign(diagnostics, {
     marketId: state.currentSignal.marketId,
     question: state.currentSignal.question,
