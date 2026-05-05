@@ -1752,6 +1752,13 @@ function getMarketMinEdge(market, volScale = 1) {
     const simBase = Math.min(base, 0.004);
     return Math.max(0.003, simBase * Math.min(1.10, volScale));
   }
+  if (market?.live && state.config.mode === 'SIM') {
+    // In SIM mode, live market prices are polled every 30s. A realistic BTC move
+    // between polls is 0.05-0.5%, generating edge of 0.3-1.5% on a 5-30 min binary.
+    // The full minEdge (2%) threshold would block almost every opportunity.
+    // Cap live dynMinEdge to 0.8% in SIM so real market data is actually usable.
+    return Math.max(0.005, Math.min(base * 0.40, 0.008) * Math.min(1.20, volScale));
+  }
   return base * volScale;
 }
 
@@ -2064,11 +2071,11 @@ function hasStableEdge(edge) { return isGoodEntry(edge); }
 
 function runArbitrageCheck() {
   const now = Date.now();
-  const market = getBestMarket();
+  const topMarket = getBestMarket();
   // 4-layer loss limit check
   if (isTradingPaused(now)) {
     state.currentSignal = null;
-    const context = buildSignalContext(market, now);
+    const context = buildSignalContext(topMarket, now);
     setSignalDiagnostics({
       marketId: context?.marketId ?? null,
       question: context?.question ?? null,
@@ -2095,19 +2102,41 @@ function runArbitrageCheck() {
   // inside computeImpliedProb() and computePolyOdds() can return different
   // markets on consecutive calls (scoring is time-dependent), making the edge
   // meaningless (difference between two unrelated markets' model prices).
-  if (!market) {
+  if (!topMarket) {
     state.currentSignal = null;
     setSignalDiagnostics({ blockReason: 'NO_MARKET', blockers: ['no_market'] });
     return;
   }
 
-  const signalCandidate = buildTradeSignal(market);
+  // ── Market cascade: try markets in order until one yields a signal ──────────
+  // When the top-scored market fails MIN_EDGE (common for live markets in calm
+  // conditions), cascade through all eligible markets (live + SIM) rather than
+  // giving up. SIM markets have dynMinEdge ~0.4-0.8%, so they catch opportunities
+  // that live markets miss during low-volatility periods.
+  const cascadePool = [topMarket, ...state.markets.filter(m => {
+    if (m.id === topMarket.id) return false;
+    if (!isValidTradingMarket(m)) return false;
+    const ml = getMarketMinutesLeft(m, now);
+    if (ml < 1 || ml > 30.5) return false;
+    if (m.priceIsEstimated) return false;
+    if (m.live && Number(m.volume || 0) < 50000) return false;
+    if (getMarketPriceDistance(m) > 0.42) return false;
+    return true;
+  })].slice(0, 6);
+
+  let signalCandidate = null;
+  let signalMarket = topMarket;
+  for (const mkt of cascadePool) {
+    const candidate = buildTradeSignal(mkt);
+    if (candidate) { signalCandidate = candidate; signalMarket = mkt; break; }
+  }
+
   if (!signalCandidate) {
     state.currentSignal = null;
-    const context = buildSignalContext(market, now);
+    const context = buildSignalContext(topMarket, now);
     setSignalDiagnostics({
-      marketId: context?.marketId ?? market.id,
-      question: context?.question ?? market.question,
+      marketId: context?.marketId ?? topMarket.id,
+      question: context?.question ?? topMarket.question,
       side: context?.side ?? null,
       implied: context?.implied ?? null,
       poly: context?.poly ?? null,
@@ -2126,6 +2155,8 @@ function runArbitrageCheck() {
     return broadcastSignal();
   }
 
+  // Use the market that actually produced the signal (may differ from top-scored market)
+  const market = signalMarket;
   const implied = signalCandidate.impliedProb;
   const poly = signalCandidate.polyOdds;
   const edge = signalCandidate._rawEdge;
@@ -3308,9 +3339,9 @@ server.listen(PORT, async () => {
   connectBinance();
   await fetchBTCMarkets();
   syncPolyMarketSubscription();
-  // Refresh markets every 90s — ensures fresh Polymarket prices and valid expiry windows.
-  // This natural polling lag (90s) mirrors Polymarket's real update cycle for both SIM and LIVE.
-  setInterval(fetchBTCMarkets, 90 * 1000);
+  // Refresh markets every 30s — fresher Polymarket prices = more edge opportunities.
+  // 30s is well within Gamma API rate limits and gives 3x more price updates per window.
+  setInterval(fetchBTCMarkets, 30 * 1000);
   setInterval(syncPolyMarketSubscription, 2000);
   // Sim market price model: re-prices non-live markets every 2s using real BTC + binary option math
   setInterval(updateSimMarketPrices, 2000);
