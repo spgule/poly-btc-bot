@@ -2663,20 +2663,28 @@ function updateSimMarketPrices() {
   // back to 0.50 and hides the true SIM edge.
   const nowMs = Date.now();
   const activeSims = state.markets.filter(m => !m.live && getMarketMinutesLeft(m, nowMs) > 1);
-  // Reseed when all SIM markets expired, or when BTC has drifted >1.2% from the
-  // strike at which any market was seeded (_strikeSnapshot). "Up or Down" markets
-  // have no fixed $ strike in the question, so use _strikeSnapshot set at seed time.
+  // Reseed triggers:
+  // 1. All SIM markets expired (activeSims.length === 0)
+  // 2. BTC drifted >0.5% from seed — beyond this, priceDist approaches 0.42 and
+  //    markets start getting excluded. Reseeding at 0.5% prevents the dead zone
+  //    (0.4%-1.2%) where markets are excluded but no reseed fires.
   const ladderTooFar = activeSims.length > 0 && activeSims.every(m => {
     const strike = getSimStrike(m) ?? m._strikeSnapshot;
     return strike && state.btcPrice
-      ? Math.abs(strike - state.btcPrice) / state.btcPrice > 0.012
+      ? Math.abs(strike - state.btcPrice) / state.btcPrice > 0.005
       : false;  // no strike data — assume still valid
   });
-  if (activeSims.length === 0 || ladderTooFar) seedSimMarkets();
+  // 3. All active SIM markets have priceDist > 0.42 — none will pass getBestMarket
+  //    scoring. This catches the post-spike dead zone immediately.
+  const allExcluded = activeSims.length > 0 &&
+    activeSims.every(m => getMarketPriceDistance(m) > 0.42);
+  if (activeSims.length === 0 || ladderTooFar || allExcluded) {
+    seedSimMarkets();
+    updateSimMarketPrices._lastUpdateTs = 0; // force immediate price update after reseed
+  }
   if (state.markets.length === 0) return;
 
-  // Throttle price-model computation to every 15s — short enough to reopen edge windows
-  // frequently, preventing the "burst-then-silence" pattern from 90s resets.
+  // Throttle price-model computation to every 15s.
   const SIM_PRICE_REFRESH_MS = 15 * 1000;
   if (nowMs - (updateSimMarketPrices._lastUpdateTs || 0) < SIM_PRICE_REFRESH_MS) return;
   updateSimMarketPrices._lastUpdateTs = nowMs;
@@ -2684,10 +2692,12 @@ function updateSimMarketPrices() {
   for (const m of state.markets) {
     if (m.live) continue;
     if (!m.outcomePrices) m.outcomePrices = [0.5, 0.5];
-    // SIM tape should behave like a venue that refreshes discretely, not like the
-    // fair-value model itself. Use a short stale BTC snapshot and 1¢ ticks so the
-    // edge engine sees realistic mispricings during fast moves.
-    const simBtcRef = getPriceAt(LAG_MS) || state.btcPrice;
+    // Use a 60s-lagged BTC reference for poly so the market price is always 60s
+    // "stale" relative to implied. This creates persistent edge from BTC's continuous
+    // movement — even in calm markets BTC drifts 0.05-0.1%/min, which generates
+    // 5-10% edge on a 10-min binary. Previous 2.7s lag collapsed edge to ~0 every
+    // 15s (btcLagged2700ms ≈ btcNow → poly ≈ implied → burst-then-silence).
+    const simBtcRef = getPriceAt(60000) || getPriceAt(LAG_MS) || state.btcPrice;
     const rawProb = computeBinaryMid(m, simBtcRef);
     const steppedYes = Math.round(clampProb(rawProb) / SIM_PRICE_STEP) * SIM_PRICE_STEP;
     const newYes = clampProb(steppedYes);
