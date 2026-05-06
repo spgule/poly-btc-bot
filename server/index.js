@@ -1382,6 +1382,13 @@ function seedSimMarkets() {
     { id: 'sim-6', minutes: 30, volume: 52000 },
   ];
 
+  // Strike = BTC price from ~5 min ago (oldest entry in priceHistory).
+  // Using the historical baseline means edge = 5-minute BTC drift at seed time,
+  // so the bot can trade IMMEDIATELY after reseed rather than waiting for BTC
+  // to move away from a strike set at the current price (which would give edge ≈ 0).
+  // Falls back to btcNow only if priceHistory is empty (very first startup tick).
+  const simStrike = (state.priceHistory.length > 0 ? state.priceHistory[0].price : btcNow);
+
   const liveMarkets = state.markets.filter(m => m.live);
   state.markets = [
     ...liveMarkets,
@@ -1391,20 +1398,19 @@ function seedSimMarkets() {
       const startDate   = new Date(windowStart).toISOString();
       const endDate     = new Date(endMs).toISOString();
       const question    = `Bitcoin Up or Down - ${dateLabel}, ${fmtET(windowStart)}-${fmtET(endMs)} ET`;
-      // Strike = BTC price at window open — fair value starts at 0.5 (BTC hasn't moved yet).
-      const tempMarket  = { question, startDate, endDate, _strikeSnapshot: btcNow };
-      const rawProb     = computeBinaryMid(tempMarket, btcNow);
-      const initYes     = Math.round(clampProb(rawProb) / SIM_PRICE_STEP) * SIM_PRICE_STEP;
+      // Use simStrike (BTC ~5 min ago) so the binary model already reflects the
+      // recent directional drift. outcomePrices frozen at 0.5 (poly reference);
+      // edge = computeBinaryMid(btcNow, strike=simStrike) - 0.5 is non-zero from the start.
       return {
         id,
         question,
         outcomes: ['Yes', 'No'],
-        outcomePrices: [clampProb(initYes), Math.round((1 - clampProb(initYes)) * 1000) / 1000],
+        outcomePrices: [0.5, 0.5],
         volume,
         startDate,
         endDate,
         live: false,
-        _strikeSnapshot: btcNow,
+        _strikeSnapshot: simStrike,
       };
     }),
   ];
@@ -1757,10 +1763,10 @@ function getMarketMinEdge(market, volScale = 1) {
   }
   if (market?.live && state.config.mode === 'SIM') {
     // In SIM mode, live market prices are polled every 30s. A realistic BTC move
-    // between polls is 0.05-0.5%, generating edge of 0.3-1.5% on a 5-30 min binary.
-    // The full minEdge (2%) threshold would block almost every opportunity.
-    // Cap live dynMinEdge to 0.8% in SIM so real market data is actually usable.
-    return Math.max(0.005, Math.min(base * 0.40, 0.008) * Math.min(1.20, volScale));
+    // between polls is 0.05-0.3%, generating edge of 0.2-0.8% on a 5-30 min binary.
+    // Cap live dynMinEdge to 0.4% so entries fire when Gamma lag creates meaningful
+    // mispricing — previously 0.8% blocked most opportunities outside spike moments.
+    return Math.max(0.003, Math.min(base * 0.40, 0.004) * Math.min(1.20, volScale));
   }
   return base * volScale;
 }
@@ -1913,8 +1919,10 @@ function computeBinaryMid(market, btcOverride) {
         || state.priceHistory[0]?.price
         || btc;
     } else {
-      // Window hasn't started yet — oldest price in priceHistory is best proxy
-      strike = (state.priceHistory.length > 0 ? state.priceHistory[0].price : null) || btc;
+      // Window hasn't started yet — use the snapshotted strike (set at seed time to
+      // BTC ~5 min ago). This is consistent with the post-startDate branch and avoids
+      // a discontinuous edge jump when startDate arrives. Falls back to current BTC.
+      strike = market._strikeSnapshot || btc;
     }
   }
 
@@ -2127,7 +2135,7 @@ function runArbitrageCheck() {
     if (m.live && Number(m.volume || 0) < 50000) return false;
     if (getMarketPriceDistance(m) > 0.42) return false;
     return true;
-  })].slice(0, 6);
+  })].slice(0, 10);
 
   let signalCandidate = null;
   let signalMarket = topMarket;
@@ -2231,21 +2239,25 @@ function runArbitrageCheck() {
       state.currentSignal = null;
       return broadcastSignal();
     } else {
-      tradeMarket = alternatives[0];
+      // Try each alternative in order until one produces a valid signal.
+      // Previously only alternatives[0] was tried — if it had no edge the bot gave up.
+      let altSignal = null;
+      let altMarket = null;
+      for (const candidate of alternatives) {
+        const altHasSameSide = state.positions.some(p =>
+          p.status === 'OPEN' && p.marketId === candidate.id && p.side === side
+        );
+        if (altHasSameSide) continue; // skip if same-side conflict
+        const sig = buildTradeSignal(candidate, now);
+        if (sig) { altSignal = sig; altMarket = candidate; break; }
+      }
+      if (!altSignal || !altMarket) {
+        // No alternative had sufficient edge — nothing to do
+        state.currentSignal = null;
+        return broadcastSignal();
+      }
+      tradeMarket = altMarket;
       hasOpposite = false; // cleared — alternative has no conflicting position
-      const altHasSameSide = state.positions.some(p =>
-        p.status === 'OPEN' && p.marketId === tradeMarket.id && p.side === side
-      );
-      if (altHasSameSide) {
-        // Alternative also has same-side position — no clean market found, skip
-        state.currentSignal = null;
-        return broadcastSignal();
-      }
-      const altSignal = buildTradeSignal(tradeMarket, now);
-      if (!altSignal) {
-        state.currentSignal = null;
-        return broadcastSignal();
-      }
       state.currentSignal = {
         marketId: altSignal.marketId,
         question: altSignal.question,
