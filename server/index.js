@@ -2658,52 +2658,45 @@ function openPosition(signal) {
 function updateSimMarketPrices() {
   if (!state.btcPrice || state.btcPrice <= 0) return;
 
-  // Auto-refresh sim markets only when the ladder expired or drifted too far from spot.
-  // Price skew alone is not enough reason to reset, otherwise the ladder keeps snapping
-  // back to 0.50 and hides the true SIM edge.
   const nowMs = Date.now();
   const activeSims = state.markets.filter(m => !m.live && getMarketMinutesLeft(m, nowMs) > 1);
+
   // Reseed triggers:
-  // 1. All SIM markets expired (activeSims.length === 0)
-  // 2. BTC drifted >0.5% from seed — beyond this, priceDist approaches 0.42 and
-  //    markets start getting excluded. Reseeding at 0.5% prevents the dead zone
-  //    (0.4%-1.2%) where markets are excluded but no reseed fires.
+  // 1. All SIM markets expired.
+  const allExpired = activeSims.length === 0;
+  // 2. BTC drifted >2% from seed strike — outcome becoming too one-sided.
   const ladderTooFar = activeSims.length > 0 && activeSims.every(m => {
     const strike = getSimStrike(m) ?? m._strikeSnapshot;
     return strike && state.btcPrice
-      ? Math.abs(strike - state.btcPrice) / state.btcPrice > 0.005
-      : false;  // no strike data — assume still valid
+      ? Math.abs(strike - state.btcPrice) / state.btcPrice > 0.02
+      : false;
   });
-  // 3. All active SIM markets have priceDist > 0.42 — none will pass getBestMarket
-  //    scoring. This catches the post-spike dead zone immediately.
-  const allExcluded = activeSims.length > 0 &&
-    activeSims.every(m => getMarketPriceDistance(m) > 0.42);
-  if (activeSims.length === 0 || ladderTooFar || allExcluded) {
+  // 3. Implied probability extreme (>92%) on ALL active markets — outcome too certain.
+  //    Uses implied (computeBinaryMid) not poly, so it is immune to poly being stale.
+  const allExtreme = activeSims.length > 0 &&
+    activeSims.every(m => Math.abs(computeBinaryMid(m, state.btcPrice) - 0.5) > 0.42);
+
+  if (allExpired || ladderTooFar || allExtreme) {
     seedSimMarkets();
-    updateSimMarketPrices._lastUpdateTs = 0; // force immediate price update after reseed
+    // No post-reseed poly update needed. New markets start with outcomePrices[0] = 0.50
+    // (set in seedSimMarkets) and poly stays frozen at that value — see design note below.
+    return;
   }
-  if (state.markets.length === 0) return;
 
-  // Throttle price-model computation to every 15s.
-  const SIM_PRICE_REFRESH_MS = 15 * 1000;
-  if (nowMs - (updateSimMarketPrices._lastUpdateTs || 0) < SIM_PRICE_REFRESH_MS) return;
-  updateSimMarketPrices._lastUpdateTs = nowMs;
-
-  for (const m of state.markets) {
-    if (m.live) continue;
-    if (!m.outcomePrices) m.outcomePrices = [0.5, 0.5];
-    // Use a 60s-lagged BTC reference for poly so the market price is always 60s
-    // "stale" relative to implied. This creates persistent edge from BTC's continuous
-    // movement — even in calm markets BTC drifts 0.05-0.1%/min, which generates
-    // 5-10% edge on a 10-min binary. Previous 2.7s lag collapsed edge to ~0 every
-    // 15s (btcLagged2700ms ≈ btcNow → poly ≈ implied → burst-then-silence).
-    const simBtcRef = getPriceAt(60000) || getPriceAt(LAG_MS) || state.btcPrice;
-    const rawProb = computeBinaryMid(m, simBtcRef);
-    const steppedYes = Math.round(clampProb(rawProb) / SIM_PRICE_STEP) * SIM_PRICE_STEP;
-    const newYes = clampProb(steppedYes);
-    m.outcomePrices[0] = Math.round(newYes * 1000) / 1000;
-    m.outcomePrices[1] = Math.round((1 - m.outcomePrices[0]) * 1000) / 1000;
-  }
+  // ── FROZEN POLY DESIGN ──────────────────────────────────────────────────────
+  // poly (outcomePrices[0]) is intentionally NOT updated here. It stays at 0.50 from
+  // seed time forever, acting as a frozen market-maker reference price.
+  //
+  // implied = computeBinaryMid(market, btcNow) is computed fresh on every tick in
+  // computeEdge(). As BTC moves away from _strikeSnapshot, implied drifts away from
+  // 0.50 continuously. edge = implied − 0.50 grows in real-time.
+  //
+  // Why this eliminates burst-then-silence:
+  //   Previous design: poly updated every N seconds from getPriceAt(lag). When the lag
+  //   "caught up" after a spike (btcLagged ≈ btcNow), poly ≈ implied → edge collapsed
+  //   to 0. Bot silent until next BTC move.
+  //   New design: poly never changes → edge = implied − 0.50 is always non-zero as
+  //   long as BTC ≠ _strikeSnapshot. Any BTC drift produces persistent, tradeable edge.
 }
 
 function getPositionCloseDeadline(pos, market) {
