@@ -219,14 +219,17 @@ function buildTradeSignal(market, now = Date.now()) {
     ? Math.min(state.config.fixedAmount, state.trading.balance)
     : kellySize(cappedEdge, winProb, entryPrice, state.trading.balance, state.config.maxBetPct);
 
-  // ── Time-decay sizing (Gabagool / polybot pattern) ────────────────────────────
-  // Reduz tamanho nos primeiros 90s de vida do mercado (liquidez tende a ser menor
-  // logo após abertura) e nos primeiros 60s após qualquer re-seed de mercado SIM.
-  // Aplica igual em SIM e LIVE pois ambos têm startDate ou _seedTs.
-  const marketOpenTs = market.startDate ? new Date(market.startDate).getTime()
-                     : (market._seedTs || 0);
-  const secsAlive    = marketOpenTs > 0 ? (Date.now() - marketOpenTs) / 1000 : 9999;
-  const timeMult     = secsAlive < 60 ? 0.65 : secsAlive < 120 ? 0.80 : 1.0;
+  // ── Time-decay sizing (live markets only) ──────────────────────────────────────
+  // For real live markets: reduce size in first 90s after opening (low liquidity).
+  // For SIM markets: startDate is the NEXT 5-min UTC boundary (up to 5 min in the future)
+  // so secsAlive would be negative → timeMult=0.65 → betSize<$1 → bet_too_small block.
+  // SIM markets have constant synthetic volume — no liquidity ramp needed.
+  let timeMult = 1.0;
+  if (market.live) {
+    const marketOpenTs = market.startDate ? new Date(market.startDate).getTime() : 0;
+    const secsAlive    = marketOpenTs > 0 ? (Date.now() - marketOpenTs) / 1000 : 9999;
+    timeMult = secsAlive < 60 ? 0.65 : secsAlive < 120 ? 0.80 : 1.0;
+  }
   const betSize      = Math.round(rawBetSize * timeMult * 100) / 100;
 
   // ── Confidence score ──────────────────────────────────────────────────────────
@@ -2399,7 +2402,12 @@ function runArbitrageCheck() {
   if (!exposureOk) diagnostics.blockers.push('exposure_limit');
   if (hasOpposite) diagnostics.blockers.push('opposite_position');
   
-  if (vetoCount >= 2 && !isSpike) {
+  // SIGNAL_VETO: only apply when requireStableEdge is explicitly enabled.
+  // When requireStableEdge=false (default), user has opted out of all confirmation
+  // filters — trade on edge alone. The veto was blocking post-spike entries even
+  // when signals were good because trendAgainst+flowAgainst fire together during
+  // normal BTC pullbacks after any spike.
+  if (state.config.requireStableEdge && vetoCount >= 2 && !isSpike) {
     state.currentSignal = null;
     diagnostics.blockers.push('signal_confirmation');
     diagnostics.blockReason = 'SIGNAL_VETO';
