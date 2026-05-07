@@ -370,7 +370,6 @@ const state = {
     todayPnl:    0,
     streak:      0,
     totalFees:   0,
-    todayCost:   0,  // custo acumulado de todas as apostas do dia (reset meia-noite UTC)
   },
 
   markets:          [],
@@ -2676,18 +2675,7 @@ function runArbitrageCheck() {
   const volumeOk = !tradeMarket.live || liveVolume >= liveVolumeMin;
   if (!volumeOk) diagnostics.blockers.push('market_volume');
 
-  // Daily spending cap — only applies in LIVE mode (real money protection).
-  // In SIM mode the cap is skipped entirely: it is a capital-preservation guard
-  // for real funds, not a simulation constraint. Applying it in SIM caused the bot
-  // to silently stop after 4-10 trades ($200 cap on $1000 capital) even though
-  // the signal was valid, making the simulation useless for strategy testing.
-  const _dailyCap = (state.config.capital || 1000) * 0.20;
-  const dailyCapOk = state.config.mode === 'SIM'
-    ? true
-    : (state.stats.todayCost || 0) + state.currentSignal.betSize <= _dailyCap;
-  if (!dailyCapOk) diagnostics.blockers.push('daily_cap');
-
-  if (state.config.autoTrade && state.currentSignal.betSize >= 1 && canTrade && stableOk && safeBalance && !hasOpposite && exposureOk && volumeOk && dailyCapOk) {
+  if (state.config.autoTrade && state.currentSignal.betSize >= 1 && canTrade && stableOk && safeBalance && !hasOpposite && exposureOk && volumeOk) {
     diagnostics.blockReason = 'READY';
     setSignalDiagnostics(diagnostics);
     executeTrade(state.currentSignal);
@@ -2894,7 +2882,6 @@ function openPosition(signal) {
   pos.closeDeadline = getPositionCloseDeadline(pos, market);
 
   state.trading.balance = Math.round((state.trading.balance - fillSize) * 100) / 100;
-  state.stats.todayCost  = Math.round(((state.stats.todayCost || 0) + fillSize) * 100) / 100;
   state.positions.push(pos);
   // Keep history bounded
   if (state.positions.length > 500) state.positions = state.positions.slice(-500);
@@ -3470,7 +3457,7 @@ app.post('/api/sim/reset', (req, res) => {
   state.trading.lastTradeTs  = 0;
   state.trading.peakBalanceDay   = state.config.capital;
   state.trading.peakBalanceMonth = state.config.capital;
-  state.stats = { totalTrades: 0, wins: 0, losses: 0, totalPnl: 0, todayPnl: 0, streak: 0, totalFees: 0, todayCost: 0 };
+  state.stats = { totalTrades: 0, wins: 0, losses: 0, totalPnl: 0, todayPnl: 0, streak: 0, totalFees: 0 };
   state.currentSignal = null;
   // Clear persisted trade and session files
   try { fs.unlinkSync(TRADES_FILE); } catch (_) {}
@@ -3642,7 +3629,6 @@ server.listen(PORT, async () => {
   const msToMidnight = new Date().setUTCHours(24, 0, 0, 0) - Date.now();
   setTimeout(function resetDay() {
     state.stats.todayPnl  = 0;
-    state.stats.todayCost = 0;  // Reset daily spending cap
     state.trading.peakBalanceDay = state.trading.balance; // Reset daily peak reference
     broadcastStatus();
     setTimeout(resetDay, 86400000);
