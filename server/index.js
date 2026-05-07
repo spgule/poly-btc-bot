@@ -4103,7 +4103,7 @@ app.get('/api/alt/candles', async (req, res) => {
   try {
     // Binance REST klines — 1m interval, 200 candles ≈ 3h 20m of history
     const symbol   = `${asset}USDT`;
-    const klineUrl = `https://api.binance.com/api/v3/klines?symbol=${symbol}&interval=1m&limit=200`;
+    const klineUrl = `https://data-api.binance.vision/api/v3/klines?symbol=${symbol}&interval=1m&limit=200`;
     const klineResp = await axios.get(klineUrl, { timeout: 10000 });
     const klines    = Array.isArray(klineResp.data) ? klineResp.data : [];
     const candles   = klines.map(k => ({
