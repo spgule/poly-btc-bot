@@ -3029,12 +3029,8 @@ async function executeTrade(signal) {
   state.trading.lastTradeTs = Date.now();
 
   // ── Simulate execution latency (CLOB order roundtrip) ─────────────────────
-  // LIVE: real network + chain confirmation: ~50-300ms.
-  // SIM:  order submission → matching engine → confirmation round-trip: 800-2500ms.
-  //       This prevents unrealistically fast exits (holdMs=127ms never happens in LIVE).
-  const latencyMs = state.config.mode === 'LIVE'
-    ? (50 + Math.floor(Math.random() * 250))
-    : (800 + Math.floor(Math.random() * 1700));
+  // Same range for SIM and LIVE: 50-300ms realistic network + chain roundtrip.
+  const latencyMs = 50 + Math.floor(Math.random() * 250);
   await new Promise(r => setTimeout(r, latencyMs));
 
   openPosition(signal);
