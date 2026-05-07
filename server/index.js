@@ -464,7 +464,38 @@ function clampProb(value) {
 
 function setSignalDiagnostics(patch = {}) {
   state.signalDiagnostics = {
-    ...state.signalDiagnostics,
+    ts: null,
+    marketId: null,
+    question: null,
+    side: null,
+    implied: null,
+    poly: null,
+    edge: null,
+    dynMinEdge: null,
+    blockReason: 'INIT',
+    blockers: [],
+    confirmedSignals: 0,
+    trendMatches: false,
+    velOk: false,
+    edgeOk: false,
+    stableOk: false,
+    canTrade: false,
+    safeBalance: false,
+    exposureOk: false,
+    hasOpposite: false,
+    vpin: 0,
+    btcSpike: 0,
+    isSpike: false,
+    bollinger: null,
+    bollingerBias: 'neutral',
+    trendIndicators: null,
+    trendBias: 'neutral',
+    pausedUntil: 0,
+    pauseReason: null,
+    manualRearmRequired: false,
+    trendAgainst: false,
+    flowAgainst: false,
+    vetoCount: 0,
     ...patch,
     ts: patch.ts ?? Date.now(),
   };
@@ -1753,19 +1784,27 @@ function getTrendIndicatorBias(side, indicators) {
 
 function getMarketMinEdge(market, volScale = 1) {
   const base = Math.max(0.0015, Number(state.config.minEdge) || 0.02);
+  const durationMin = getMarketDurationMinutes(market);
+  const shortWindowBias = durationMin <= 5.5 ? 0.70
+    : durationMin <= 10.5 ? 0.82
+    : durationMin <= 20.5 ? 0.92
+    : 1.0;
   if (!market?.live && state.config.mode === 'SIM') {
     // SIM fallback prices are refreshed every 2s in discrete ticks, so a live-grade
     // 2¢ threshold suppresses almost every opportunity. Keep SIM strict, but scaled
     // to the coarser/staler simulated tape.
-    const simBase = Math.min(base, 0.004);
-    return Math.max(0.003, simBase * Math.min(1.10, volScale));
+    const simBase = Math.min(base, 0.0035);
+    const scaled = simBase * Math.min(1.08, volScale) * shortWindowBias;
+    return Math.max(0.002, Math.min(0.0035, scaled));
   }
   if (market?.live && state.config.mode === 'SIM') {
     // In SIM mode, live market prices are polled every 30s. A realistic BTC move
     // between polls is 0.05-0.3%, generating edge of 0.2-0.8% on a 5-30 min binary.
     // Cap live dynMinEdge to 0.4% so entries fire when Gamma lag creates meaningful
     // mispricing — previously 0.8% blocked most opportunities outside spike moments.
-    return Math.max(0.003, Math.min(base * 0.40, 0.004) * Math.min(1.20, volScale));
+    const liveBase = Math.min(base * 0.35, 0.0035);
+    const scaled = liveBase * Math.min(1.15, volScale) * shortWindowBias;
+    return Math.max(0.0025, Math.min(0.0035, scaled));
   }
   return base * volScale;
 }
