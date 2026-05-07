@@ -339,7 +339,7 @@ function PanelShell({ id, label, badge, onHide, children }) {
 }
 
 // ─── TOP BAR MOBILE ───────────────────────────────────────────────────────────
-function TopBarMobile({ status, market, connected, clock, onStart, onStop, onSettings, onOrder, actionPending }) {
+function TopBarMobile({ status, market, connected, clock, onStart, onStop, onSettings, onOrder, actionPending, altCharts }) {
   const up    = (market.btcChange24h ?? 0) >= 0;
   const stats = status.stats || {};
   const wr    = stats.totalTrades > 0 ? Math.round(stats.wins / stats.totalTrades * 100) : 0;
@@ -377,6 +377,18 @@ function TopBarMobile({ status, market, connected, clock, onStart, onStop, onSet
           <span className="mobile-stat-chip-label">BTC</span>
           <span className="mobile-stat-chip-val" style={{ color: up ? 'var(--green)' : 'var(--red)', fontSize: 14 }}>
             {market.btcPrice ? fmtPrice(market.btcPrice) : '—'}
+          </span>
+        </div>
+        <div className="mobile-stat-chip">
+          <span className="mobile-stat-chip-label">SOL</span>
+          <span className="mobile-stat-chip-val" style={{ color: '#9945ff', fontSize: 14 }}>
+            {altCharts?.SOL?.price ? `$${Number(altCharts.SOL.price).toLocaleString(undefined, { maximumFractionDigits: 2 })}` : '—'}
+          </span>
+        </div>
+        <div className="mobile-stat-chip">
+          <span className="mobile-stat-chip-label">ETH</span>
+          <span className="mobile-stat-chip-val" style={{ color: '#627eea', fontSize: 14 }}>
+            {altCharts?.ETH?.price ? `$${Number(altCharts.ETH.price).toLocaleString(undefined, { maximumFractionDigits: 2 })}` : '—'}
           </span>
         </div>
         <div className="mobile-stat-chip">
@@ -440,7 +452,7 @@ function MobileCard({ title, badge, defaultOpen = true, children, bodyStyle }) {
 }
 
 // ─── TOP BAR ─────────────────────────────────────────────────────────────────
-function TopBar({ status, market, connected, clock, onStart, onStop, onSettings, onLayout, actionPending }) {
+function TopBar({ status, market, connected, clock, onStart, onStop, onSettings, onLayout, actionPending, altCharts }) {
   const up    = (market.btcChange24h ?? 0) >= 0;
   const stats = status.stats || {};
   const wr    = stats.totalTrades > 0 ? Math.round(stats.wins / stats.totalTrades * 100) : 0;
@@ -467,6 +479,24 @@ function TopBar({ status, market, connected, clock, onStart, onStop, onSettings,
         </span>
         <span className="tb-price-chg" style={{ color: up ? 'var(--green)' : 'var(--red)' }}>
           {market.btcChange24h != null ? `${up ? '+' : ''}${market.btcChange24h.toFixed(2)}%` : ''}
+        </span>
+      </div>
+
+      <div className="tb-divider" />
+
+      <div className="tb-price">
+        <span style={{ fontSize: 8, color: 'var(--t3)', fontWeight: 700, letterSpacing: '0.08em' }}>SOL</span>
+        <span className="tb-price-val" style={{ color: '#9945ff', fontSize: 11 }}>
+          {altCharts?.SOL?.price ? `$${Number(altCharts.SOL.price).toLocaleString(undefined, { maximumFractionDigits: 2 })}` : '—'}
+        </span>
+      </div>
+
+      <div className="tb-divider" />
+
+      <div className="tb-price">
+        <span style={{ fontSize: 8, color: 'var(--t3)', fontWeight: 700, letterSpacing: '0.08em' }}>ETH</span>
+        <span className="tb-price-val" style={{ color: '#627eea', fontSize: 11 }}>
+          {altCharts?.ETH?.price ? `$${Number(altCharts.ETH.price).toLocaleString(undefined, { maximumFractionDigits: 2 })}` : '—'}
         </span>
       </div>
 
@@ -833,46 +863,10 @@ function MarketsBody({ markets }) {
 }
 
 // ─── BTC CHART BODY ───────────────────────────────────────────────────────────
-function BtcChartBody({ market, candles, currentCandle, altCharts }) {
+function BtcChartBody({ market, candles, currentCandle }) {
   const up   = (market.btcPrice || 0) >= (market.laggedPrice || market.btcPrice || 0);
   const diff = (market.btcPrice || 0) - (market.laggedPrice || market.btcPrice || 0);
   const pct  = market.laggedPrice > 0 ? (diff / market.laggedPrice * 100) : 0;
-
-  // ── Asset selector ──────────────────────────────────────────────────────────
-  const [chartAsset, setChartAsset] = useState('BTC');
-  const [altData, setAltData] = useState({});
-  const altFetchRef = useRef({});                     // { SOL: ts, ETH: ts } — debounce
-
-  const fetchAlt = useCallback((asset) => {
-    altFetchRef.current[asset] = Date.now();
-    api.getAltCandles(asset)
-      .then(d => setAltData(prev => ({ ...prev, [asset]: d })))
-      .catch(() => {});
-  }, []);
-
-  useEffect(() => {
-    fetchAlt('SOL');
-    fetchAlt('ETH');
-  }, [fetchAlt]);
-
-  useEffect(() => {
-    if (chartAsset === 'BTC') return;
-    fetchAlt(chartAsset);
-  }, [chartAsset, fetchAlt]);
-
-  // Refresh alt candles every 5s when live WS candles are expected, else every 15s
-  useEffect(() => {
-    if (chartAsset === 'BTC') return undefined;
-    const timer = setInterval(() => {
-      fetchAlt(chartAsset);
-    }, 5000);
-    return () => clearInterval(timer);
-  }, [chartAsset, fetchAlt]);
-
-  // Pick the right candle data
-  const displayCandles       = chartAsset === 'BTC' ? candles : ((altData[chartAsset]?.candles?.length ? altData[chartAsset]?.candles : altCharts?.[chartAsset]?.candles) ?? []);
-  const displayCurrentCandle = chartAsset === 'BTC' ? currentCandle : (altData[chartAsset]?.currentCandle ?? altCharts?.[chartAsset]?.currentCandle ?? null);
-  const altInfo = chartAsset === 'BTC' ? null : (altData[chartAsset] || altCharts?.[chartAsset] || null);
 
   const [indicatorToggles, setIndicatorToggles] = useState(() => {
     try {
@@ -903,85 +897,32 @@ function BtcChartBody({ market, candles, currentCandle, altCharts }) {
         padding: '4px 12px', background: 'var(--s2)', borderBottom: '1px solid var(--border)',
         display: 'flex', justifyContent: 'space-between', alignItems: 'center', flexWrap: 'wrap', gap: 8, flexShrink: 0,
       }}>
-        {/* ── Asset toggle ── */}
-        <div style={{ display: 'flex', gap: 4, alignItems: 'center' }}>
-          {['BTC', 'SOL', 'ETH'].map(a => (
-            <button key={a} type="button" onClick={() => setChartAsset(a)} style={{
-              border: `1px solid ${chartAsset === a ? 'var(--blue)' : 'var(--border)'}`,
-              background: chartAsset === a ? 'rgba(72,153,255,0.12)' : 'transparent',
-              color: chartAsset === a ? 'var(--blue)' : 'var(--t3)',
-              borderRadius: 4, padding: '2px 8px', fontSize: 8, fontWeight: 700,
-              cursor: 'pointer', letterSpacing: '0.06em',
-            }}>{a}</button>
-          ))}
-        </div>
         {/* ── Price / connection info ── */}
-        {chartAsset === 'BTC' ? (
-          <div style={{ display: 'flex', gap: 10, alignItems: 'center', fontSize: 8 }}>
-            <span style={{ fontWeight: 700, color: up ? 'var(--green)' : 'var(--red)' }}>
-              {up ? '▲' : '▼'} {Math.abs(pct).toFixed(3)}% vs lag
-            </span>
-            {market.priceSource === 'binance'
-              ? <span className="blink" style={{ color: 'var(--green)' }}>● LIVE</span>
-              : market.priceSource === 'binance-rest'
-                ? <span style={{ color: 'var(--amber)' }}>● REST</span>
-                : <span style={{ color: 'var(--red)' }}>● OFF</span>
-            }
-            <span style={{ color: 'var(--t3)' }}>candles 5s</span>
-          </div>
-        ) : (
-          <div style={{ display: 'flex', gap: 10, alignItems: 'center', fontSize: 8 }}>
-            <span style={{ fontWeight: 700, color: 'var(--t1)' }}>
-              {altInfo ? `$${altInfo.price?.toLocaleString(undefined, { maximumFractionDigits: 4 })}` : '—'}
-            </span>
-            <span style={{ color: 'var(--t3)' }}>
-              {altInfo?.source === 'live-ws' ? 'candles 5s · Binance WS' : 'candles 1m · Binance REST'}
-            </span>
-            {!altInfo && <span style={{ color: 'var(--amber)' }}>Carregando…</span>}
-          </div>
-        )}
-        {/* ── Poly odds (BTC only) / Alt Poly odds ── */}
+        <div style={{ display: 'flex', gap: 10, alignItems: 'center', fontSize: 8 }}>
+          <span style={{ fontWeight: 700, color: up ? 'var(--green)' : 'var(--red)' }}>
+            {up ? '▲' : '▼'} {Math.abs(pct).toFixed(3)}% vs lag
+          </span>
+          {market.priceSource === 'binance'
+            ? <span className="blink" style={{ color: 'var(--green)' }}>● LIVE</span>
+            : market.priceSource === 'binance-rest'
+              ? <span style={{ color: 'var(--amber)' }}>● REST</span>
+              : <span style={{ color: 'var(--red)' }}>● OFF</span>
+          }
+          <span style={{ color: 'var(--t3)' }}>candles 5s</span>
+        </div>
+        {/* ── Poly odds ── */}
         <div style={{ display: 'flex', gap: 12, alignItems: 'center', fontSize: 8 }}>
-          {chartAsset === 'BTC' ? (
-            <>
-              <span style={{ color: 'var(--t2)' }}>
-                IMPLIED <span style={{ color: (market.impliedProb || 0.5) > 0.5 ? 'var(--green)' : 'var(--red)', fontWeight: 700 }}>
-                  {((market.impliedProb || 0.5) * 100).toFixed(1)}¢
-                </span>
-              </span>
-              <span style={{ color: 'var(--t2)' }}>
-                POLY <span style={{ color: 'var(--t1)', fontWeight: 700 }}>{((market.polyOdds || 0.5) * 100).toFixed(1)}¢</span>
-              </span>
-              <span style={{ fontWeight: 700, color: Math.abs(market.edge || 0) > 0.03 ? ((market.edge || 0) > 0 ? 'var(--green)' : 'var(--red)') : 'var(--t3)' }}>
-                EDGE {fmtEdge(market.edge || 0)}
-              </span>
-            </>
-          ) : altInfo?.polyPrice != null ? (
-            <>
-              <span style={{ color: 'var(--t2)' }}>
-                POLY YES <span style={{ color: 'var(--t1)', fontWeight: 700 }}>
-                  {(altInfo.polyPrice * 100).toFixed(1)}¢
-                </span>
-              </span>
-              {altInfo?.impliedProb != null && (
-                <span style={{ color: 'var(--t2)' }}>
-                  IMPLIED <span style={{ color: (altInfo.impliedProb || 0.5) > 0.5 ? 'var(--green)' : 'var(--red)', fontWeight: 700 }}>
-                    {(altInfo.impliedProb * 100).toFixed(1)}¢
-                  </span>
-                </span>
-              )}
-              {altInfo?.edge != null && (
-                <span style={{ fontWeight: 700, color: Math.abs(altInfo.edge || 0) > 0.03 ? ((altInfo.edge || 0) > 0 ? 'var(--green)' : 'var(--red)') : 'var(--t3)' }}>
-                  EDGE {fmtEdge(altInfo.edge || 0)}
-                </span>
-              )}
-              {altInfo?.polyQuestion && (
-                <span style={{ color: 'var(--t3)', maxWidth: 160, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
-                  {altInfo.polyQuestion}
-                </span>
-              )}
-            </>
-          ) : null}
+          <span style={{ color: 'var(--t2)' }}>
+            IMPLIED <span style={{ color: (market.impliedProb || 0.5) > 0.5 ? 'var(--green)' : 'var(--red)', fontWeight: 700 }}>
+              {((market.impliedProb || 0.5) * 100).toFixed(1)}¢
+            </span>
+          </span>
+          <span style={{ color: 'var(--t2)' }}>
+            POLY <span style={{ color: 'var(--t1)', fontWeight: 700 }}>{((market.polyOdds || 0.5) * 100).toFixed(1)}¢</span>
+          </span>
+          <span style={{ fontWeight: 700, color: Math.abs(market.edge || 0) > 0.03 ? ((market.edge || 0) > 0 ? 'var(--green)' : 'var(--red)') : 'var(--t3)' }}>
+            EDGE {fmtEdge(market.edge || 0)}
+          </span>
         </div>
         {/* ── Indicator toggles ── */}
         <div style={{ display: 'flex', gap: 6, alignItems: 'center', flexWrap: 'wrap' }}>
@@ -996,13 +937,9 @@ function BtcChartBody({ market, candles, currentCandle, altCharts }) {
                   border: `1px solid ${active ? indicator.color : 'var(--border)'}`,
                   background: active ? `${indicator.color}18` : 'transparent',
                   color: active ? indicator.color : 'var(--t3)',
-                  borderRadius: 999,
-                  padding: '3px 8px',
-                  fontSize: 8,
-                  fontWeight: 700,
-                  letterSpacing: '0.05em',
-                  cursor: 'pointer',
-                  transition: 'all .15s ease',
+                  borderRadius: 999, padding: '3px 8px',
+                  fontSize: 8, fontWeight: 700, letterSpacing: '0.05em',
+                  cursor: 'pointer', transition: 'all .15s ease',
                 }}
                 title={active ? `Ocultar ${indicator.label}` : `Mostrar ${indicator.label}`}
               >
@@ -1013,10 +950,10 @@ function BtcChartBody({ market, candles, currentCandle, altCharts }) {
         </div>
       </div>
       <div style={{ flex: 1, minHeight: 0 }}>
-        {displayCandles.length > 0 || displayCurrentCandle
-          ? <CandleChart key={chartAsset} candles={displayCandles} currentCandle={displayCurrentCandle} indicators={indicatorToggles} />
+        {candles.length > 0 || currentCandle
+          ? <CandleChart candles={candles} currentCandle={currentCandle} indicators={indicatorToggles} />
           : <div style={{ height: '100%', display: 'flex', alignItems: 'center', justifyContent: 'center', color: 'var(--t2)', fontSize: 10 }}>
-              {chartAsset === 'BTC' ? 'Aguardando dados do Binance…' : `Carregando ${chartAsset}/USDT…`}
+              Aguardando dados do Binance…
             </div>
         }
       </div>
@@ -1045,7 +982,8 @@ function AltAssetChartBody({ asset, altCharts }) {
 
   useEffect(() => {
     fetchData();
-    const timer = setInterval(fetchData, 5000);
+    // Poll every 1s — same cadence as BTC candle refresh
+    const timer = setInterval(fetchData, 1000);
     return () => clearInterval(timer);
   }, [fetchData]);
 
@@ -1055,9 +993,15 @@ function AltAssetChartBody({ asset, altCharts }) {
 
   const toggleIndicator = (key) => setIndicatorToggles(prev => ({ ...prev, [key]: !prev[key] }));
 
-  const displayCandles       = (altData?.candles?.length ? altData.candles : altCharts?.[asset]?.candles) ?? [];
-  const displayCurrentCandle = altData?.currentCandle ?? altCharts?.[asset]?.currentCandle ?? null;
-  const info                 = altData || altCharts?.[asset] || null;
+  // Prefer WS-live altCharts candles (real-time) over HTTP-polled altData when WS is warm
+  const wsCandles      = altCharts?.[asset]?.candles;
+  const wsCurrentCandle = altCharts?.[asset]?.currentCandle;
+  const displayCandles       = (wsCandles?.length ? wsCandles : altData?.candles) ?? [];
+  const displayCurrentCandle = wsCurrentCandle ?? altData?.currentCandle ?? null;
+  // Merge metadata: use altData for price/edge/poly (fresher from 1s poll), WS for source indicator
+  const info = altData
+    ? { ...altData, source: wsCandles?.length ? 'live-ws' : altData.source }
+    : altCharts?.[asset] || null;
 
   const indicatorMeta = [
     { key: 'bollinger', label: 'BB',     color: '#ff6b7f' },
@@ -1727,7 +1671,7 @@ export default function App() {
     switch (id) {
       case 'signal':    return <SignalBody signal={signal} market={market} status={status} onManualTrade={manualTrade} />;
       case 'markets':   return <MarketsBody markets={markets} />;
-      case 'chart':     return <BtcChartBody market={market} candles={candles} currentCandle={currentCandle} altCharts={altCharts} />;
+      case 'chart':     return <BtcChartBody market={market} candles={candles} currentCandle={currentCandle} />;
       case 'chart-sol': return <AltAssetChartBody asset="SOL" altCharts={altCharts} />;
       case 'chart-eth': return <AltAssetChartBody asset="ETH" altCharts={altCharts} />;
       case 'edge':      return <EdgeChartBody market={market} />;
@@ -1775,7 +1719,7 @@ export default function App() {
             bodyStyle={{ height: 320, display: 'flex', flexDirection: 'column' }}
           >
             <div className="mobile-chart-wrap">
-              <BtcChartBody market={market} candles={candles} currentCandle={currentCandle} altCharts={altCharts} />
+              <BtcChartBody market={market} candles={candles} currentCandle={currentCandle} />
             </div>
           </MobileCard>
         );
@@ -1906,6 +1850,7 @@ export default function App() {
           onOrder={() => setShowMobileOrder(true)}
           onSettings={() => setShowConfig(true)}
           actionPending={actionPending}
+          altCharts={altCharts}
         />
         {errorBanner}
         <div className="mobile-body">
@@ -2038,6 +1983,7 @@ export default function App() {
         onSettings={() => setShowConfig(true)}
         onLayout={() => setShowLayout(v => !v)}
         actionPending={actionPending}
+        altCharts={altCharts}
       />
 
       {errorBanner}
