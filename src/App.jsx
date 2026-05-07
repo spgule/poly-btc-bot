@@ -206,6 +206,12 @@ function useBot() {
             setMarket(d => ({ ...d, ...msg.data }));
             if (msg.data.candles?.length) setCandles(msg.data.candles);
             if (msg.data.currentCandle)   setCurrentCandle(msg.data.currentCandle);
+            if (msg.data.altCharts) {
+              setAltCharts(prev => ({
+                SOL: msg.data.altCharts.SOL ?? prev.SOL,
+                ETH: msg.data.altCharts.ETH ?? prev.ETH,
+              }));
+            }
             break;
           case 'CONNECTION':
             setStatus(d => ({ ...d, binanceConnected: msg.data.binanceConnected, priceSource: msg.data.priceSource }));

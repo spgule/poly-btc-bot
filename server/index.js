@@ -3732,6 +3732,32 @@ function _legacySimTrade_unused(signal) {
   void signal;
 }
 
+function buildAltChartSnapshot(asset) {
+  const assetKey = String(asset || '').toUpperCase();
+  if (!['SOL', 'ETH'].includes(assetKey)) return null;
+  const candles = assetKey === 'SOL' ? state.solCandles : state.ethCandles;
+  const currentCandle = assetKey === 'SOL' ? state.solCurrentCandle : state.ethCurrentCandle;
+  const price = assetKey === 'SOL' ? state.solPrice : state.ethPrice;
+  const connected = assetKey === 'SOL' ? state.solConnected : state.ethConnected;
+  const altMkt = getBestMarket(false, assetKey)
+    || state.markets
+      .filter(m => (m.asset || 'BTC').toUpperCase() === assetKey)
+      .sort((a, b) => getMarketLiquidityValue(b) - getMarketLiquidityValue(a))[0]
+    || null;
+  const edgeCtx = computeEdge(altMkt);
+  return {
+    candles: (candles || []).slice(-300),
+    currentCandle: currentCandle || null,
+    price: price || 0,
+    polyPrice: altMkt?.outcomePrices?.[0] ?? null,
+    polyQuestion: altMkt?.question?.slice(0, 80) ?? null,
+    impliedProb: edgeCtx.implied,
+    polyOdds: edgeCtx.poly,
+    edge: edgeCtx.edge,
+    source: connected && (candles?.length || 0) >= 2 ? 'live-ws' : 'rest',
+  };
+}
+
 // ── BROADCASTS ────────────────────────────────────────────────────────────────
 function broadcastMarketData() {
   const mkt            = getActiveSignalMarket();
@@ -3753,6 +3779,10 @@ function broadcastMarketData() {
       edgeHistory,
       priceChart:   state.priceChart.slice(-100),
       currentCandle:state.currentCandle,
+      altCharts: {
+        SOL: buildAltChartSnapshot('SOL'),
+        ETH: buildAltChartSnapshot('ETH'),
+      },
       bollinger:    computeBollinger(),
       trendIndicators: computeChartTrendIndicators(),
       priceSource:  state.priceSource,
@@ -4191,6 +4221,10 @@ wss.on('connection', (ws) => {
     priceChart: state.priceChart.slice(-100),
     candles: state.candles.slice(-300),
     currentCandle: state.currentCandle,
+    altCharts: {
+      SOL: buildAltChartSnapshot('SOL'),
+      ETH: buildAltChartSnapshot('ETH'),
+    },
     trendIndicators: computeChartTrendIndicators(),
     priceSource: state.priceSource, timestamp: Date.now(),
   }}));
