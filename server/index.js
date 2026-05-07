@@ -410,6 +410,24 @@ const state = {
     flowAgainst: false,
     vetoCount: 0,
   },
+  // ── SOL state (mirrors BTC state for multi-asset trading) ───────────────────
+  solPrice:          0,
+  solPriceCoalesced: 0,
+  _solCoalesceWin:   { sumPQ: 0, sumQ: 0, start: 0 },
+  solPriceHistory:   [],
+  solCandles:        [],
+  solCurrentCandle:  null,
+  solConnected:      false,
+
+  // ── ETH state (mirrors BTC state for multi-asset trading) ───────────────────
+  ethPrice:          0,
+  ethPriceCoalesced: 0,
+  _ethCoalesceWin:   { sumPQ: 0, sumQ: 0, start: 0 },
+  ethPriceHistory:   [],
+  ethCandles:        [],
+  ethCurrentCandle:  null,
+  ethConnected:      false,
+
   binanceConnected: false,
   priceSource:      'binance',  // 'binance' | 'binance-rest' | 'unavailable'
   lastPriceChartTs: 0,
@@ -432,6 +450,62 @@ function addChartPoint(price, time) {
     if (state.priceChart.length > 300) state.priceChart.shift();
     state.lastPriceChartTs = time;
   }
+}
+
+// ── PER-ASSET ROUTING HELPERS ─────────────────────────────────────────────────
+// Route price/history/candle reads to the correct asset based on market.asset.
+// BTC is the default (backward-compatible).
+
+function getAssetKey(market) {
+  return (market?.asset || 'BTC').toUpperCase();
+}
+
+function getAssetPrice(market) {
+  const a = getAssetKey(market);
+  if (a === 'SOL') return state.solPrice > 0 ? state.solPrice : state.btcPrice;
+  if (a === 'ETH') return state.ethPrice > 0 ? state.ethPrice : state.btcPrice;
+  return state.btcPrice;
+}
+
+function getAssetPriceCoalesced(market) {
+  const a = getAssetKey(market);
+  if (a === 'SOL') return (state.solPriceCoalesced > 0 ? state.solPriceCoalesced : state.solPrice) || state.btcPriceCoalesced;
+  if (a === 'ETH') return (state.ethPriceCoalesced > 0 ? state.ethPriceCoalesced : state.ethPrice) || state.btcPriceCoalesced;
+  return state.btcPriceCoalesced > 0 ? state.btcPriceCoalesced : state.btcPrice;
+}
+
+function getAssetPriceHistory(market) {
+  const a = getAssetKey(market);
+  if (a === 'SOL') return state.solPriceHistory;
+  if (a === 'ETH') return state.ethPriceHistory;
+  return state.priceHistory;
+}
+
+function getAssetCandles(market) {
+  const a = getAssetKey(market);
+  if (a === 'SOL') return state.solCandles;
+  if (a === 'ETH') return state.ethCandles;
+  return state.candles;
+}
+
+function getAssetCurrentCandle(market) {
+  const a = getAssetKey(market);
+  if (a === 'SOL') return state.solCurrentCandle;
+  if (a === 'ETH') return state.ethCurrentCandle;
+  return state.currentCandle;
+}
+
+// Get the live price at a given msAgo for a given history array.
+function getPriceAtFromHistory(history, msAgo, fallback = 0) {
+  if (!history || history.length === 0) return fallback;
+  const target = Date.now() - msAgo;
+  let closest = history[0];
+  let minDiff  = Math.abs(closest.time - target);
+  for (const p of history) {
+    const d = Math.abs(p.time - target);
+    if (d < minDiff) { minDiff = d; closest = p; }
+  }
+  return closest.price;
 }
 
 function seedMinimalChartState(price, now = Date.now(), priceSource = state.priceSource) {
@@ -909,6 +983,202 @@ function connectBinance() {
   });
 }
 
+// ── ALT-ASSET BINANCE WS ──────────────────────────────────────────────────────
+// Connects to Binance aggTrade stream for SOL or ETH.
+// Updates state.sol*/state.eth* price, history, candles, and coalesce window.
+const altWsTimers = {};
+const altWsUrlIndex = {};
+
+function connectAltAsset(symbol, assetKey) {
+  const KEY = assetKey.toUpperCase(); // 'SOL' or 'ETH'
+  const priceKey     = KEY === 'SOL' ? 'solPrice'     : 'ethPrice';
+  const coalKey      = KEY === 'SOL' ? 'solPriceCoalesced' : 'ethPriceCoalesced';
+  const coalWinKey   = KEY === 'SOL' ? '_solCoalesceWin' : '_ethCoalesceWin';
+  const histKey      = KEY === 'SOL' ? 'solPriceHistory' : 'ethPriceHistory';
+  const candlesKey   = KEY === 'SOL' ? 'solCandles'   : 'ethCandles';
+  const curCandleKey = KEY === 'SOL' ? 'solCurrentCandle' : 'ethCurrentCandle';
+  const connKey      = KEY === 'SOL' ? 'solConnected' : 'ethConnected';
+
+  if (!altWsUrlIndex[KEY]) altWsUrlIndex[KEY] = 0;
+  const wsUrl = `wss://data-stream.binance.vision/ws/${symbol.toLowerCase()}@aggTrade`;
+  const ws = new WebSocket(wsUrl);
+  let socketOpenedAt = 0;
+  let sawRealTick = false;
+  let lastWsMsg = 0;
+
+  ws.on('open', () => {
+    socketOpenedAt = Date.now();
+    state[connKey] = false;
+    console.log(`[Binance WS] ${KEY} connected: ${wsUrl}`);
+  });
+
+  ws.on('message', (raw) => {
+    try {
+      const msg = JSON.parse(raw);
+      const price = parseFloat(msg.p);
+      if (!price || isNaN(price)) return;
+      sawRealTick = true;
+      lastWsMsg = Date.now();
+      state[connKey] = true;
+      state[priceKey] = price;
+      const now = Date.now();
+      const qty = parseFloat(msg.q || 0);
+
+      // Price history (5-min window)
+      state[histKey].push({ price, time: now });
+      state[histKey] = state[histKey].filter(p => now - p.time <= PRICE_HIST_MS);
+
+      // 5s OHLCV candles
+      updateCandleForAsset(price, now, qty, candlesKey, curCandleKey);
+
+      // 100ms VWAP coalescing
+      const w = state[coalWinKey];
+      const tickW = Math.max(qty, 0.0001);
+      if (now - w.start > 100) {
+        if (w.sumQ > 0) state[coalKey] = Math.round((w.sumPQ / w.sumQ) * 100) / 100;
+        w.sumPQ = price * tickW;
+        w.sumQ  = tickW;
+        w.start = now;
+      } else {
+        w.sumPQ += price * tickW;
+        w.sumQ  += tickW;
+      }
+    } catch (e) { /* ignore */ }
+  });
+
+  ws.on('error', (err) => {
+    console.error(`[Binance WS] ${KEY} error:`, err.message);
+    try { ws.terminate(); } catch (_) {}
+  });
+
+  const hbGuard = setInterval(() => {
+    const noFirst = socketOpenedAt > 0 && !sawRealTick && Date.now() - socketOpenedAt > 10000;
+    const stale   = sawRealTick && Date.now() - lastWsMsg > 15000;
+    if (noFirst || stale) {
+      console.warn(`[Binance WS] ${KEY} stale — reconnecting`);
+      state[connKey] = false;
+      clearInterval(hbGuard);
+      altWsTimers[KEY] = setTimeout(() => connectAltAsset(symbol, KEY), 1000);
+      try { ws.terminate(); } catch (_) {}
+    }
+  }, 5000);
+
+  ws.on('close', () => {
+    clearInterval(hbGuard);
+    state[connKey] = false;
+    console.log(`[Binance WS] ${KEY} disconnected — reconnecting in 4s`);
+    altWsTimers[KEY] = setTimeout(() => connectAltAsset(symbol, KEY), 4000);
+  });
+}
+
+// Update a 5s OHLCV candle for a given asset using keyed state properties.
+function updateCandleForAsset(price, now, qty, candlesKey, curCandleKey) {
+  const CANDLE_MS = 5000;
+  const candleTime = Math.floor(now / CANDLE_MS) * CANDLE_MS;
+  let cur = state[curCandleKey];
+  if (!cur || cur.time !== candleTime) {
+    if (cur) {
+      state[candlesKey].push(cur);
+      if (state[candlesKey].length > 300) state[candlesKey].shift();
+    }
+    state[curCandleKey] = {
+      time: candleTime,
+      open: price, high: price, low: price, close: price,
+      volume: qty, ticks: 1,
+    };
+  } else {
+    cur.high = Math.max(cur.high, price);
+    cur.low  = Math.min(cur.low,  price);
+    cur.close = price;
+    cur.volume += qty;
+    cur.ticks  += 1;
+  }
+}
+
+// Fetch live Polymarket markets for SOL or ETH, tag with market.asset, merge into state.markets.
+async function fetchAltMarkets(asset, keyword) {
+  const KEY = asset.toUpperCase();
+  try {
+    const fetches = [
+      axios.get(`${POLY_GAMMA}/markets`, {
+        params: { active: true, closed: false, limit: 300, order: 'volume', ascending: false },
+        timeout: 15000,
+        headers: { 'User-Agent': 'poly-btc-bot/1.0' },
+      }).catch(() => null),
+      axios.get(`${POLY_GAMMA}/markets`, {
+        params: { active: true, closed: false, limit: 200, order: 'startDate', ascending: false },
+        timeout: 10000,
+      }).catch(() => null),
+    ];
+    const responses = await Promise.all(fetches);
+
+    const seen = new Set();
+    const altRaw = [];
+    for (const resp of responses) {
+      if (!resp) continue;
+      const arr = Array.isArray(resp.data) ? resp.data : (resp.data?.markets || resp.data?.results || []);
+      for (const m of arr) {
+        const q = (m.question || m.title || '').toLowerCase();
+        if (!q.includes(keyword)) continue;
+        if (q.includes('btc') || q.includes('bitcoin')) continue;
+        if (seen.has(m.id)) continue;
+        seen.add(m.id);
+        altRaw.push(m);
+      }
+    }
+
+    if (altRaw.length === 0) {
+      console.log(`[Polymarket] No live ${KEY} markets found — SIM only`);
+      return;
+    }
+
+    // Map to internal format (same as fetchBTCMarkets mapMarket)
+    const newAltMarkets = [];
+    for (const m of altRaw) {
+      try {
+        const prices = Array.isArray(m.outcomePrices)
+          ? m.outcomePrices.map(Number)
+          : JSON.parse(m.outcomePrices || '[0.5,0.5]').map(Number);
+        if (!prices.length || !Number.isFinite(prices[0])) continue;
+        const vol = Number(m.volume || m.volumeNum || 0);
+        if (vol < 50000) continue; // minimum volume filter
+        const endDate = m.endDate || m.gameStartTime;
+        const startDate = m.startDate;
+        if (!endDate) continue;
+        const minutesLeft = (new Date(endDate).getTime() - Date.now()) / 60000;
+        if (minutesLeft <= 0 || minutesLeft > 1440) continue;
+        newAltMarkets.push({
+          id: m.id,
+          question: m.question || m.title,
+          outcomes: m.outcomes || ['Yes', 'No'],
+          outcomePrices: [
+            Math.round(prices[0] * 10000) / 10000,
+            Math.round((1 - prices[0]) * 10000) / 10000,
+          ],
+          volume: vol,
+          startDate,
+          endDate,
+          live: true,
+          asset: KEY,
+          clobTokenIds: m.clobTokenIds,
+          priceIsEstimated: false,
+        });
+      } catch (_) { continue; }
+    }
+
+    if (newAltMarkets.length === 0) return;
+
+    // Merge: remove old live alt markets for this asset, add new ones
+    state.markets = [
+      ...state.markets.filter(m => !(m.live && (m.asset || 'BTC').toUpperCase() === KEY)),
+      ...newAltMarkets,
+    ];
+    console.log(`[Polymarket] ${KEY} live markets loaded: ${newAltMarkets.length}`);
+  } catch (err) {
+    console.error(`[Polymarket] fetchAltMarkets(${KEY}) error:`, err.message);
+  }
+}
+
 let polyMarketWs = null;
 let polyMarketPingTimer = null;
 let polyMarketReconnectTimer = null;
@@ -1322,6 +1592,7 @@ async function fetchBTCMarkets() {
         endDate: m.endDateIso || m.endDate || m.end_date_iso,
         clobTokenIds: parseClobTokenIds(m.clobTokenIds || m.clob_token_ids || m.asset_ids || []),
         live: true,
+        asset: 'BTC',
         _score: score,
         priceIsEstimated,
         // Snapshot BTC price at market window open (used as strike for Up/Down markets).
@@ -1343,7 +1614,9 @@ async function fetchBTCMarkets() {
     mapped.sort((a, b) => b._score - a._score || b.volume - a.volume);
 
     const existingSim = state.markets.filter(m => m.id && m.id.startsWith('sim-'));
-    state.markets = [...mapped, ...existingSim];
+    // Also preserve live SOL/ETH markets fetched by fetchAltMarkets
+    const existingAlt = state.markets.filter(m => m.live && m.asset && m.asset !== 'BTC');
+    state.markets = [...mapped, ...existingAlt, ...existingSim];
     applyPolyLivePrices();
     const top = mapped[0];
     console.log(`[Polymarket] Loaded ${mapped.length} real BTC markets | top: "${top.question}" price=${top.outcomePrices[0]} vol=$${top.volume.toLocaleString()}`);
@@ -1450,11 +1723,96 @@ function seedSimMarkets() {
         startDate,
         endDate,
         live: false,
+        asset: 'BTC',
         _strikeSnapshot: simStrike,
       };
     }),
   ];
   console.log(`[Polymarket] Sim markets seeded — Up/Down format, ${slots.length} markets, window start ${fmtET(alignedStartMs)} ET`);
+}
+
+// Seed SIM markets for SOL or ETH — identical structure to BTC but uses asset name/price.
+function seedSimMarketsForAsset(asset, assetPrice) {
+  if (!asset || !assetPrice || assetPrice <= 0) return;
+  const assetUpper = asset.toUpperCase();
+  const assetLabel = assetUpper === 'SOL' ? 'Solana' : assetUpper === 'ETH' ? 'Ethereum' : assetUpper;
+
+  // Remove any existing SIM markets for this asset (but keep BTC and other assets)
+  state.markets = state.markets.filter(m => {
+    if (m.live) return true;
+    const mAsset = (m.asset || 'BTC').toUpperCase();
+    return mAsset !== assetUpper;
+  });
+
+  const nowMs = Date.now();
+  const FIVE_MIN = 5 * 60000;
+  const alignedStartMs = Math.ceil(nowMs / FIVE_MIN) * FIVE_MIN;
+
+  function fmtET(ms) {
+    try {
+      const parts = new Intl.DateTimeFormat('en-US', {
+        timeZone: 'America/New_York',
+        hour: 'numeric', minute: '2-digit', hour12: true,
+      }).formatToParts(new Date(ms));
+      const hour      = (parts.find(p => p.type === 'hour') || {}).value || '0';
+      const minute    = (parts.find(p => p.type === 'minute') || {}).value || '00';
+      const dayPeriod = ((parts.find(p => p.type === 'dayPeriod') || {}).value || '').toUpperCase();
+      const hourClean = hour.replace(/\s?(AM|PM)$/i, '');
+      const meridiem  = dayPeriod || (/PM/i.test(hour) ? 'PM' : 'AM');
+      return `${hourClean}:${minute}${meridiem}`;
+    } catch (_) {
+      const d = new Date(ms);
+      const etOffset = -5;
+      const etHour = (d.getUTCHours() + 24 + etOffset) % 24;
+      const meridiem = etHour >= 12 ? 'PM' : 'AM';
+      const h = etHour % 12 || 12;
+      const m = String(d.getUTCMinutes()).padStart(2, '0');
+      return `${h}:${m}${meridiem}`;
+    }
+  }
+
+  let dateLabel;
+  try {
+    dateLabel = new Intl.DateTimeFormat('en-US', {
+      timeZone: 'America/New_York', month: 'short', day: 'numeric',
+    }).format(new Date(alignedStartMs));
+  } catch (_) {
+    const d = new Date(alignedStartMs);
+    const months = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'];
+    dateLabel = `${months[d.getUTCMonth()]} ${d.getUTCDate()}`;
+  }
+
+  const slots = [
+    { id: `sim-${assetUpper.toLowerCase()}-1`, minutes: 5,  volume: 60000 },
+    { id: `sim-${assetUpper.toLowerCase()}-2`, minutes: 10, volume: 55000 },
+    { id: `sim-${assetUpper.toLowerCase()}-3`, minutes: 15, volume: 60000 },
+    { id: `sim-${assetUpper.toLowerCase()}-4`, minutes: 20, volume: 52000 },
+    { id: `sim-${assetUpper.toLowerCase()}-5`, minutes: 25, volume: 50000 },
+    { id: `sim-${assetUpper.toLowerCase()}-6`, minutes: 30, volume: 50000 },
+  ];
+
+  const simStrike = assetPrice;
+  const newMarkets = slots.map(({ id, minutes, volume }) => {
+    const endMs    = alignedStartMs + minutes * 60000;
+    const startDate = new Date(alignedStartMs).toISOString();
+    const endDate   = new Date(endMs).toISOString();
+    const question  = `${assetLabel} Up or Down - ${dateLabel}, ${fmtET(alignedStartMs)}-${fmtET(endMs)} ET`;
+    return {
+      id,
+      question,
+      outcomes: ['Yes', 'No'],
+      outcomePrices: [0.5, 0.5],
+      volume,
+      startDate,
+      endDate,
+      live: false,
+      asset: assetUpper,
+      _strikeSnapshot: simStrike,
+    };
+  });
+
+  state.markets = [...state.markets, ...newMarkets];
+  console.log(`[Polymarket] ${assetUpper} sim markets seeded — ${slots.length} markets @ $${assetPrice.toFixed(2)}`);
 }
 
 // ── PRICE HELPERS ─────────────────────────────────────────────────────────────
@@ -1541,8 +1899,9 @@ function hasUsableSimMarket(now = Date.now()) {
     if (m.live) return false;
     if (!isValidTradingMarket(m)) return false;
     const minutesLeft = getMarketMinutesLeft(m, now);
+    const assetPrice = getAssetPrice(m);
     const strike = getSimStrike(m);
-    const strikeGap = strike && state.btcPrice ? Math.abs(strike - state.btcPrice) / state.btcPrice : 0;
+    const strikeGap = strike && assetPrice ? Math.abs(strike - assetPrice) / assetPrice : 0;
     return (
       minutesLeft >= 2 &&
       minutesLeft <= 30.5 &&
@@ -1557,8 +1916,9 @@ function pickBestSimMarket(now = Date.now()) {
     if (m.live) return false;
     if (!isValidTradingMarket(m)) return false;
     const minutesLeft = getMarketMinutesLeft(m, now);
+    const assetPrice = getAssetPrice(m);
     const strike = getSimStrike(m);
-    const strikeGap = strike && state.btcPrice ? Math.abs(strike - state.btcPrice) / state.btcPrice : 0;
+    const strikeGap = strike && assetPrice ? Math.abs(strike - assetPrice) / assetPrice : 0;
     return (
       minutesLeft >= 2 &&
       minutesLeft <= 30.5 &&
@@ -1568,18 +1928,20 @@ function pickBestSimMarket(now = Date.now()) {
   });
   if (sims.length === 0) return null;
   return sims.sort((a, b) => {
-    const aStrike = getSimStrike(a) ?? state.btcPrice;
-    const bStrike = getSimStrike(b) ?? state.btcPrice;
-    const aStrikeGap = Math.abs(aStrike - state.btcPrice);
-    const bStrikeGap = Math.abs(bStrike - state.btcPrice);
+    const aAssetPrice = getAssetPrice(a);
+    const bAssetPrice = getAssetPrice(b);
+    const aStrike = getSimStrike(a) ?? aAssetPrice;
+    const bStrike = getSimStrike(b) ?? bAssetPrice;
+    const aStrikeGap = Math.abs(aStrike - aAssetPrice);
+    const bStrikeGap = Math.abs(bStrike - bAssetPrice);
     // Prefer shorter-duration markets (same priority as getBestMarket timeScore)
     const aDuration = getMarketDurationMinutes(a);
     const bDuration = getMarketDurationMinutes(b);
     const aTimeScore = aDuration <= 5.5 ? 4 : aDuration <= 10.5 ? 3 : aDuration <= 20.5 ? 2 : 1;
     const bTimeScore = bDuration <= 5.5 ? 4 : bDuration <= 10.5 ? 3 : bDuration <= 20.5 ? 2 : 1;
     if (bTimeScore !== aTimeScore) return bTimeScore - aTimeScore;
-    const aScore = getMarketPriceDistance(a) + aStrikeGap / Math.max(1, state.btcPrice) + getMarketMinutesLeft(a, now) / 1000;
-    const bScore = getMarketPriceDistance(b) + bStrikeGap / Math.max(1, state.btcPrice) + getMarketMinutesLeft(b, now) / 1000;
+    const aScore = getMarketPriceDistance(a) + aStrikeGap / Math.max(1, aAssetPrice) + getMarketMinutesLeft(a, now) / 1000;
+    const bScore = getMarketPriceDistance(b) + bStrikeGap / Math.max(1, bAssetPrice) + getMarketMinutesLeft(b, now) / 1000;
     return aScore - bScore;
   })[0];
 }
@@ -1658,9 +2020,9 @@ function pctChange(cur, ref, clipPct = 0.008) {
 
 // Recent realised volatility: stdev of 1s returns over msWindow.
 // Used to scale sigmoid sensitivity and dynamic edge threshold.
-function recentVolatility(msWindow = 30000) {
+function recentVolatilityFromHistory(history, msWindow = 30000) {
   const now = Date.now();
-  const pts  = state.priceHistory.filter(p => now - p.time <= msWindow);
+  const pts  = (history || state.priceHistory).filter(p => now - p.time <= msWindow);
   if (pts.length < 4) return 0.0010; // default ~10bps/s
   const returns = [];
   for (let i = 1; i < pts.length; i++) {
@@ -1673,9 +2035,15 @@ function recentVolatility(msWindow = 30000) {
   return Math.sqrt(variance) || 0.0001;
 }
 
-function computeBollinger(period = 20, mult = 2) {
-  const closed = state.candles.slice(-Math.max(0, period - 1)).map(c => Number(c.close)).filter(Number.isFinite);
-  const currentClose = Number(state.currentCandle?.close);
+function recentVolatility(msWindow = 30000) {
+  return recentVolatilityFromHistory(state.priceHistory, msWindow);
+}
+
+function computeBollinger(period = 20, mult = 2, candlesArg = null, currentCandleArg = undefined) {
+  const candlesSrc = candlesArg ?? state.candles;
+  const currentSrc = currentCandleArg !== undefined ? currentCandleArg : state.currentCandle;
+  const closed = candlesSrc.slice(-Math.max(0, period - 1)).map(c => Number(c.close)).filter(Number.isFinite);
+  const currentClose = Number(currentSrc?.close);
   const closes = Number.isFinite(currentClose) ? [...closed, currentClose] : closed;
   if (closes.length < period) return null;
 
@@ -1720,10 +2088,12 @@ function getBollingerBias(side, bollinger) {
   return 'neutral';
 }
 
-function getChartIndicatorRows(limit = 300) {
-  const candles = state.currentCandle
-    ? [...state.candles.slice(-limit), state.currentCandle]
-    : state.candles.slice(-limit);
+function getChartIndicatorRows(limit = 300, candlesArg = null, currentCandleArg = undefined) {
+  const candlesSrc = candlesArg ?? state.candles;
+  const currentSrc = currentCandleArg !== undefined ? currentCandleArg : state.currentCandle;
+  const candles = currentSrc
+    ? [...candlesSrc.slice(-limit), currentSrc]
+    : candlesSrc.slice(-limit);
   return candles
     .filter(Boolean)
     .map((candle) => {
@@ -1743,8 +2113,8 @@ function getChartIndicatorRows(limit = 300) {
     .filter(row => [row.open, row.high, row.low, row.close].every(Number.isFinite));
 }
 
-function computeChartTrendIndicators() {
-  const rows = getChartIndicatorRows();
+function computeChartTrendIndicators(candlesArg = null, currentCandleArg = undefined) {
+  const rows = getChartIndicatorRows(300, candlesArg, currentCandleArg);
   if (rows.length < 21) return null;
 
   const calcEmaValue = (period) => {
@@ -1792,8 +2162,8 @@ function getTrendIndicatorBias(side, indicators) {
   return 'neutral';
 }
 
-function computeFibContext(side, lookback = 80) {
-  const rows = getChartIndicatorRows(lookback);
+function computeFibContext(side, lookback = 80, candlesArg = null, currentCandleArg = undefined) {
+  const rows = getChartIndicatorRows(lookback, candlesArg, currentCandleArg);
   if (rows.length < 24) return null;
 
   const current = rows[rows.length - 1]?.close;
@@ -1933,14 +2303,17 @@ function getMarketMinEdge(market, volScale = 1) {
 function buildSignalContext(market, now = Date.now()) {
   if (!market) return null;
   const { implied, poly, edge } = computeEdge(market);
-  const volScale = Math.max(1.0, Math.min(1.5, recentVolatility(20000) / 0.0015));
+  const assetHistory = getAssetPriceHistory(market);
+  const assetCandles = getAssetCandles(market);
+  const assetCurrentCandle = getAssetCurrentCandle(market);
+  const volScale = Math.max(1.0, Math.min(1.5, recentVolatilityFromHistory(assetHistory, 20000) / 0.0015));
   const dynMinEdge = getMarketMinEdge(market, volScale);
   const side = edge > 0 ? 'BUY_YES' : 'BUY_NO';
-  const bollinger = computeBollinger();
+  const bollinger = computeBollinger(20, 2, assetCandles, assetCurrentCandle);
   const bollingerBias = getBollingerBias(side, bollinger);
-  const trendIndicators = computeChartTrendIndicators();
+  const trendIndicators = computeChartTrendIndicators(assetCandles, assetCurrentCandle);
   const trendBias = getTrendIndicatorBias(side, trendIndicators);
-  const fib = computeFibContext(side);
+  const fib = computeFibContext(side, 80, assetCandles, assetCurrentCandle);
   const fibBias = fib?.bias || 'neutral';
   return {
     marketId: market.id,
@@ -2024,9 +2397,10 @@ function getBestMarket(preferLiveOnly = false) {
     const isUpOrDown = /up or down/.test(q);
     if (m.live && Number(m.volume || 0) < 50000) return { m, score: -1 };
     if (isSim && minLeft > maxMinutes) return { m, score: -1 };
+    const assetCurrentPrice = getAssetPrice(m);
     const strike = getSimStrike(m);
-    const strikeGap = isSim && strike && state.btcPrice
-      ? Math.abs(strike - state.btcPrice) / state.btcPrice
+    const strikeGap = isSim && strike && assetCurrentPrice
+      ? Math.abs(strike - assetCurrentPrice) / assetCurrentPrice
       : 0;
     // Dead zone fix: match reseed threshold (2%) — previously 1.2% excluded sim markets
     // before updateSimMarketPrices() reseeded them (at 2%), leaving a 0.8% gap with no
@@ -2059,8 +2433,9 @@ function getBestMarket(preferLiveOnly = false) {
 // Used by: computeImpliedProb() (signal), monitorPositions() (mark-to-market),
 //          updateSimMarketPrices() (display prices for sim markets).
 // All three use the SAME formula — ensuring signal, mark and display are consistent.
-function computeBinaryMid(market, btcOverride) {
-  const btc = btcOverride ?? state.btcPrice;
+function computeBinaryMid(market, priceOverride) {
+  const assetPrice = priceOverride ?? getAssetPrice(market);
+  const btc = assetPrice;
   if (!btc || btc <= 0 || !market) return 0.5;
 
   // Parse strike from question: "Will BTC be above $97,000 in 15 min?"
@@ -2077,17 +2452,15 @@ function computeBinaryMid(market, btcOverride) {
     // priceHistory (best momentum proxy). Falls back to current BTC.
     const windowOpenMs = market.startDate ? new Date(market.startDate).getTime() : 0;
     const nowMs = Date.now();
+    const assetHist = getAssetPriceHistory(market);
     if (windowOpenMs > 0 && windowOpenMs <= nowMs) {
       // Window is open — use snapshotted strike if available (more accurate than
       // getPriceAt which is limited to 5-min history depth)
       strike = market._strikeSnapshot
-        || getPriceAt(nowMs - windowOpenMs)
-        || state.priceHistory[0]?.price
+        || getPriceAtFromHistory(assetHist, nowMs - windowOpenMs, 0) || 0
+        || assetHist[0]?.price
         || btc;
     } else {
-      // Window hasn't started yet — use the snapshotted strike (set at seed time to
-      // BTC ~5 min ago). This is consistent with the post-startDate branch and avoids
-      // a discontinuous edge jump when startDate arrives. Falls back to current BTC.
       strike = market._strikeSnapshot || btc;
     }
   }
@@ -2096,8 +2469,9 @@ function computeBinaryMid(market, btcOverride) {
   const msLeft    = market.endDate ? new Date(market.endDate).getTime() - now : 15 * 60000;
   const hoursLeft = Math.max(1 / 3600, msLeft / 3600000); // min 1 second
 
-  // Realized vol (1-min window) scaled to per-hour
-  const realizedVol = Math.max(0.001, recentVolatility(60000) * Math.sqrt(3600));
+  // Realized vol (1-min window) scaled to per-hour — use asset-specific history
+  const assetHistory = getAssetPriceHistory(market);
+  const realizedVol = Math.max(0.001, recentVolatilityFromHistory(assetHistory, 60000) * Math.sqrt(3600));
 
   // Black-Scholes d2: ln(S/K) / (σ√T)
   // Positive when BTC is above strike, negative when below.
@@ -2120,9 +2494,8 @@ function computeBinaryMid(market, btcOverride) {
 function computeEdge(market) {
   if (!market) return { implied: 0.5, poly: 0.5, edge: 0 };
   // Use 100ms VWAP for edge signal — smooths single-tick outliers without losing latency.
-  // Falls back to raw btcPrice if VWAP not yet established (first 100ms of run).
-  const btcForEdge = (state.btcPriceCoalesced > 0 ? state.btcPriceCoalesced : state.btcPrice);
-  const implied = computeBinaryMid(market, btcForEdge); // fair value from VWAP-smoothed BTC
+  const priceForEdge = getAssetPriceCoalesced(market);
+  const implied = computeBinaryMid(market, priceForEdge); // fair value from VWAP-smoothed price
   const poly    = market.outcomePrices?.[0] ?? 0.5;     // real market price (Gamma API or sim)
   return { implied, poly, edge: implied - poly };
 }
@@ -2900,50 +3273,47 @@ function updateSimMarketPrices() {
   if (!state.btcPrice || state.btcPrice <= 0) return;
 
   const nowMs = Date.now();
-  const activeSims = state.markets.filter(m => !m.live && getMarketMinutesLeft(m, nowMs) > 1);
 
-  // Reseed triggers:
-  // 1. All SIM markets expired.
-  const allExpired = activeSims.length === 0;
-  // 2. BTC drifted >2% from seed strike — outcome becoming too one-sided.
-  const ladderTooFar = activeSims.length > 0 && activeSims.every(m => {
-    const strike = getSimStrike(m) ?? m._strikeSnapshot;
-    return strike && state.btcPrice
-      ? Math.abs(strike - state.btcPrice) / state.btcPrice > 0.02
-      : false;
-  });
-  // 3. Implied probability extreme (>92%) on ALL active markets — outcome too certain.
-  //    Uses implied (computeBinaryMid) not poly, so it is immune to poly being stale.
-  const allExtreme = activeSims.length > 0 &&
-    activeSims.every(m => Math.abs(computeBinaryMid(m, state.btcPrice) - 0.5) > 0.42);
-
-  if (allExpired || ladderTooFar || allExtreme) {
-    seedSimMarkets();
-    return;
+  // Process SIM markets grouped by asset, allowing independent reseed per asset
+  const assetGroups = { BTC: [], SOL: [], ETH: [] };
+  for (const m of state.markets) {
+    if (!m.live && getMarketMinutesLeft(m, nowMs) > 1) {
+      const a = (m.asset || 'BTC').toUpperCase();
+      if (assetGroups[a]) assetGroups[a].push(m);
+    }
   }
 
-  // ── LAGGED POLY DESIGN (faithful Polymarket simulation) ─────────────────────
-  // poly (outcomePrices[0]) = computeBinaryMid(market, btcLagged90s).
-  //
-  // This faithfully simulates the ~90s Polymarket update cycle:
-  //   implied = computeBinaryMid(btcNow)       — current fair value (real BTC)
-  //   poly    = computeBinaryMid(btcLagged90s) — what market showed 90s ago (real BTC)
-  //   edge    = implied − poly                 — only exists when BTC moved in last 90s
-  //
-  // This means:
-  //   • BTC flat for 90s → poly catches up → edge ≈ 0 → no entries (correct)
-  //   • BTC moves +0.5% in 90s → poly stale → real edge → entry fires (correct)
-  //   • At startup (< 90s history) → btcLagged ≈ btcNow → edge ≈ 0 → no fake entries
-  //
-  // Previous "frozen at 0.50" design: created permanent artificial edge any time
-  // BTC ≠ _strikeSnapshot — caused invented entries even during flat markets.
-  const btcLagged90s = getPriceAt(90000); // BTC price 90 seconds ago (real history)
-  for (const m of activeSims) {
-    const laggedPoly = computeBinaryMid(m, btcLagged90s);
-    m.outcomePrices = [
-      Math.round(laggedPoly * 10000) / 10000,
-      Math.round((1 - laggedPoly) * 10000) / 10000,
-    ];
+  for (const [asset, activeSims] of Object.entries(assetGroups)) {
+    const assetPriceMkt = { asset };
+    const assetCurrentPrice = getAssetPrice(assetPriceMkt);
+    if (!assetCurrentPrice || assetCurrentPrice <= 0) continue;
+
+    const allExpired = activeSims.length === 0;
+    const ladderTooFar = activeSims.length > 0 && activeSims.every(m => {
+      const strike = getSimStrike(m) ?? m._strikeSnapshot;
+      return strike && assetCurrentPrice
+        ? Math.abs(strike - assetCurrentPrice) / assetCurrentPrice > 0.02
+        : false;
+    });
+    const allExtreme = activeSims.length > 0 &&
+      activeSims.every(m => Math.abs(computeBinaryMid(m) - 0.5) > 0.42);
+
+    if (allExpired || ladderTooFar || allExtreme) {
+      if (asset === 'BTC') { seedSimMarkets(); }
+      else { seedSimMarketsForAsset(asset, assetCurrentPrice); }
+      continue;
+    }
+
+    // Lagged poly design — use per-asset price history
+    const assetHistory = getAssetPriceHistory(assetPriceMkt);
+    const laggedPrice = getPriceAtFromHistory(assetHistory, 90000, assetCurrentPrice);
+    for (const m of activeSims) {
+      const laggedPoly = computeBinaryMid(m, laggedPrice);
+      m.outcomePrices = [
+        Math.round(laggedPoly * 10000) / 10000,
+        Math.round((1 - laggedPoly) * 10000) / 10000,
+      ];
+    }
   }
 }
 
@@ -3106,11 +3476,11 @@ function monitorPositions() {
     // exit before your entry fill confirms. Prevents unrealistic 127ms round-trips.
     if (nowMs - pos.entryTime < 2000) continue;
 
-    // For SIM markets: compute YES probability in real-time from BTC price + strike.
+    // For SIM markets: compute YES probability in real-time from asset price + strike.
     // For LIVE markets: use outcomePrices from CLOB (already live).
     let rawYesOdds;
     if (!mktForPos.live) {
-      rawYesOdds = computeBinaryMid(mktForPos, state.btcPrice);
+      rawYesOdds = computeBinaryMid(mktForPos); // auto-detects asset via getAssetPrice
     } else {
       rawYesOdds = mktForPos.outcomePrices?.[0] ?? 0.5;
     }
@@ -3239,6 +3609,8 @@ function broadcastMarketData() {
     data: {
       btcPrice:     state.btcPrice,
       btcChange24h: state.btcChange24h,
+      solPrice:     state.solPrice,
+      ethPrice:     state.ethPrice,
       laggedPrice:  getPriceAt(LAG_MS),
       impliedProb:  implied,
       polyOdds:     poly,
@@ -3288,6 +3660,10 @@ function buildStatusPayload() {
     unrealizedPnl: Math.round(unrealizedPnl * 100) / 100,
     binanceConnected: state.binanceConnected,
     priceSource:   state.priceSource,
+    solPrice:      state.solPrice,
+    ethPrice:      state.ethPrice,
+    solConnected:  state.solConnected,
+    ethConnected:  state.ethConnected,
     stats:         state.stats,
     kelly:         empiricalKellyParams(),   // null until 20 trades; then { winRate, b, kellyFraction }
     feeRate: POLY_FEE_RATE,
@@ -3676,12 +4052,25 @@ server.listen(PORT, async () => {
   await loadBinanceHistory();
   seedSimMarkets();
   connectBinance();
+  connectAltAsset('solusdt', 'SOL');
+  connectAltAsset('ethusdt', 'ETH');
   await fetchBTCMarkets();
+  // Fetch SOL/ETH markets in parallel (non-blocking, best-effort)
+  fetchAltMarkets('SOL', 'solana').catch(() => {});
+  fetchAltMarkets('ETH', 'ethereum').catch(() => {});
+  // Seed SIM markets for SOL/ETH using current prices (0 = deferred until price arrives)
+  // A short delay allows the WS feeds to deliver first prices
+  setTimeout(() => {
+    if (state.solPrice > 0) seedSimMarketsForAsset('SOL', state.solPrice);
+    if (state.ethPrice > 0) seedSimMarketsForAsset('ETH', state.ethPrice);
+  }, 5000);
   syncPolyMarketSubscription();
-  // Refresh markets every 15s — short "Up or Down" windows last 5-15 min,
-  // so 30s poll risked missing an entire window. 15s keeps price data fresh
-  // while staying well within Gamma API rate limits.
+  // Refresh markets every 15s
   setInterval(fetchBTCMarkets, 15 * 1000);
+  setInterval(() => {
+    fetchAltMarkets('SOL', 'solana').catch(() => {});
+    fetchAltMarkets('ETH', 'ethereum').catch(() => {});
+  }, 30 * 1000);
   setInterval(syncPolyMarketSubscription, 2000);
   // Sim market price model: re-prices non-live markets every 2s using real BTC + binary option math
   setInterval(updateSimMarketPrices, 2000);
