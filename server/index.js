@@ -2032,8 +2032,11 @@ function kellySize(edge, winProb, entryPrice, balance, maxBetPct) {
   const vMult     = vol > 0.003 ? 0.70 : vol > 0.0015 ? 0.85 : 1.0;
   const capped    = Math.min(scaled, maxBetPct / 100) * sMult * vMult;
   const raw       = Math.round(balance * capped * 100) / 100;
-  // Minimum $1 — consistent with fixedAmount:1 config; lower threshold allows the
-  // bot to trade at typical 0.3-0.5% edge levels without needing a spike.
+  // Minimum $1 floor: if Kelly is positive (real edge exists) and balance allows,
+  // never let sMult/vMult shrink the bet below $1. A losing streak reduces SIZE,
+  // not the ability to trade — blocking entirely after 3 losses was causing 30+ min
+  // silences. The streak multiplier floor (0.2) already caps the max damage.
+  if (raw < 1 && fullKelly > 0 && balance >= 3) return 1;
   return raw >= 1 ? raw : 0;
 }
 
@@ -2454,14 +2457,17 @@ function runArbitrageCheck() {
   }
 
   // 4. ADVERSE SELECTION COOLDOWN
-  // If ≥3 of the last 5 closed trades were losses, pause new auto-entries for 60s.
-  // Signals the bot may be in a toxic-flow regime. (gamma-trade-lab pattern)
+  // If ≥4 of the last 5 closed trades were losses, pause auto-entries for 15s.
+  // Raised threshold from 3→4 and reduced window from 60s→15s: the original
+  // 3/5 + 60s block was causing silences up to 60s after ANY moderate losing
+  // stretch (common in normal market noise). 4/5 is a genuine toxic-flow signal;
+  // 15s respects CLOB rate limits without over-suppressing entry frequency.
   const last5 = state.trading.trades.slice(0, 5);
   if (last5.length >= 5) {
     const lossCount = last5.filter(t => t.outcome === 'LOSS').length;
-    if (lossCount >= 3) {
+    if (lossCount >= 4) {
       const lastLossTs = (last5.find(t => t.outcome === 'LOSS') || {}).timestamp || 0;
-      if (now - lastLossTs < 60000) {
+      if (now - lastLossTs < 15000) {
         // Emit signal so UI shows it, but block auto-execution until cooldown expires
         diagnostics.blockers.push('recent_losses');
         diagnostics.blockReason = 'RECENT_LOSSES';
