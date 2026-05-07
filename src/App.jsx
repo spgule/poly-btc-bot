@@ -788,6 +788,11 @@ function BtcChartBody({ market, candles, currentCandle }) {
   }, []);
 
   useEffect(() => {
+    fetchAlt('SOL');
+    fetchAlt('ETH');
+  }, [fetchAlt]);
+
+  useEffect(() => {
     if (chartAsset === 'BTC') return;
     fetchAlt(chartAsset);
   }, [chartAsset, fetchAlt]);
@@ -804,6 +809,7 @@ function BtcChartBody({ market, candles, currentCandle }) {
   // Pick the right candle data
   const displayCandles       = chartAsset === 'BTC' ? candles       : (altData[chartAsset]?.candles       ?? []);
   const displayCurrentCandle = chartAsset === 'BTC' ? currentCandle : (altData[chartAsset]?.currentCandle ?? null);
+  const altInfo = chartAsset === 'BTC' ? null : altData[chartAsset];
 
   const [indicatorToggles, setIndicatorToggles] = useState(() => {
     try {
@@ -863,10 +869,12 @@ function BtcChartBody({ market, candles, currentCandle }) {
         ) : (
           <div style={{ display: 'flex', gap: 10, alignItems: 'center', fontSize: 8 }}>
             <span style={{ fontWeight: 700, color: 'var(--t1)' }}>
-              {altData[chartAsset] ? `$${altData[chartAsset].price?.toLocaleString(undefined, { maximumFractionDigits: 4 })}` : '—'}
+              {altInfo ? `$${altInfo.price?.toLocaleString(undefined, { maximumFractionDigits: 4 })}` : '—'}
             </span>
-            <span style={{ color: 'var(--t3)' }}>candles 1m · Binance REST</span>
-            {!altData[chartAsset] && <span style={{ color: 'var(--amber)' }}>Carregando…</span>}
+            <span style={{ color: 'var(--t3)' }}>
+              {altInfo?.source === 'live-ws' ? 'candles 5s · Binance WS' : 'candles 1m · Binance REST'}
+            </span>
+            {!altInfo && <span style={{ color: 'var(--amber)' }}>Carregando…</span>}
           </div>
         )}
         {/* ── Poly odds (BTC only) / Alt Poly odds ── */}
@@ -885,16 +893,28 @@ function BtcChartBody({ market, candles, currentCandle }) {
                 EDGE {fmtEdge(market.edge || 0)}
               </span>
             </>
-          ) : altData[chartAsset]?.polyPrice != null ? (
+          ) : altInfo?.polyPrice != null ? (
             <>
               <span style={{ color: 'var(--t2)' }}>
                 POLY YES <span style={{ color: 'var(--t1)', fontWeight: 700 }}>
-                  {(altData[chartAsset].polyPrice * 100).toFixed(1)}¢
+                  {(altInfo.polyPrice * 100).toFixed(1)}¢
                 </span>
               </span>
-              {altData[chartAsset]?.polyQuestion && (
+              {altInfo?.impliedProb != null && (
+                <span style={{ color: 'var(--t2)' }}>
+                  IMPLIED <span style={{ color: (altInfo.impliedProb || 0.5) > 0.5 ? 'var(--green)' : 'var(--red)', fontWeight: 700 }}>
+                    {(altInfo.impliedProb * 100).toFixed(1)}¢
+                  </span>
+                </span>
+              )}
+              {altInfo?.edge != null && (
+                <span style={{ fontWeight: 700, color: Math.abs(altInfo.edge || 0) > 0.03 ? ((altInfo.edge || 0) > 0 ? 'var(--green)' : 'var(--red)') : 'var(--t3)' }}>
+                  EDGE {fmtEdge(altInfo.edge || 0)}
+                </span>
+              )}
+              {altInfo?.polyQuestion && (
                 <span style={{ color: 'var(--t3)', maxWidth: 160, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
-                  {altData[chartAsset].polyQuestion}
+                  {altInfo.polyQuestion}
                 </span>
               )}
             </>
