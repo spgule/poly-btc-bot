@@ -2676,7 +2676,15 @@ function runArbitrageCheck() {
   const volumeOk = !tradeMarket.live || liveVolume >= liveVolumeMin;
   if (!volumeOk) diagnostics.blockers.push('market_volume');
 
-  if (state.config.autoTrade && state.currentSignal.betSize >= 1 && canTrade && stableOk && safeBalance && !hasOpposite && exposureOk && volumeOk) {
+  // Daily spending cap check — surfaced here so UI shows DAILY_CAP instead of phantom READY.
+  // Cap = 20% of starting capital per day (cumulative bet cost, not just losses).
+  // Previously only checked inside openPosition() with a silent return — caused the bot to
+  // appear ready but never execute after a few trades without any visible explanation.
+  const _dailyCap = (state.config.capital || 1000) * 0.20;
+  const dailyCapOk = (state.stats.todayCost || 0) + state.currentSignal.betSize <= _dailyCap;
+  if (!dailyCapOk) diagnostics.blockers.push('daily_cap');
+
+  if (state.config.autoTrade && state.currentSignal.betSize >= 1 && canTrade && stableOk && safeBalance && !hasOpposite && exposureOk && volumeOk && dailyCapOk) {
     diagnostics.blockReason = 'READY';
     setSignalDiagnostics(diagnostics);
     executeTrade(state.currentSignal);
@@ -2801,16 +2809,6 @@ function openPosition(signal) {
   if (Date.now() - lastEntry < 500) return;
   if (!openPosition._lastEntryTs) openPosition._lastEntryTs = {};
   openPosition._lastEntryTs[lockKey] = Date.now();
-
-  // ── Daily spending cap ──────────────────────────────────────────────────────
-  // Limita o custo total apostado por dia (não apenas perdas) a 20% do capital.
-  // Protege contra over-trading em dias de muitos sinais. Aplica em SIM e LIVE.
-  const dailyCapPct = 20;  // 20% do capital por dia
-  const dailyCap    = (state.config.capital || 1000) * dailyCapPct / 100;
-  if ((state.stats.todayCost || 0) + betSize > dailyCap) {
-    console.log(`[CLOB] Skip — daily spend cap atingido: $${(state.stats.todayCost || 0).toFixed(2)} + $${betSize} > $${dailyCap.toFixed(2)}`);
-    return;
-  }
 
   // NEVER open opposite direction on same market — prevents self-canceling trades
   if (state.positions.some(p => p.status === 'OPEN' && p.marketId === marketId && p.side !== side)) return;
@@ -3467,7 +3465,9 @@ app.post('/api/sim/reset', (req, res) => {
   state.trading.peakBalance  = state.config.capital;
   state.trading.trades       = [];
   state.trading.lastTradeTs  = 0;
-  state.stats = { totalTrades: 0, wins: 0, losses: 0, totalPnl: 0, todayPnl: 0, streak: 0, totalFees: 0 };
+  state.trading.peakBalanceDay   = state.config.capital;
+  state.trading.peakBalanceMonth = state.config.capital;
+  state.stats = { totalTrades: 0, wins: 0, losses: 0, totalPnl: 0, todayPnl: 0, streak: 0, totalFees: 0, todayCost: 0 };
   state.currentSignal = null;
   // Clear persisted trade and session files
   try { fs.unlinkSync(TRADES_FILE); } catch (_) {}
