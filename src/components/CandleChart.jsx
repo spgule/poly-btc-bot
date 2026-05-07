@@ -108,7 +108,18 @@ export default function CandleChart({
 
     const rows = buildChartRows(candles, currentCandle);
     latestRowsRef.current = rows;
-    if (!rows.length) return;
+    if (!rows.length) {
+      candleSeries.setData([]);
+      volumeSeriesRef.current?.setData([]);
+      const overlays = overlaySeriesRef.current;
+      overlays.ema9?.setData([]);
+      overlays.ema21?.setData([]);
+      overlays.vwap?.setData([]);
+      overlays.bbUpper?.setData([]);
+      overlays.bbMiddle?.setData([]);
+      overlays.bbLower?.setData([]);
+      return;
+    }
 
     candleSeries.setData(rows.map((row) => ({
       time: row.time,
@@ -136,6 +147,8 @@ export default function CandleChart({
     overlays.bbUpper?.setData(indicators.bollinger ? bollinger.upper : []);
     overlays.bbMiddle?.setData(indicators.bollinger ? bollinger.middle : []);
     overlays.bbLower?.setData(indicators.bollinger ? bollinger.lower : []);
+
+    chartRef.current?.timeScale().fitContent();
   }
 
   useEffect(() => {

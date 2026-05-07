@@ -836,7 +836,7 @@ function BtcChartBody({ market, candles, currentCandle, altCharts }) {
 
   // ── Asset selector ──────────────────────────────────────────────────────────
   const [chartAsset, setChartAsset] = useState('BTC');
-  const [altData, setAltData]       = useState({});  // { SOL: {candles,price,polyPrice,...}, ETH: {...} }
+  const [altData, setAltData] = useState({});
   const altFetchRef = useRef({});                     // { SOL: ts, ETH: ts } — debounce
 
   const fetchAlt = useCallback((asset) => {
