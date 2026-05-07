@@ -1865,7 +1865,10 @@ function getBestMarket(preferLiveOnly = false) {
     const strikeGap = isSim && strike && state.btcPrice
       ? Math.abs(strike - state.btcPrice) / state.btcPrice
       : 0;
-    if (isSim && strikeGap > 0.012) return { m, score: -1 };
+    // Dead zone fix: match reseed threshold (2%) — previously 1.2% excluded sim markets
+    // before updateSimMarketPrices() reseeded them (at 2%), leaving a 0.8% gap with no
+    // tradeable markets. Now both thresholds align at 2%.
+    if (isSim && strikeGap > 0.020) return { m, score: -1 };
     // Prefer markets nearer to 0.5 (more uncertainty = larger edge swings possible)
     const priceScore = priceDist < 0.10 ? 3 : priceDist < 0.25 ? 2 : priceDist < 0.40 ? 1 : 0;
     // Bonus score for Up or Down markets (these are the ideal arb target)
@@ -2126,8 +2129,16 @@ function runArbitrageCheck() {
   // conditions), cascade through all eligible markets (live + SIM) rather than
   // giving up. SIM markets have dynMinEdge ~0.4-0.8%, so they catch opportunities
   // that live markets miss during low-volatility periods.
+  //
+  // KEY FIX: live markets whose Polymarket WS feed is observed-but-stale are
+  // excluded from the cascade BEFORE buildTradeSignal() — otherwise the cascade
+  // picks the live market (it has edge), then POLY_LIVE_STALE fires at the entry
+  // guard with no SIM fallback. By pruning here, SIM markets fill in seamlessly.
+  const _polyStaleExclude = (m) =>
+    m.live && state.polyLive.marketIds.includes(m.id) && !isPolyLiveFresh();
   const cascadePool = [topMarket, ...state.markets.filter(m => {
     if (m.id === topMarket.id) return false;
+    if (_polyStaleExclude(m)) return false; // stale observed live markets → SIM fallback
     if (!isValidTradingMarket(m)) return false;
     const ml = getMarketMinutesLeft(m, now);
     if (ml < 1 || ml > 30.5) return false;
@@ -2135,7 +2146,7 @@ function runArbitrageCheck() {
     if (m.live && Number(m.volume || 0) < 50000) return false;
     if (getMarketPriceDistance(m) > 0.42) return false;
     return true;
-  })].slice(0, 10);
+  })].filter(m => !_polyStaleExclude(m)).slice(0, 10); // also prune topMarket if stale
 
   let signalCandidate = null;
   let signalMarket = topMarket;
@@ -2147,6 +2158,18 @@ function runArbitrageCheck() {
   if (!signalCandidate) {
     state.currentSignal = null;
     const context = buildSignalContext(topMarket, now);
+    // Diagnostic: log why there's no signal every 30s so Railway logs show the block reason.
+    // Previously silent — made it impossible to debug long stretches with no entries.
+    if (now - (runArbitrageCheck._lastNoSignalLog || 0) > 30000) {
+      runArbitrageCheck._lastNoSignalLog = now;
+      const polyFresh = isPolyLiveFresh();
+      const stalePrunedCount = state.markets.filter(m => m.live && state.polyLive.marketIds.includes(m.id) && !polyFresh).length;
+      console.log(`[ARB NO-SIGNAL] topMkt="${topMarket.question?.slice(0,35)}" ` +
+        `edge=${((context?.edge ?? 0)*100).toFixed(2)}¢ dynMin=${((context?.dynMinEdge ?? 0)*100).toFixed(2)}¢ ` +
+        `polyFresh=${polyFresh} stalePruned=${stalePrunedCount} ` +
+        `simMkts=${state.markets.filter(m => !m.live).length} liveMkts=${state.markets.filter(m => m.live).length} ` +
+        `cascadeSize=${cascadePool.length} autoTrade=${state.config.autoTrade}`);
+    }
     setSignalDiagnostics({
       marketId: context?.marketId ?? topMarket.id,
       question: context?.question ?? topMarket.question,
@@ -2310,11 +2333,14 @@ function runArbitrageCheck() {
   }
 
   // 1. SETTLEMENT TIMING GUARD
-  // In the final 3 minutes of a short-term binary (≤30 min), 60-90% of informed
-  // volume arrives. Entering here is strongly adversely selected.
+  // In the final minutes of a short-term binary (≤30 min), informed volume surges.
+  // Guard scaled to market duration: 90s (1.5 min) for all markets ≤30 min.
+  // Previously 3 min — too restrictive for 5-min markets (blocked 60% of window).
+  // 90s still protects against end-of-window adverse selection while allowing
+  // 3.5 min of tradeable window on 5-min markets (vs 2 min with 3-min guard).
   const mktMsLeft  = tradeMarket.endDate ? new Date(tradeMarket.endDate).getTime() - now : Infinity;
   const isShortMkt = mktMsLeft <= 30 * 60000;
-  if (isShortMkt && mktMsLeft < 3 * 60000) {
+  if (isShortMkt && mktMsLeft < 90 * 1000) {
     state.currentSignal = null;
     diagnostics.blockers.push('settlement_window');
     diagnostics.blockReason = 'SETTLEMENT_WINDOW';
@@ -2460,6 +2486,14 @@ function runArbitrageCheck() {
   } else {
     diagnostics.blockReason = diagnostics.blockers[0] ? diagnostics.blockers[0].toUpperCase() : 'READY_MANUAL';
     setSignalDiagnostics(diagnostics);
+    // Log when bot has signal but something blocks auto-entry — helps diagnose quiet periods.
+    if (state.config.autoTrade && now - (runArbitrageCheck._lastBlockLog || 0) > 30000) {
+      runArbitrageCheck._lastBlockLog = now;
+      console.log(`[ARB BLOCKED] reason=${diagnostics.blockReason} blockers=[${diagnostics.blockers.join(',')}] ` +
+        `edge=${(signalCandidate._rawEdge*100).toFixed(2)}¢ betSize=$${state.currentSignal.betSize} ` +
+        `canTrade=${canTrade} stableOk=${stableOk} safeBalance=${safeBalance} exposureOk=${exposureOk} ` +
+        `autoTrade=${state.config.autoTrade} mkt="${market.question?.slice(0,28)}"`);
+    }
   }
   broadcastSignal();
 }
