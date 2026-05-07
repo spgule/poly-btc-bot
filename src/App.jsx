@@ -126,6 +126,7 @@ function useBot() {
       livePauseRequireStreak: false,
       liveManualRearm: false,
     },
+    assetSignals: { BTC: null, SOL: null, ETH: null },
   });
   const [trades, setTrades]       = useState([]);
   const [markets, setMarkets]     = useState([]);
@@ -200,7 +201,12 @@ function useBot() {
           case 'CONNECTION':
             setStatus(d => ({ ...d, binanceConnected: msg.data.binanceConnected, priceSource: msg.data.priceSource }));
             break;
-          case 'SIGNAL':         setSignal(msg.data); break;
+          case 'SIGNAL':
+            setSignal(msg.data?.current ?? msg.data ?? null);
+            if (msg.data?.byAsset) {
+              setStatus(d => ({ ...d, assetSignals: msg.data.byAsset }));
+            }
+            break;
           case 'STATUS':         setStatus(msg.data); break;
           case 'TRADE':          setTrades(t => [msg.data, ...t].slice(0, 500)); break;
           case 'TRADES_HISTORY': setTrades(msg.data); break;
@@ -614,6 +620,18 @@ function SignalBody({ signal, market, status, onManualTrade }) {
   const edge      = market.edge || 0;
   const absEdge   = Math.abs(edge);
   const edgePct   = Math.min(100, absEdge * 400);
+  const assetSignals = status.assetSignals || {};
+  const assetRows = ['BTC', 'SOL', 'ETH'].map((asset) => {
+    const sig = assetSignals[asset];
+    const edgeValue = sig?._rawEdge ?? sig?.edge ?? 0;
+    return {
+      asset,
+      sig,
+      edgeValue,
+      active: Boolean(sig && Math.abs(edgeValue) >= minEdge),
+      direction: sig?.side === 'BUY_NO' ? 'NO' : 'YES',
+    };
+  });
 
   return (
     <div style={{ padding: '12px 14px', display: 'flex', flexDirection: 'column', gap: 10, height: '100%', overflowY: 'auto' }}>
@@ -679,6 +697,25 @@ function SignalBody({ signal, market, status, onManualTrade }) {
             background: absEdge >= minEdge ? (edge > 0 ? 'var(--green)' : 'var(--red)') : 'var(--border2)',
           }} />
         </div>
+      </div>
+
+      <div style={{ display: 'grid', gridTemplateColumns: 'repeat(3, 1fr)', gap: 6 }}>
+        {assetRows.map(({ asset, sig, edgeValue, active, direction }) => (
+          <div key={asset} style={{ background: 'var(--s2)', border: '1px solid var(--border)', borderRadius: 4, padding: '6px 7px' }}>
+            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 3 }}>
+              <span style={{ fontSize: 8, fontWeight: 800, color: 'var(--t1)', letterSpacing: '0.08em' }}>{asset}</span>
+              <span className={cn('badge', active ? 'badge-green' : 'badge-gray')} style={{ fontSize: 6, padding: '1px 4px' }}>
+                {active ? direction : 'WAIT'}
+              </span>
+            </div>
+            <div style={{ fontSize: 10, fontWeight: 700, color: active ? (direction === 'YES' ? 'var(--green)' : 'var(--red)') : 'var(--t3)' }}>
+              {sig ? fmtEdge(edgeValue) : '—'}
+            </div>
+            <div style={{ fontSize: 7, color: 'var(--t3)', marginTop: 2 }}>
+              {sig ? `${sig.confidence?.toFixed(0) || 0}% conf` : 'sem sinal'}
+            </div>
+          </div>
+        ))}
       </div>
 
       {hasSignal && (
@@ -951,7 +988,7 @@ function BtcChartBody({ market, candles, currentCandle }) {
       </div>
       <div style={{ flex: 1, minHeight: 0 }}>
         {displayCandles.length > 0 || displayCurrentCandle
-          ? <CandleChart candles={displayCandles} currentCandle={displayCurrentCandle} indicators={indicatorToggles} />
+          ? <CandleChart key={chartAsset} candles={displayCandles} currentCandle={displayCurrentCandle} indicators={indicatorToggles} />
           : <div style={{ height: '100%', display: 'flex', alignItems: 'center', justifyContent: 'center', color: 'var(--t2)', fontSize: 10 }}>
               {chartAsset === 'BTC' ? 'Aguardando dados do Binance…' : `Carregando ${chartAsset}/USDT…`}
             </div>

@@ -358,6 +358,7 @@ const state = {
     active:        false,
     trades:        [],
     lastTradeTs:   0,
+    lastTradeTsByAsset: { BTC: 0, SOL: 0, ETH: 0 },
     cooldownMs:    2000,   // CLOB-safe minimum cooldown shared by SIM and LIVE
   },
 
@@ -3678,6 +3679,7 @@ const _inFlight = new Set();
 
 async function executeTrade(signal) {
   if (!signal || signal.betSize < 1) return;
+  const assetKey = String(signal.asset || 'BTC').toUpperCase();
 
   // Duplicate-order guard: reject if this exact market+side combo is already
   // awaiting CLOB confirmation. Critical in LIVE — double-submitting an order
@@ -3705,9 +3707,13 @@ async function executeTrade(signal) {
 
   // ── CLOB rate-limit enforcement (identical for SIM and LIVE) ──────────────
   // Polymarket CLOB allows ~10 req/s. 2s cooldown = safe margin, mirrors LIVE.
-  const minCooldown = Math.max(state.trading.cooldownMs, 2000);
-  if (Date.now() - state.trading.lastTradeTs < minCooldown) return;
-  state.trading.lastTradeTs = Date.now();
+  const nowTs = Date.now();
+  const globalMinCooldown = 350;
+  const perAssetCooldown = Math.max(state.trading.cooldownMs, 2000);
+  if (nowTs - state.trading.lastTradeTs < globalMinCooldown) return;
+  if (nowTs - (state.trading.lastTradeTsByAsset[assetKey] || 0) < perAssetCooldown) return;
+  state.trading.lastTradeTs = nowTs;
+  state.trading.lastTradeTsByAsset[assetKey] = nowTs;
 
   // ── Simulate execution latency (CLOB order roundtrip) ─────────────────────
   // Same range for SIM and LIVE: 50-300ms realistic network + chain roundtrip.
@@ -3756,7 +3762,13 @@ function broadcastMarketData() {
 }
 
 function broadcastSignal() {
-  broadcast({ type: 'SIGNAL', data: state.currentSignal });
+  broadcast({
+    type: 'SIGNAL',
+    data: {
+      current: state.currentSignal,
+      byAsset: state.assetSignals,
+    },
+  });
 }
 
 function broadcastTrade(trade) {
@@ -3794,6 +3806,7 @@ function buildStatusPayload() {
     solConnected:  state.solConnected,
     ethConnected:  state.ethConnected,
     stats:         state.stats,
+    assetSignals:  state.assetSignals,
     kelly:         empiricalKellyParams(),   // null until 20 trades; then { winRate, b, kellyFraction }
     feeRate: POLY_FEE_RATE,
     config: {
@@ -3863,6 +3876,7 @@ app.post('/api/bot/start', (req, res) => {
   state.trading.active      = true;
   state.config.autoTrade    = true;
   state.trading.lastTradeTs = 0;    // reset cooldown — first trade can fire immediately
+  state.trading.lastTradeTsByAsset = { BTC: 0, SOL: 0, ETH: 0 };
   saveConfig();
   saveSession();
   broadcastStatus();
@@ -3877,6 +3891,7 @@ app.post('/api/bot/stop', (req, res) => {
   state.config.autoTrade = false;
   state.currentSignal   = null;
   state.assetSignals    = { BTC: null, SOL: null, ETH: null };
+  state.trading.lastTradeTsByAsset = { BTC: 0, SOL: 0, ETH: 0 };
   saveConfig();
   saveSession();
   broadcastStatus();
@@ -3909,10 +3924,12 @@ app.post('/api/config', (req, res) => {
     state.trading.active = wantsAutoTrade;
     if (wantsAutoTrade) {
       state.trading.lastTradeTs = 0;
+      state.trading.lastTradeTsByAsset = { BTC: 0, SOL: 0, ETH: 0 };
       if (state.priceHistory.length >= 3) runArbitrageCheck();
     } else {
       state.currentSignal = null;
       state.assetSignals = { BTC: null, SOL: null, ETH: null };
+      state.trading.lastTradeTsByAsset = { BTC: 0, SOL: 0, ETH: 0 };
       broadcastSignal();
     }
   }
@@ -3962,6 +3979,7 @@ app.post('/api/sim/reset', (req, res) => {
   state.trading.peakBalance  = state.config.capital;
   state.trading.trades       = [];
   state.trading.lastTradeTs  = 0;
+  state.trading.lastTradeTsByAsset = { BTC: 0, SOL: 0, ETH: 0 };
   state.trading.peakBalanceDay   = state.config.capital;
   state.trading.peakBalanceMonth = state.config.capital;
   state.stats = { totalTrades: 0, wins: 0, losses: 0, totalPnl: 0, todayPnl: 0, streak: 0, totalFees: 0 };
