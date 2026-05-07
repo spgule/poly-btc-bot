@@ -104,6 +104,7 @@ function useBot() {
   const [candles, setCandles]               = useState([]);
   const [currentCandle, setCurrentCandle]   = useState(null);
   const [signal, setSignal]                 = useState(null);
+  const [altCharts, setAltCharts]           = useState({ SOL: null, ETH: null });
   const [status, setStatus]                 = useState({
     mode: 'SIM', active: false,
     balance: 1000, startBalance: 1000, peakBalance: 1000, drawdown: 0,
@@ -139,7 +140,7 @@ function useBot() {
   useEffect(() => {
     async function poll() {
       try {
-        const [st, mkts, prices, candleData] = await Promise.all([
+        const [st, mkts, prices, candleData, solAlt, ethAlt] = await Promise.all([
           api.getStatus(),
           api.getMarkets(),
           fetch(BASE + '/api/prices', {
@@ -147,6 +148,8 @@ function useBot() {
             headers: { 'Cache-Control': 'no-cache' },
           }).then(r => r.json()).catch(() => null),
           api.getCandles().catch(() => null),
+          api.getAltCandles('SOL').catch(() => null),
+          api.getAltCandles('ETH').catch(() => null),
         ]);
         if (st) setStatus(st);
         if (mkts) setMarkets(mkts);
@@ -168,6 +171,12 @@ function useBot() {
             impliedProb: candleData.impliedProb ?? d.impliedProb,
             polyOdds: candleData.polyOdds ?? d.polyOdds,
             edge: candleData.edge ?? d.edge,
+          }));
+        }
+        if (solAlt || ethAlt) {
+          setAltCharts(prev => ({
+            SOL: solAlt ?? prev.SOL,
+            ETH: ethAlt ?? prev.ETH,
           }));
         }
       } catch (_) { /* ignore */ }
@@ -250,7 +259,7 @@ function useBot() {
   const manualTrade   = () => api.manualTrade().catch(console.error);
   const closePosition = (id) => api.closePosition(id).catch(console.error);
 
-  return { connected, market, candles, currentCandle, signal, status, trades, markets, positions, startBot, stopBot, manualTrade, closePosition, actionPending, botError, setBotError };
+  return { connected, market, candles, currentCandle, signal, status, trades, markets, positions, altCharts, startBot, stopBot, manualTrade, closePosition, actionPending, botError, setBotError };
 }
 
 // ─── CHART TOOLTIP ────────────────────────────────────────────────────────────
@@ -714,6 +723,9 @@ function SignalBody({ signal, market, status, onManualTrade }) {
             <div style={{ fontSize: 7, color: 'var(--t3)', marginTop: 2 }}>
               {sig ? `${sig.confidence?.toFixed(0) || 0}% conf` : 'sem sinal'}
             </div>
+            <div style={{ fontSize: 7, color: 'var(--t3)', marginTop: 3, lineHeight: 1.25, minHeight: 26 }}>
+              {sig?.question ? sig.question.slice(0, 38) : 'nenhum mercado ativo'}
+            </div>
           </div>
         ))}
       </div>
@@ -721,9 +733,13 @@ function SignalBody({ signal, market, status, onManualTrade }) {
       {hasSignal && (
         <div className="signal-detail">
           <div className="signal-detail-row">
+            <span style={{ color: 'var(--t2)' }}>Ativo</span>
+            <span style={{ color: 'var(--blue)', fontWeight: 700 }}>{signal.asset || 'BTC'}</span>
+          </div>
+          <div className="signal-detail-row">
             <span style={{ color: 'var(--t2)' }}>Mercado</span>
             <span style={{ color: 'var(--t1)', fontWeight: 600, maxWidth: 160, textAlign: 'right', lineHeight: 1.3 }}>
-              {signal.question?.slice(0, 48)}
+              {signal.question || '—'}
             </span>
           </div>
           <div className="signal-detail-row">
@@ -807,7 +823,7 @@ function MarketsBody({ markets }) {
 }
 
 // ─── BTC CHART BODY ───────────────────────────────────────────────────────────
-function BtcChartBody({ market, candles, currentCandle }) {
+function BtcChartBody({ market, candles, currentCandle, altCharts }) {
   const up   = (market.btcPrice || 0) >= (market.laggedPrice || market.btcPrice || 0);
   const diff = (market.btcPrice || 0) - (market.laggedPrice || market.btcPrice || 0);
   const pct  = market.laggedPrice > 0 ? (diff / market.laggedPrice * 100) : 0;
@@ -844,9 +860,9 @@ function BtcChartBody({ market, candles, currentCandle }) {
   }, [chartAsset, fetchAlt]);
 
   // Pick the right candle data
-  const displayCandles       = chartAsset === 'BTC' ? candles       : (altData[chartAsset]?.candles       ?? []);
-  const displayCurrentCandle = chartAsset === 'BTC' ? currentCandle : (altData[chartAsset]?.currentCandle ?? null);
-  const altInfo = chartAsset === 'BTC' ? null : altData[chartAsset];
+  const displayCandles       = chartAsset === 'BTC' ? candles : ((altData[chartAsset]?.candles?.length ? altData[chartAsset]?.candles : altCharts?.[chartAsset]?.candles) ?? []);
+  const displayCurrentCandle = chartAsset === 'BTC' ? currentCandle : (altData[chartAsset]?.currentCandle ?? altCharts?.[chartAsset]?.currentCandle ?? null);
+  const altInfo = chartAsset === 'BTC' ? null : (altData[chartAsset] || altCharts?.[chartAsset] || null);
 
   const [indicatorToggles, setIndicatorToggles] = useState(() => {
     try {
@@ -1432,7 +1448,7 @@ function HistoryBody({ trades }) {
 
 // ─── APP ─────────────────────────────────────────────────────────────────────
 export default function App() {
-  const { connected, market, candles, currentCandle, signal, status, trades, markets, positions,
+  const { connected, market, candles, currentCandle, signal, status, trades, markets, positions, altCharts,
           startBot, stopBot, manualTrade, closePosition, actionPending, botError, setBotError } = useBot();
   const [showConfig, setShowConfig] = useState(false);
   const [showLayout, setShowLayout] = useState(false);
@@ -1563,7 +1579,7 @@ export default function App() {
     switch (id) {
       case 'signal':    return <SignalBody signal={signal} market={market} status={status} onManualTrade={manualTrade} />;
       case 'markets':   return <MarketsBody markets={markets} />;
-      case 'chart':     return <BtcChartBody market={market} candles={candles} currentCandle={currentCandle} />;
+      case 'chart':     return <BtcChartBody market={market} candles={candles} currentCandle={currentCandle} altCharts={altCharts} />;
       case 'edge':      return <EdgeChartBody market={market} />;
       case 'balance':   return <BalanceCurveBody trades={trades} status={status} />;
       case 'stats':     return <StatsBody status={status} />;
@@ -1609,7 +1625,7 @@ export default function App() {
             bodyStyle={{ height: 320, display: 'flex', flexDirection: 'column' }}
           >
             <div className="mobile-chart-wrap">
-              <BtcChartBody market={market} candles={candles} currentCandle={currentCandle} />
+              <BtcChartBody market={market} candles={candles} currentCandle={currentCandle} altCharts={altCharts} />
             </div>
           </MobileCard>
         );
@@ -1749,7 +1765,7 @@ export default function App() {
             defaultOpen
           >
             <div className="mobile-chart-wrap">
-              <BtcChartBody market={market} candles={candles} currentCandle={currentCandle} />
+            <BtcChartBody market={market} candles={candles} currentCandle={currentCandle} altCharts={altCharts} />
             </div>
           </MobileCard>
 
