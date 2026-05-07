@@ -48,23 +48,27 @@ const DEFAULT_LAYOUT = [
   { i: 'positions', x: 28, y: 32, w: 8,  h: 10, minW: 5,  minH: 6  },
   { i: 'trades',    x: 0,  y: 36, w: 20, h: 16, minW: 8,  minH: 8  },
   { i: 'history',   x: 20, y: 36, w: 16, h: 16, minW: 8,  minH: 8  },
+  { i: 'chart-sol', x: 0,  y: 52, w: 18, h: 22, minW: 10, minH: 14 },
+  { i: 'chart-eth', x: 18, y: 52, w: 18, h: 22, minW: 10, minH: 14 },
 ];
 
 const PANEL_NAMES = {
-  signal:    'Signal',
-  markets:   'Mercados Multi-Asset',
-  chart:     'BTC / USDT',
-  edge:      'Live Edge',
-  balance:   'Balance Curve',
-  stats:     'Performance',
-  risk:      'Risk Monitor',
-  positions: 'Posições Abertas',
-  trades:    'Trade Log',
-  history:   'Histórico',
+  signal:      'Signal',
+  markets:     'Mercados Multi-Asset',
+  chart:       'BTC / USDT',
+  edge:        'Live Edge',
+  balance:     'Balance Curve',
+  stats:       'Performance',
+  risk:        'Risk Monitor',
+  positions:   'Posições Abertas',
+  trades:      'Trade Log',
+  history:     'Histórico',
+  'chart-sol': 'SOL / USDT',
+  'chart-eth': 'ETH / USDT',
 };
 
 // ─── FORMATTERS ──────────────────────────────────────────────────────────────
-const DEFAULT_MOBILE_ORDER = ['signal', 'positions', 'chart', 'edge', 'stats', 'risk', 'balance', 'markets', 'trades', 'history'];
+const DEFAULT_MOBILE_ORDER = ['signal', 'positions', 'chart', 'chart-sol', 'chart-eth', 'edge', 'stats', 'risk', 'balance', 'markets', 'trades', 'history'];
 
 const fmt$ = (n, dec = 0) => {
   if (n == null || isNaN(n)) return '$0';
@@ -1020,6 +1024,132 @@ function BtcChartBody({ market, candles, currentCandle, altCharts }) {
   );
 }
 
+// ─── ALT ASSET CHART BODY (SOL / ETH) ────────────────────────────────────────
+function AltAssetChartBody({ asset, altCharts }) {
+  const assetColor = asset === 'SOL' ? '#9945ff' : '#627eea';
+
+  const [altData, setAltData] = useState(null);
+  const [indicatorToggles, setIndicatorToggles] = useState(() => {
+    try {
+      const saved = localStorage.getItem(`ptb-chart-indicators-${asset}-v1`);
+      if (saved) return JSON.parse(saved);
+    } catch (_) { /* ignore */ }
+    return { bollinger: true, vwap: false, ema9: true, ema21: true };
+  });
+
+  const fetchData = useCallback(() => {
+    api.getAltCandles(asset)
+      .then(d => setAltData(d))
+      .catch(() => {});
+  }, [asset]);
+
+  useEffect(() => {
+    fetchData();
+    const timer = setInterval(fetchData, 5000);
+    return () => clearInterval(timer);
+  }, [fetchData]);
+
+  useEffect(() => {
+    localStorage.setItem(`ptb-chart-indicators-${asset}-v1`, JSON.stringify(indicatorToggles));
+  }, [indicatorToggles, asset]);
+
+  const toggleIndicator = (key) => setIndicatorToggles(prev => ({ ...prev, [key]: !prev[key] }));
+
+  const displayCandles       = (altData?.candles?.length ? altData.candles : altCharts?.[asset]?.candles) ?? [];
+  const displayCurrentCandle = altData?.currentCandle ?? altCharts?.[asset]?.currentCandle ?? null;
+  const info                 = altData || altCharts?.[asset] || null;
+
+  const indicatorMeta = [
+    { key: 'bollinger', label: 'BB',     color: '#ff6b7f' },
+    { key: 'vwap',      label: 'VWAP',   color: '#c486ff' },
+    { key: 'ema9',      label: 'EMA 9',  color: '#f7b955' },
+    { key: 'ema21',     label: 'EMA 21', color: '#6ea8ff' },
+  ];
+
+  return (
+    <>
+      <div style={{
+        padding: '4px 12px', background: 'var(--s2)', borderBottom: '1px solid var(--border)',
+        display: 'flex', justifyContent: 'space-between', alignItems: 'center', flexWrap: 'wrap', gap: 8, flexShrink: 0,
+      }}>
+        {/* Asset label */}
+        <div style={{ display: 'flex', gap: 6, alignItems: 'center' }}>
+          <span style={{ fontWeight: 700, fontSize: 9, color: assetColor, letterSpacing: '0.08em' }}>{asset}/USDT</span>
+        </div>
+        {/* Price / connection info */}
+        <div style={{ display: 'flex', gap: 10, alignItems: 'center', fontSize: 8 }}>
+          <span style={{ fontWeight: 700, color: 'var(--t1)' }}>
+            {info ? `$${info.price?.toLocaleString(undefined, { maximumFractionDigits: 4 })}` : '—'}
+          </span>
+          <span style={{ color: 'var(--t3)' }}>
+            {info?.source === 'live-ws' ? 'candles 5s · Binance WS' : 'candles 1m · Binance REST'}
+          </span>
+          {!info && <span style={{ color: 'var(--amber)' }}>Carregando…</span>}
+        </div>
+        {/* Poly odds */}
+        {info?.polyPrice != null && (
+          <div style={{ display: 'flex', gap: 12, alignItems: 'center', fontSize: 8 }}>
+            <span style={{ color: 'var(--t2)' }}>
+              POLY YES <span style={{ color: 'var(--t1)', fontWeight: 700 }}>
+                {(info.polyPrice * 100).toFixed(1)}¢
+              </span>
+            </span>
+            {info?.impliedProb != null && (
+              <span style={{ color: 'var(--t2)' }}>
+                IMPLIED <span style={{ color: (info.impliedProb || 0.5) > 0.5 ? 'var(--green)' : 'var(--red)', fontWeight: 700 }}>
+                  {(info.impliedProb * 100).toFixed(1)}¢
+                </span>
+              </span>
+            )}
+            {info?.edge != null && (
+              <span style={{ fontWeight: 700, color: Math.abs(info.edge || 0) > 0.03 ? ((info.edge || 0) > 0 ? 'var(--green)' : 'var(--red)') : 'var(--t3)' }}>
+                EDGE {fmtEdge(info.edge || 0)}
+              </span>
+            )}
+            {info?.polyQuestion && (
+              <span style={{ color: 'var(--t3)', maxWidth: 160, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                {info.polyQuestion}
+              </span>
+            )}
+          </div>
+        )}
+        {/* Indicator toggles */}
+        <div style={{ display: 'flex', gap: 6, alignItems: 'center', flexWrap: 'wrap' }}>
+          {indicatorMeta.map((indicator) => {
+            const active = !!indicatorToggles[indicator.key];
+            return (
+              <button
+                key={indicator.key}
+                type="button"
+                onClick={() => toggleIndicator(indicator.key)}
+                style={{
+                  border: `1px solid ${active ? indicator.color : 'var(--border)'}`,
+                  background: active ? `${indicator.color}18` : 'transparent',
+                  color: active ? indicator.color : 'var(--t3)',
+                  borderRadius: 999, padding: '3px 8px',
+                  fontSize: 8, fontWeight: 700, letterSpacing: '0.05em',
+                  cursor: 'pointer', transition: 'all .15s ease',
+                }}
+                title={active ? `Ocultar ${indicator.label}` : `Mostrar ${indicator.label}`}
+              >
+                {active ? 'ON' : 'OFF'} {indicator.label}
+              </button>
+            );
+          })}
+        </div>
+      </div>
+      <div style={{ flex: 1, minHeight: 0 }}>
+        {displayCandles.length > 0 || displayCurrentCandle
+          ? <CandleChart key={asset} candles={displayCandles} currentCandle={displayCurrentCandle} indicators={indicatorToggles} />
+          : <div style={{ height: '100%', display: 'flex', alignItems: 'center', justifyContent: 'center', color: 'var(--t2)', fontSize: 10 }}>
+              Carregando {asset}/USDT…
+            </div>
+        }
+      </div>
+    </>
+  );
+}
+
 // ─── EDGE CHART BODY ──────────────────────────────────────────────────────────
 function EdgeChartBody({ market }) {
   const data = (market.edgeHistory || []).slice(-80).map((e, i) => ({
@@ -1553,6 +1683,18 @@ export default function App() {
       const up = (market.btcChange24h ?? 0) >= 0;
       return <span style={{ fontSize: 9, fontWeight: 700, color: up ? 'var(--green)' : 'var(--red)', marginLeft: 4 }}>{market.btcPrice ? fmtPrice(market.btcPrice) : '—'}</span>;
     }
+    if (id === 'chart-sol') {
+      const price = altCharts?.SOL?.price;
+      return price
+        ? <span style={{ fontSize: 9, fontWeight: 700, color: '#9945ff', marginLeft: 4 }}>${Number(price).toLocaleString(undefined, { maximumFractionDigits: 2 })}</span>
+        : null;
+    }
+    if (id === 'chart-eth') {
+      const price = altCharts?.ETH?.price;
+      return price
+        ? <span style={{ fontSize: 9, fontWeight: 700, color: '#627eea', marginLeft: 4 }}>${Number(price).toLocaleString(undefined, { maximumFractionDigits: 2 })}</span>
+        : null;
+    }
     if (id === 'edge') {
       const edge = market.edge || 0;
       return (
@@ -1586,6 +1728,8 @@ export default function App() {
       case 'signal':    return <SignalBody signal={signal} market={market} status={status} onManualTrade={manualTrade} />;
       case 'markets':   return <MarketsBody markets={markets} />;
       case 'chart':     return <BtcChartBody market={market} candles={candles} currentCandle={currentCandle} altCharts={altCharts} />;
+      case 'chart-sol': return <AltAssetChartBody asset="SOL" altCharts={altCharts} />;
+      case 'chart-eth': return <AltAssetChartBody asset="ETH" altCharts={altCharts} />;
       case 'edge':      return <EdgeChartBody market={market} />;
       case 'balance':   return <BalanceCurveBody trades={trades} status={status} />;
       case 'stats':     return <StatsBody status={status} />;
@@ -1632,6 +1776,32 @@ export default function App() {
           >
             <div className="mobile-chart-wrap">
               <BtcChartBody market={market} candles={candles} currentCandle={currentCandle} altCharts={altCharts} />
+            </div>
+          </MobileCard>
+        );
+      case 'chart-sol':
+        return (
+          <MobileCard
+            title="SOL / USDT"
+            badge={altCharts?.SOL?.price ? <span style={{ fontSize: 9, fontWeight: 700, color: '#9945ff' }}>${Number(altCharts.SOL.price).toLocaleString(undefined, { maximumFractionDigits: 2 })}</span> : null}
+            defaultOpen={false}
+            bodyStyle={{ height: 320, display: 'flex', flexDirection: 'column' }}
+          >
+            <div className="mobile-chart-wrap">
+              <AltAssetChartBody asset="SOL" altCharts={altCharts} />
+            </div>
+          </MobileCard>
+        );
+      case 'chart-eth':
+        return (
+          <MobileCard
+            title="ETH / USDT"
+            badge={altCharts?.ETH?.price ? <span style={{ fontSize: 9, fontWeight: 700, color: '#627eea' }}>${Number(altCharts.ETH.price).toLocaleString(undefined, { maximumFractionDigits: 2 })}</span> : null}
+            defaultOpen={false}
+            bodyStyle={{ height: 320, display: 'flex', flexDirection: 'column' }}
+          >
+            <div className="mobile-chart-wrap">
+              <AltAssetChartBody asset="ETH" altCharts={altCharts} />
             </div>
           </MobileCard>
         );
