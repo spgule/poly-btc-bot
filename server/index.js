@@ -2990,14 +2990,28 @@ function monitorPositions() {
 }
 
 // ── TRADE EXECUTION ───────────────────────────────────────────────────────────
+// inFlight set: tracks (marketId+side) pairs currently in async executeTrade().
+// Prevents duplicate orders when runArbitrageCheck fires at 100ms and 400ms
+// simultaneously while the first await latency is still pending.
+const _inFlight = new Set();
+
 async function executeTrade(signal) {
   if (!signal || signal.betSize < 1) return;
 
-  // Use effective balance (cash + open position cost + unrealized P&L) for drawdown
+  // Duplicate-order guard: reject if this exact market+side combo is already
+  // awaiting CLOB confirmation. Critical in LIVE — double-submitting an order
+  // to the Polymarket CLOB creates two fills and doubles risk.
+  const flightKey = `${signal.marketId}:${signal.side}`;
+  if (_inFlight.has(flightKey)) return;
+  _inFlight.add(flightKey);
+
+  try {
+  // Use effective balance (cash + open position cost) for drawdown.
+  // Do NOT include unrealizedPnl — unrealized gains are not spendable and
+  // inflating effectiveBal would loosen the exposure cap artificially.
   const openPos      = state.positions.filter(p => p.status === 'OPEN');
-  const openCost     = openPos.reduce((s, p) => s + (p.cost     || 0), 0);
-  const unrealized   = openPos.reduce((s, p) => s + (p.unrealizedPnl || 0), 0);
-  const effectiveBal = state.trading.balance + openCost + unrealized;
+  const openCost     = openPos.reduce((s, p) => s + (p.cost || 0), 0);
+  const effectiveBal = state.trading.balance + openCost;
   const drawdown     = state.trading.startBalance > 0
     ? (state.trading.startBalance - effectiveBal) / state.trading.startBalance
     : 0;
@@ -3025,6 +3039,9 @@ async function executeTrade(signal) {
 
   openPosition(signal);
   if (state.config.mode === 'LIVE') console.log('[LIVE] Order stub — CLOB API not yet implemented');
+  } finally {
+    _inFlight.delete(flightKey);
+  }
 }
 
 // legacy sim kept for reference but no longer called
@@ -3410,9 +3427,10 @@ server.listen(PORT, async () => {
   connectBinance();
   await fetchBTCMarkets();
   syncPolyMarketSubscription();
-  // Refresh markets every 30s — fresher Polymarket prices = more edge opportunities.
-  // 30s is well within Gamma API rate limits and gives 3x more price updates per window.
-  setInterval(fetchBTCMarkets, 30 * 1000);
+  // Refresh markets every 15s — short "Up or Down" windows last 5-15 min,
+  // so 30s poll risked missing an entire window. 15s keeps price data fresh
+  // while staying well within Gamma API rate limits.
+  setInterval(fetchBTCMarkets, 15 * 1000);
   setInterval(syncPolyMarketSubscription, 2000);
   // Sim market price model: re-prices non-live markets every 2s using real BTC + binary option math
   setInterval(updateSimMarketPrices, 2000);
