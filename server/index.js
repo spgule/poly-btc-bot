@@ -1382,12 +1382,12 @@ function seedSimMarkets() {
     { id: 'sim-6', minutes: 30, volume: 52000 },
   ];
 
-  // Strike = BTC price from ~5 min ago (oldest entry in priceHistory).
-  // Using the historical baseline means edge = 5-minute BTC drift at seed time,
-  // so the bot can trade IMMEDIATELY after reseed rather than waiting for BTC
-  // to move away from a strike set at the current price (which would give edge ≈ 0).
-  // Falls back to btcNow only if priceHistory is empty (very first startup tick).
-  const simStrike = (state.priceHistory.length > 0 ? state.priceHistory[0].price : btcNow);
+  // Strike = current BTC price at seed time (window open price).
+  // With the lagged-poly design, edge = computeBinaryMid(btcNow) - computeBinaryMid(btcLagged90s).
+  // Strike represents the price at the start of the market window — exactly how real
+  // Polymarket "Up or Down" markets work. Edge builds naturally as BTC moves over 90s.
+  // No need to use 5-min-old strike to create artificial immediate edge.
+  const simStrike = btcNow;
 
   const liveMarkets = state.markets.filter(m => m.live);
   state.markets = [
@@ -1398,9 +1398,8 @@ function seedSimMarkets() {
       const startDate   = new Date(windowStart).toISOString();
       const endDate     = new Date(endMs).toISOString();
       const question    = `Bitcoin Up or Down - ${dateLabel}, ${fmtET(windowStart)}-${fmtET(endMs)} ET`;
-      // Use simStrike (BTC ~5 min ago) so the binary model already reflects the
-      // recent directional drift. outcomePrices frozen at 0.5 (poly reference);
-      // edge = computeBinaryMid(btcNow, strike=simStrike) - 0.5 is non-zero from the start.
+      // Initial poly = computeBinaryMid with current BTC (0.5 when strike = btcNow).
+      // updateSimMarketPrices() will update to btcLagged90s every 2s.
       return {
         id,
         question,
@@ -2738,25 +2737,32 @@ function updateSimMarketPrices() {
 
   if (allExpired || ladderTooFar || allExtreme) {
     seedSimMarkets();
-    // No post-reseed poly update needed. New markets start with outcomePrices[0] = 0.50
-    // (set in seedSimMarkets) and poly stays frozen at that value — see design note below.
     return;
   }
 
-  // ── FROZEN POLY DESIGN ──────────────────────────────────────────────────────
-  // poly (outcomePrices[0]) is intentionally NOT updated here. It stays at 0.50 from
-  // seed time forever, acting as a frozen market-maker reference price.
+  // ── LAGGED POLY DESIGN (faithful Polymarket simulation) ─────────────────────
+  // poly (outcomePrices[0]) = computeBinaryMid(market, btcLagged90s).
   //
-  // implied = computeBinaryMid(market, btcNow) is computed fresh on every tick in
-  // computeEdge(). As BTC moves away from _strikeSnapshot, implied drifts away from
-  // 0.50 continuously. edge = implied − 0.50 grows in real-time.
+  // This faithfully simulates the ~90s Polymarket update cycle:
+  //   implied = computeBinaryMid(btcNow)       — current fair value (real BTC)
+  //   poly    = computeBinaryMid(btcLagged90s) — what market showed 90s ago (real BTC)
+  //   edge    = implied − poly                 — only exists when BTC moved in last 90s
   //
-  // Why this eliminates burst-then-silence:
-  //   Previous design: poly updated every N seconds from getPriceAt(lag). When the lag
-  //   "caught up" after a spike (btcLagged ≈ btcNow), poly ≈ implied → edge collapsed
-  //   to 0. Bot silent until next BTC move.
-  //   New design: poly never changes → edge = implied − 0.50 is always non-zero as
-  //   long as BTC ≠ _strikeSnapshot. Any BTC drift produces persistent, tradeable edge.
+  // This means:
+  //   • BTC flat for 90s → poly catches up → edge ≈ 0 → no entries (correct)
+  //   • BTC moves +0.5% in 90s → poly stale → real edge → entry fires (correct)
+  //   • At startup (< 90s history) → btcLagged ≈ btcNow → edge ≈ 0 → no fake entries
+  //
+  // Previous "frozen at 0.50" design: created permanent artificial edge any time
+  // BTC ≠ _strikeSnapshot — caused invented entries even during flat markets.
+  const btcLagged90s = getPriceAt(90000); // BTC price 90 seconds ago (real history)
+  for (const m of activeSims) {
+    const laggedPoly = computeBinaryMid(m, btcLagged90s);
+    m.outcomePrices = [
+      Math.round(laggedPoly * 10000) / 10000,
+      Math.round((1 - laggedPoly) * 10000) / 10000,
+    ];
+  }
 }
 
 function getPositionCloseDeadline(pos, market) {
