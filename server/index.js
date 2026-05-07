@@ -2676,12 +2676,15 @@ function runArbitrageCheck() {
   const volumeOk = !tradeMarket.live || liveVolume >= liveVolumeMin;
   if (!volumeOk) diagnostics.blockers.push('market_volume');
 
-  // Daily spending cap check — surfaced here so UI shows DAILY_CAP instead of phantom READY.
-  // Cap = 20% of starting capital per day (cumulative bet cost, not just losses).
-  // Previously only checked inside openPosition() with a silent return — caused the bot to
-  // appear ready but never execute after a few trades without any visible explanation.
+  // Daily spending cap — only applies in LIVE mode (real money protection).
+  // In SIM mode the cap is skipped entirely: it is a capital-preservation guard
+  // for real funds, not a simulation constraint. Applying it in SIM caused the bot
+  // to silently stop after 4-10 trades ($200 cap on $1000 capital) even though
+  // the signal was valid, making the simulation useless for strategy testing.
   const _dailyCap = (state.config.capital || 1000) * 0.20;
-  const dailyCapOk = (state.stats.todayCost || 0) + state.currentSignal.betSize <= _dailyCap;
+  const dailyCapOk = state.config.mode === 'SIM'
+    ? true
+    : (state.stats.todayCost || 0) + state.currentSignal.betSize <= _dailyCap;
   if (!dailyCapOk) diagnostics.blockers.push('daily_cap');
 
   if (state.config.autoTrade && state.currentSignal.betSize >= 1 && canTrade && stableOk && safeBalance && !hasOpposite && exposureOk && volumeOk && dailyCapOk) {
