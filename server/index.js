@@ -175,7 +175,7 @@ function applyConfigPatch(patch = {}) {
   }
   if (patch.maxBetPct !== undefined) c.maxBetPct = Math.min(50, Math.max(1, Number(patch.maxBetPct) || c.maxBetPct));
   if (patch.minEdge !== undefined) c.minEdge = Math.min(0.5, Math.max(0.01, Number(patch.minEdge) || c.minEdge));
-  if (patch.killThreshold !== undefined) c.killThreshold = Math.min(100, Math.max(5, Number(patch.killThreshold) || c.killThreshold));
+  if (patch.killThreshold !== undefined) c.killThreshold = Math.min(100, Math.max(0, Number(patch.killThreshold) || 0));
   if (patch.autoTrade !== undefined) c.autoTrade = Boolean(patch.autoTrade);
   if (patch.takeProfitPct !== undefined) c.takeProfitPct = Math.min(100, Math.max(1, Number(patch.takeProfitPct) || c.takeProfitPct));
   if (patch.stopLossPct !== undefined) c.stopLossPct = Math.min(100, Math.max(1, Number(patch.stopLossPct) || c.stopLossPct));
@@ -236,8 +236,8 @@ function buildTradeSignal(market, now = Date.now()) {
   const betSize      = Math.round(rawBetSize * timeMult * 100) / 100;
 
   // ── Confidence score ──────────────────────────────────────────────────────────
-  const velBonus      = edgeVelocity() > 0.003 ? 10 : 0;
-  const qualBonus     = Math.round(edgeQuality(cappedEdge) * 20);
+  const velBonus      = edgeVelocity(market) > 0.003 ? 10 : 0;
+  const qualBonus     = Math.round(edgeQuality(cappedEdge, market) * 20);
   const bollingerBonus = bollingerBias === 'favorable' ? 6 : bollingerBias === 'unfavorable' ? -8 : 0;
   const trendBonus    = trendBias === 'favorable' ? 6 : trendBias === 'unfavorable' ? -8 : 0;
   const fibBonus      = fibBias === 'favorable' ? 8 : fibBias === 'unfavorable' ? -10 : 0;
@@ -246,7 +246,7 @@ function buildTradeSignal(market, now = Date.now()) {
   // Flow imbalance bonus: pressão de compra/venda alinhada com direção do trade → +7
   // contra → -7. Usa Binance aggTrades (isSell flag), populado igual em SIM e LIVE.
   // Fonte: Polymarket-BTC-15-Minute-Trading-Bot order_book_imbalance_processor.py
-  const imb = flowImbalance();
+  const imb = flowImbalance(market);
   const imbBonus = Math.abs(imb) >= 0.30
     ? ((side === 'BUY_YES' && imb > 0) || (side === 'BUY_NO' && imb < 0) ? 7 : -7)
     : 0;
@@ -258,6 +258,7 @@ function buildTradeSignal(market, now = Date.now()) {
   return {
     marketId: context.marketId,
     question: context.question,
+    asset: getAssetKey(market),
     side,
     edge: cappedEdge,
     impliedProb: implied,
@@ -376,6 +377,7 @@ const state = {
   currentSignal:    null,
   signalDiagnostics: {
     ts: null,
+    asset: 'BTC',
     marketId: null,
     question: null,
     side: null,
@@ -415,6 +417,7 @@ const state = {
   solPriceCoalesced: 0,
   _solCoalesceWin:   { sumPQ: 0, sumQ: 0, start: 0 },
   solPriceHistory:   [],
+  solVolHistory:     [],
   solCandles:        [],
   solCurrentCandle:  null,
   solConnected:      false,
@@ -424,6 +427,7 @@ const state = {
   ethPriceCoalesced: 0,
   _ethCoalesceWin:   { sumPQ: 0, sumQ: 0, start: 0 },
   ethPriceHistory:   [],
+  ethVolHistory:     [],
   ethCandles:        [],
   ethCurrentCandle:  null,
   ethConnected:      false,
@@ -479,6 +483,13 @@ function getAssetPriceHistory(market) {
   if (a === 'SOL') return state.solPriceHistory;
   if (a === 'ETH') return state.ethPriceHistory;
   return state.priceHistory;
+}
+
+function getAssetVolHistory(market) {
+  const a = getAssetKey(market);
+  if (a === 'SOL') return state.solVolHistory;
+  if (a === 'ETH') return state.ethVolHistory;
+  return state.volHistory;
 }
 
 function getAssetCandles(market) {
@@ -547,6 +558,7 @@ function clampProb(value) {
 function setSignalDiagnostics(patch = {}) {
   state.signalDiagnostics = {
     ts: null,
+    asset: 'BTC',
     marketId: null,
     question: null,
     side: null,
@@ -1027,6 +1039,9 @@ function connectAltAsset(symbol, assetKey) {
       // Price history (5-min window)
       state[histKey].push({ price, time: now });
       state[histKey] = state[histKey].filter(p => now - p.time <= PRICE_HIST_MS);
+      const volHistKey = KEY === 'SOL' ? 'solVolHistory' : 'ethVolHistory';
+      state[volHistKey].push({ qty, isSell, time: now });
+      state[volHistKey] = state[volHistKey].filter(v => now - v.time <= 60000);
 
       // 5s OHLCV candles
       updateCandleForAsset(price, now, qty, candlesKey, curCandleKey);
@@ -1847,6 +1862,11 @@ function getPriceAt(msAgo) {
   return closest.price;
 }
 
+function getPriceAtForMarket(market, msAgo) {
+  const history = getAssetPriceHistory(market);
+  return getPriceAtFromHistory(history, msAgo, getAssetPrice(market));
+}
+
 function getMarketMinutesLeft(market, now = Date.now()) {
   if (!market?.endDate) return 10;
   return (new Date(market.endDate).getTime() - now) / 60000;
@@ -1906,6 +1926,12 @@ function getMarketYesPrice(market) {
 
 function getMarketPriceDistance(market) {
   return Math.abs(getMarketYesPrice(market) - 0.5);
+}
+
+function getMarketMinVolume(market) {
+  const asset = getAssetKey(market);
+  if (asset === 'SOL' || asset === 'ETH') return 5000;
+  return 50000;
 }
 
 function getSimStrike(market) {
@@ -1974,7 +2000,7 @@ function hasTradableLiveMarket(now = Date.now()) {
     // A market 400 min away is not "available" for trading right now and should not
     // block SIM fallback.
     if (minLeft < 1 || minLeft > 30.5) return false;
-    if (Number(m.volume || 0) < 50000) return false;
+    if (Number(m.volume || 0) < getMarketMinVolume(m)) return false;
     return getMarketPriceDistance(m) <= 0.42;
   });
 }
@@ -2357,8 +2383,9 @@ function buildSignalContext(market, now = Date.now()) {
 // Only enter when edge is expanding — avoids chasing edges that already peaked.
 // Uses relative window (last half vs first half of recent history) so it works
 // correctly at both 10 Hz (WS) and 0.5 Hz (REST fallback) tick rates.
-function edgeVelocity() {
-  const h = state.edgeHistory;
+function edgeVelocity(market = null) {
+  const asset = getAssetKey(market);
+  const h = state.edgeHistory.filter(e => (e.asset || 'BTC') === asset);
   if (h.length < 4) return 0;
   const mid = Math.ceil(h.length / 2);
   const recent = h.slice(mid);
@@ -2370,8 +2397,9 @@ function edgeVelocity() {
 
 // Edge quality: ratio of consistent-direction samples in recent 1/3 of history.
 // 1.0 = all samples agree, 0.5 = random noise.
-function edgeQuality(edge) {
-  const h = state.edgeHistory;
+function edgeQuality(edge, market = null) {
+  const asset = getAssetKey(market);
+  const h = state.edgeHistory.filter(e => (e.asset || 'BTC') === asset);
   if (h.length < 3) return 0.5;
   const recentSlice = h.slice(-Math.max(3, Math.ceil(h.length / 3)));
   const significant = recentSlice.filter(e => Math.abs(e.edge) > 0.005);
@@ -2414,7 +2442,7 @@ function getBestMarket(preferLiveOnly = false) {
     if (priceDist > 0.42) return { m, score: -1 }; // YES > 0.92 or < 0.08 — exclude
     const q = (m.question || '').toLowerCase();
     const isUpOrDown = /up or down/.test(q);
-    if (m.live && Number(m.volume || 0) < 50000) return { m, score: -1 };
+    if (m.live && Number(m.volume || 0) < getMarketMinVolume(m)) return { m, score: -1 };
     if (isSim && minLeft > maxMinutes) return { m, score: -1 };
     const assetCurrentPrice = getAssetPrice(m);
     const strike = getSimStrike(m);
@@ -2595,10 +2623,11 @@ function kellySize(edge, winProb, entryPrice, balance, maxBetPct) {
   return raw >= 1 ? raw : 0;
 }
 
-function computeVPIN() {
+function computeVPIN(market = null) {
   const now = Date.now();
+  const volHistory = getAssetVolHistory(market);
   let buyVol = 0, sellVol = 0;
-  for (const v of state.volHistory) {
+  for (const v of volHistory) {
     if (now - v.time <= 60000) {
       if (v.isSell) sellVol += v.qty;
       else buyVol += v.qty;
@@ -2614,10 +2643,11 @@ function computeVPIN() {
 // Usa o mesmo state.volHistory (Binance aggTrades, isSell flag), populado
 // identicamente em SIM e LIVE.
 // Fonte: Polymarket-BTC-15-Minute-Trading-Bot / order_book_imbalance_processor.py
-function flowImbalance() {
+function flowImbalance(market = null) {
   const now = Date.now();
+  const volHistory = getAssetVolHistory(market);
   let buyVol = 0, sellVol = 0;
-  for (const v of state.volHistory) {
+  for (const v of volHistory) {
     if (now - v.time <= 30000) {  // janela 30s — mais responsiva que VPIN (60s)
       if (v.isSell) sellVol += v.qty;
       else          buyVol  += v.qty;
@@ -2627,21 +2657,24 @@ function flowImbalance() {
   return total === 0 ? 0 : (buyVol - sellVol) / total;  // -1 a +1
 }
 
-function isGoodEntry(edge) {
-  const vel   = edgeVelocity();
-  const qual  = edgeQuality(edge);
+function isGoodEntry(edge, market = null) {
+  const vel   = edgeVelocity(market);
+  const qual  = edgeQuality(edge, market);
   // Fast path: very strong edge + quality → enter immediately
   if (Math.abs(edge) >= state.config.minEdge * 2.0 && qual >= 0.65) return true;
   const now     = Date.now();
+  const asset = getAssetKey(market);
   const recent  = state.edgeHistory.filter(e =>
-    now - e.time <= 1200 && Math.abs(e.edge) >= state.config.minEdge * 0.5
+    (e.asset || 'BTC') === asset &&
+    now - e.time <= 1200 &&
+    Math.abs(e.edge) >= state.config.minEdge * 0.5
   );
   const bullish = edge > 0;
   const sameDir = recent.length > 0 && recent.every(e => (e.edge > 0) === bullish);
   // Enter when edge is opening or holding (vel >= -0.002), quality >= 60%, 2+ recent samples
   return vel >= -0.002 && qual >= 0.60 && recent.length >= 2 && sameDir;
 }
-function hasStableEdge(edge) { return isGoodEntry(edge); }
+function hasStableEdge(edge, market = null) { return isGoodEntry(edge, market); }
 
 function runArbitrageCheck() {
   const now = Date.now();
@@ -2652,6 +2685,7 @@ function runArbitrageCheck() {
     const context = buildSignalContext(topMarket, now);
     setSignalDiagnostics({
       marketId: context?.marketId ?? null,
+      asset: getAssetKey(topMarket),
       question: context?.question ?? null,
       side: context?.side ?? null,
       implied: context?.implied ?? null,
@@ -2703,7 +2737,7 @@ function runArbitrageCheck() {
     const ml = getMarketMinutesLeft(m, now);
     if (ml < 1 || ml > 30.5) return false;
     if (m.priceIsEstimated) return false;
-    if (m.live && Number(m.volume || 0) < 50000) return false;
+    if (m.live && Number(m.volume || 0) < getMarketMinVolume(m)) return false;
     if (getMarketPriceDistance(m) > 0.42) return false;
     return true;
   })].filter(m => !_polyStaleExclude(m)).slice(0, 10); // also prune topMarket if stale
@@ -2732,6 +2766,7 @@ function runArbitrageCheck() {
     }
     setSignalDiagnostics({
       marketId: context?.marketId ?? topMarket.id,
+      asset: getAssetKey(topMarket),
       question: context?.question ?? topMarket.question,
       side: context?.side ?? null,
       implied: context?.implied ?? null,
@@ -2769,12 +2804,13 @@ function runArbitrageCheck() {
 
   // Always record edge history so the Binance-vs-Poly chart is always populated.
   // The stability window (hasStableEdge) filters by minEdge separately below.
-  state.edgeHistory.push({ time: signalTs, edge, implied, poly });
+  state.edgeHistory.push({ time: signalTs, edge, implied, poly, asset: getAssetKey(market) });
   if (state.edgeHistory.length > 80) state.edgeHistory.shift();
 
   state.currentSignal = {
     marketId:    signalCandidate.marketId,
     question:    signalCandidate.question,
+    asset:       signalCandidate.asset,
     side:        signalCandidate.side,
     edge:        signalCandidate.edge,
     impliedProb: signalCandidate.impliedProb,
@@ -2787,14 +2823,11 @@ function runArbitrageCheck() {
     trendBias: signalCandidate.trendBias,
     fib: signalCandidate.fib,
     fibBias: signalCandidate.fibBias,
+    _rawEdge: signalCandidate._rawEdge,
+    _dynMinEdge: signalCandidate._dynMinEdge,
     timestamp:   signalCandidate.timestamp,
   };
   const side = signalCandidate.side;
-
-  const openCount = state.positions.filter(p => p.status === 'OPEN').length;
-  const canTrade  = openCount < state.config.maxOpenPos;
-  // Stability check is optional — disable for high-frequency scalping
-  const stableOk  = !state.config.requireStableEdge || isGoodEntry(edge);
 
   // Guard: NEVER open opposite direction on the same market — self-canceling trades.
   // Also block same-side duplicate on the same market: concentrates risk with zero
@@ -2820,7 +2853,7 @@ function runArbitrageCheck() {
       if (m.priceIsEstimated) return false;
       const priceDist = Math.abs((m.outcomePrices?.[0] ?? 0.5) - 0.5);
       if (priceDist > 0.42) return false; // skip skewed markets
-      if (m.live && Number(m.volume || 0) < 50000) return false; // volume filter
+      if (m.live && Number(m.volume || 0) < getMarketMinVolume(m)) return false; // volume filter
       const msLeft = m.endDate ? new Date(m.endDate).getTime() - now : 10 * 60000;
       if (msLeft < 60000 || msLeft > 30.5 * 60000) return false; // respect duration window
       return !state.positions.some(p => p.status === 'OPEN' && p.marketId === m.id && p.side !== side);
@@ -2852,6 +2885,7 @@ function runArbitrageCheck() {
       state.currentSignal = {
         marketId: altSignal.marketId,
         question: altSignal.question,
+        asset: altSignal.asset,
         side: altSignal.side,
         edge: altSignal.edge,
         impliedProb: altSignal.impliedProb,
@@ -2864,10 +2898,20 @@ function runArbitrageCheck() {
         trendBias: altSignal.trendBias,
         fib: altSignal.fib,
         fibBias: altSignal.fibBias,
+        _rawEdge: altSignal._rawEdge,
+        _dynMinEdge: altSignal._dynMinEdge,
         timestamp: altSignal.timestamp,
       };
     }
   }
+
+  const signalEdge = state.currentSignal?._rawEdge ?? edge;
+  const signalDynMinEdge = state.currentSignal?._dynMinEdge ?? dynMinEdge;
+  const signalMarketContext = tradeMarket;
+  const openCount = state.positions.filter(p => p.status === 'OPEN').length;
+  const canTrade  = openCount < state.config.maxOpenPos;
+  // Stability check is optional — disable for high-frequency scalping
+  const stableOk  = !state.config.requireStableEdge || isGoodEntry(signalEdge, signalMarketContext);
 
   // Total exposure cap: never risk more than 40% of effective balance across all open positions
   // Use effective balance (cash + open costs) not just cash — otherwise the cap tightens every
@@ -2920,7 +2964,7 @@ function runArbitrageCheck() {
 
   // 2. VPIN TOXICITY
   // VPIN = |buyVol-sellVol|/totalVol; se > 0.75 → pausar entradas
-  const vpin = computeVPIN();
+  const vpin = computeVPIN(signalMarketContext);
   diagnostics.vpin = vpin;
   if (vpin > 0.75) {
     state.currentSignal = null;
@@ -2932,33 +2976,34 @@ function runArbitrageCheck() {
 
   // 3. SPIKE DETECTION & MULTI-SIGNAL CONFIRMATION
   // Spike detection: se |BTC move em 3s| > 15bps (0.0015) → entrada DipArb imediata
-  const btc3sAgo = getPriceAt(3000);
-  const btcSpike = btc3sAgo > 0 ? Math.abs(state.btcPrice - btc3sAgo) / btc3sAgo : 0;
+  const signalNow = getAssetPrice(signalMarketContext);
+  const btc3sAgo = getPriceAtForMarket(signalMarketContext, 3000);
+  const btcSpike = btc3sAgo > 0 ? Math.abs(signalNow - btc3sAgo) / btc3sAgo : 0;
   const isSpike = btcSpike > 0.0015;
 
   // Multi-signal: exigir 2-de-4 sinais concordando
-  const btc10sAgo   = getPriceAt(10000);
-  const btcTrend10s = btc10sAgo > 0 ? (state.btcPrice - btc10sAgo) / btc10sAgo : 0;
+  const btc10sAgo   = getPriceAtForMarket(signalMarketContext, 10000);
+  const btcTrend10s = btc10sAgo > 0 ? (signalNow - btc10sAgo) / btc10sAgo : 0;
   const trendMatches = side === 'BUY_YES' ? btcTrend10s > 0 : btcTrend10s < 0;
-  const velOk = edgeVelocity() > 0.001;
+  const velOk = edgeVelocity(signalMarketContext) > 0.001;
 
   // edgeOk: sempre true aqui pois buildTradeSignal já filtrou |edge| < dynMinEdge.
   // Preserva o baseline do código original (edgeOk garantido = 1 sinal confirmado).
-  const edgeOk = Math.abs(edge) >= dynMinEdge;
+  const edgeOk = Math.abs(signalEdge) >= signalDynMinEdge;
 
   // Confidence-adjusted edge como 4º sinal (kalshi-ai-trading-bot pattern):
   // Conta como confirmação extra quando o edge supera o limiar escalonado por confiança.
   // NÃO substitui edgeOk — apenas acrescenta. Assim o baseline de 1 sinal nunca cai.
   const conf = signalCandidate.confidence;
-  const confAdjMinEdge = conf >= 80 ? dynMinEdge * 0.75
-                       : conf <  60 ? dynMinEdge * 1.33
-                       : dynMinEdge;
-  const confEdgeOk = Math.abs(edge) >= confAdjMinEdge;
+  const confAdjMinEdge = conf >= 80 ? signalDynMinEdge * 0.75
+                       : conf <  60 ? signalDynMinEdge * 1.33
+                       : signalDynMinEdge;
+  const confEdgeOk = Math.abs(signalEdge) >= confAdjMinEdge;
 
   // Flow imbalance como 5º sinal de confirmação (polymarket-btc-15min pattern).
   // Limiar 0.15 (15%) é realista para BTC aggTrades em janelas de 30s.
   // Pressão de ordem alinhada com a direção do trade = confirmação extra de fluxo real.
-  const imb = flowImbalance();
+  const imb = flowImbalance(signalMarketContext);
   const flowConfirms = Math.abs(imb) >= 0.15 &&
     ((side === 'BUY_YES' && imb > 0) || (side === 'BUY_NO' && imb < 0));
   const fibConfirms = signalCandidate.fibBias === 'favorable'
@@ -2978,13 +3023,14 @@ function runArbitrageCheck() {
   const fibAgainst   = signalCandidate.fibBias === 'unfavorable';
   const vetoCount    = [trendAgainst, flowAgainst, fibAgainst].filter(Boolean).length;
   Object.assign(diagnostics, {
+    asset: state.currentSignal.asset || getAssetKey(signalMarketContext),
     marketId: state.currentSignal.marketId,
     question: state.currentSignal.question,
     side: state.currentSignal.side,
     implied,
     poly,
-    edge,
-    dynMinEdge,
+    edge: signalEdge,
+    dynMinEdge: signalDynMinEdge,
     confirmedSignals,
     trendMatches,
     velOk,
@@ -3030,7 +3076,7 @@ function runArbitrageCheck() {
     return broadcastSignal();
   }
 
-  if (fibAgainst && !isSpike && Math.abs(edge) < dynMinEdge * 1.35) {
+  if (fibAgainst && !isSpike && Math.abs(signalEdge) < signalDynMinEdge * 1.35) {
     state.currentSignal = null;
     diagnostics.blockers.push('fib_exhaustion');
     diagnostics.blockReason = 'FIB_EXHAUSTION';
@@ -3078,7 +3124,7 @@ function runArbitrageCheck() {
     if (state.config.autoTrade && now - (runArbitrageCheck._lastBlockLog || 0) > 30000) {
       runArbitrageCheck._lastBlockLog = now;
       console.log(`[ARB BLOCKED] reason=${diagnostics.blockReason} blockers=[${diagnostics.blockers.join(',')}] ` +
-        `edge=${(signalCandidate._rawEdge*100).toFixed(2)}¢ betSize=$${state.currentSignal.betSize} ` +
+        `edge=${(signalEdge*100).toFixed(2)}¢ betSize=$${state.currentSignal.betSize} ` +
         `canTrade=${canTrade} stableOk=${stableOk} safeBalance=${safeBalance} exposureOk=${exposureOk} ` +
         `autoTrade=${state.config.autoTrade} mkt="${market.question?.slice(0,28)}"`);
     }
@@ -3220,7 +3266,7 @@ function openPosition(signal) {
   // ── REAL CLOB CONSTRAINTS (applied in both SIM and LIVE) ──────────────────
   const vol = Number(market.volume || 0);
 
-  const MIN_VOL = 50000;
+  const MIN_VOL = getMarketMinVolume(market);
   if (vol < MIN_VOL && !marketId.startsWith('sim-')) {
     console.log(`[CLOB] Skip — market volume $${vol.toLocaleString()} below minimum $${MIN_VOL.toLocaleString()}`);
     return;
@@ -3249,6 +3295,7 @@ function openPosition(signal) {
   const pos = {
     id:               nextId('p'),
     marketId,
+    asset:            signal.asset || getAssetKey(market),
     question:         (question || 'BTC Market').slice(0, 60),
     side,
     entryOdds:        fillOdds,
@@ -3262,7 +3309,7 @@ function openPosition(signal) {
     fib:              signal.fib || null,
     fibBias:          signal.fibBias || 'neutral',
     entryTime,
-    btcPriceAtEntry:  state.btcPrice,
+    btcPriceAtEntry:  getAssetPrice(market),
     // CLOB execution metadata (shown in trade log)
     spread:           fill.spread,
     impact:           fill.impact,
@@ -3421,6 +3468,7 @@ function closePosition(pos, exitOdds, reason) {
   const trade = {
     id:            `t-${Date.now()}`,
     marketId:      pos.marketId,
+    asset:         pos.asset || getAssetKey(market),
     question:      pos.question,
     side:          pos.side,
     betSize:       pos.cost,
@@ -3621,6 +3669,7 @@ function _legacySimTrade_unused(signal) {
 function broadcastMarketData() {
   const mkt            = getActiveSignalMarket();
   const { implied, poly, edge } = computeEdge(mkt);
+  const edgeHistory = state.edgeHistory.filter(e => (e.asset || 'BTC') === getAssetKey(mkt)).slice(-80);
   // Send only live tick + current candle. Full candle history (300 candles ~39KB)
   // is fetched by the 3s HTTP pollCandles — do NOT resend every 150ms WS tick.
   broadcast({
@@ -3634,7 +3683,7 @@ function broadcastMarketData() {
       impliedProb:  implied,
       polyOdds:     poly,
       edge,
-      edgeHistory:  state.edgeHistory.slice(-80),
+      edgeHistory,
       priceChart:   state.priceChart.slice(-100),
       currentCandle:state.currentCandle,
       bollinger:    computeBollinger(),
@@ -3878,10 +3927,11 @@ app.get('/api/prices',  (req, res) => res.json({
 app.get('/api/candles', (req, res) => {
   const market = getActiveSignalMarket();
   const { implied, poly, edge } = computeEdge(market);
+  const edgeHistory = state.edgeHistory.filter(e => (e.asset || 'BTC') === getAssetKey(market)).slice(-80);
   res.json({
     candles:       state.candles.slice(-300),
     currentCandle: state.currentCandle,
-    edgeHistory:   state.edgeHistory.slice(-80),
+    edgeHistory,
     impliedProb:   implied,
     polyOdds:      poly,
     edge,
@@ -4027,6 +4077,7 @@ wss.on('connection', (ws) => {
   // Burst initial state — use single getBestMarket() call so implied/poly/edge are consistent
   const initMarket = getActiveSignalMarket();
   const { implied: initImp, poly: initPly, edge: initEdg } = computeEdge(initMarket);
+  const initEdgeHistory = state.edgeHistory.filter(e => (e.asset || 'BTC') === getAssetKey(initMarket)).slice(-80);
   ws.send(JSON.stringify({ type: 'STATUS',  data: buildStatusPayload() }));
   ws.send(JSON.stringify({ type: 'MARKETS', data: state.markets }));
   ws.send(JSON.stringify({ type: 'TRADES_HISTORY', data: state.trading.trades.slice(0, 200) }));
@@ -4035,7 +4086,7 @@ wss.on('connection', (ws) => {
     btcPrice: state.btcPrice, btcChange24h: state.btcChange24h,
     laggedPrice: getPriceAt(LAG_MS), impliedProb: initImp,
     polyOdds: initPly, edge: initEdg,
-    edgeHistory: state.edgeHistory.slice(-80),
+    edgeHistory: initEdgeHistory,
     priceChart: state.priceChart.slice(-100),
     candles: state.candles.slice(-300),
     currentCandle: state.currentCandle,

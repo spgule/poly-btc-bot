@@ -384,10 +384,10 @@ export default function ConfigModal({ onClose, initialConfig, status }) {
           <div style={S.field}>
             <label style={S.label}>Kill Switch Drawdown: <strong style={{ color: 'var(--red)' }}>{cfg.killThreshold}%</strong></label>
             <span style={S.hint}>Auto-stop bot when drawdown exceeds this % from starting balance.</span>
-            <input style={S.range} type="range" min={5} max={50} step={5}
+            <input style={S.range} type="range" min={0} max={100} step={1}
               value={cfg.killThreshold} onChange={e => set('killThreshold', Number(e.target.value))} />
             <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: 9, color: 'var(--t3)', marginTop: 3 }}>
-              <span>5%</span><span>50%</span>
+              <span>0%</span><span>100%</span>
             </div>
           </div>
 

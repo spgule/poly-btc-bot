@@ -52,7 +52,7 @@ const DEFAULT_LAYOUT = [
 
 const PANEL_NAMES = {
   signal:    'Signal',
-  markets:   'Mercados BTC',
+  markets:   'Mercados Multi-Asset',
   chart:     'BTC / USDT',
   edge:      'Live Edge',
   balance:   'Balance Curve',
@@ -715,14 +715,22 @@ function SignalBody({ signal, market, status, onManualTrade }) {
 
 // ─── MARKETS BODY ─────────────────────────────────────────────────────────────
 function MarketsBody({ markets }) {
+  const sortedMarkets = [...markets].sort((a, b) => {
+    const aAsset = a.asset || 'BTC';
+    const bAsset = b.asset || 'BTC';
+    if (aAsset !== bAsset) return aAsset.localeCompare(bAsset);
+    if (Boolean(b.live) !== Boolean(a.live)) return Number(Boolean(b.live)) - Number(Boolean(a.live));
+    return Number(b.volume || 0) - Number(a.volume || 0);
+  });
   return (
     <div style={{ flex: 1, overflowY: 'auto', padding: '4px 12px 8px' }}>
-      {markets.length === 0
+      {sortedMarkets.length === 0
         ? <div style={{ padding: '18px 0', textAlign: 'center', color: 'var(--t2)', fontSize: 10 }}>
             Conectando ao Polymarket…
           </div>
-        : markets.map((m, i) => {
+        : sortedMarkets.map((m, i) => {
             const yes      = m.outcomePrices?.[0] ?? 0.5;
+            const asset    = m.asset || 'BTC';
             const vol      = m.volume >= 1e6 ? `$${(m.volume / 1e6).toFixed(1)}M`
                            : m.volume >= 1000 ? `$${(m.volume / 1000).toFixed(0)}K`
                            : `$${m.volume}`;
@@ -736,6 +744,9 @@ function MarketsBody({ markets }) {
                 </div>
                 <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 4 }}>
                   <div style={{ display: 'flex', gap: 6, fontSize: 11, fontWeight: 700 }}>
+                    <span className={cn('badge', asset === 'BTC' ? 'badge-blue' : asset === 'SOL' ? 'badge-amber' : 'badge-green')} style={{ fontSize: 7 }}>
+                      {asset}
+                    </span>
                     <span style={{ color: 'var(--green)' }}>YES {(yes * 100).toFixed(0)}¢</span>
                     <span style={{ color: 'var(--t3)' }}>/</span>
                     <span style={{ color: 'var(--red)' }}>NO {((1 - yes) * 100).toFixed(0)}¢</span>
@@ -1585,7 +1596,7 @@ export default function App() {
       case 'markets':
         return (
           <MobileCard
-            title="Mercados BTC"
+            title="Mercados Multi-Asset"
             badge={<span className={cn('badge', isReal ? 'badge-green' : 'badge-amber')} style={{ fontSize: 7 }}>{isReal ? '● LIVE' : '● SIM'}</span>}
             defaultOpen={false}
           >
@@ -1724,7 +1735,7 @@ export default function App() {
 
           {/* Mercados */}
           <MobileCard
-            title="Mercados BTC"
+            title="Mercados Multi-Asset"
             badge={<span className={cn('badge', isReal ? 'badge-green' : 'badge-amber')} style={{ fontSize: 7 }}>{isReal ? '● LIVE' : '● SIM'}</span>}
             defaultOpen={false}
           >
