@@ -203,7 +203,10 @@ function applyConfigPatch(patch = {}) {
 function buildTradeSignal(market, now = Date.now()) {
   const context = buildSignalContext(market, now);
   if (!context) return null;
-  const { implied, poly, edge, dynMinEdge, side, bollinger, bollingerBias, trendIndicators, trendBias } = context;
+  const {
+    implied, poly, edge, dynMinEdge, side,
+    bollinger, bollingerBias, trendIndicators, trendBias, fib, fibBias,
+  } = context;
   if (Math.abs(edge) < dynMinEdge) return null;
 
   // Cap edge at 15¢: in a real CLOB institutional arbitrageurs would eliminate
@@ -237,6 +240,8 @@ function buildTradeSignal(market, now = Date.now()) {
   const qualBonus     = Math.round(edgeQuality(cappedEdge) * 20);
   const bollingerBonus = bollingerBias === 'favorable' ? 6 : bollingerBias === 'unfavorable' ? -8 : 0;
   const trendBonus    = trendBias === 'favorable' ? 6 : trendBias === 'unfavorable' ? -8 : 0;
+  const fibBonus      = fibBias === 'favorable' ? 8 : fibBias === 'unfavorable' ? -10 : 0;
+  const fibRoomBonus  = fib?.roomToTargetPct > 0.0025 ? 4 : fib?.roomToTargetPct > 0.0015 ? 2 : 0;
 
   // Flow imbalance bonus: pressão de compra/venda alinhada com direção do trade → +7
   // contra → -7. Usa Binance aggTrades (isSell flag), populado igual em SIM e LIVE.
@@ -247,7 +252,7 @@ function buildTradeSignal(market, now = Date.now()) {
     : 0;
 
   const confidence = Math.min(99, Math.max(1,
-    50 + cappedEdge * 250 + velBonus + qualBonus + bollingerBonus + trendBonus + imbBonus
+    50 + cappedEdge * 250 + velBonus + qualBonus + bollingerBonus + trendBonus + fibBonus + fibRoomBonus + imbBonus
   ));
 
   return {
@@ -266,6 +271,8 @@ function buildTradeSignal(market, now = Date.now()) {
     bollingerBias,
     trendIndicators,
     trendBias,
+    fib,
+    fibBias,
     _rawEdge: edge,
     _dynMinEdge: dynMinEdge,
   };
@@ -395,6 +402,8 @@ const state = {
     bollingerBias: 'neutral',
     trendIndicators: null,
     trendBias: 'neutral',
+    fib: null,
+    fibBias: 'neutral',
     pausedUntil: 0,
     pauseReason: null,
     manualRearmRequired: false,
@@ -490,6 +499,8 @@ function setSignalDiagnostics(patch = {}) {
     bollingerBias: 'neutral',
     trendIndicators: null,
     trendBias: 'neutral',
+    fib: null,
+    fibBias: 'neutral',
     pausedUntil: 0,
     pauseReason: null,
     manualRearmRequired: false,
@@ -1782,6 +1793,117 @@ function getTrendIndicatorBias(side, indicators) {
   return 'neutral';
 }
 
+function computeFibContext(side, lookback = 80) {
+  const rows = getChartIndicatorRows(lookback);
+  if (rows.length < 24) return null;
+
+  const current = rows[rows.length - 1]?.close;
+  if (!Number.isFinite(current) || current <= 0) return null;
+
+  let start = side === 'BUY_YES'
+    ? { idx: 0, price: rows[0].low }
+    : { idx: 0, price: rows[0].high };
+  let best = null;
+
+  for (let i = 1; i < rows.length; i++) {
+    const row = rows[i];
+    if (side === 'BUY_YES') {
+      if (row.low < start.price) start = { idx: i, price: row.low };
+      const impulsePct = start.price > 0 ? (row.high - start.price) / start.price : 0;
+      if (!best || impulsePct > best.impulsePct) {
+        best = {
+          direction: 'up',
+          startIdx: start.idx,
+          endIdx: i,
+          low: start.price,
+          high: row.high,
+          impulsePct,
+        };
+      }
+    } else {
+      if (row.high > start.price) start = { idx: i, price: row.high };
+      const impulsePct = start.price > 0 ? (start.price - row.low) / start.price : 0;
+      if (!best || impulsePct > best.impulsePct) {
+        best = {
+          direction: 'down',
+          startIdx: start.idx,
+          endIdx: i,
+          high: start.price,
+          low: row.low,
+          impulsePct,
+        };
+      }
+    }
+  }
+
+  if (!best || best.endIdx <= best.startIdx) return null;
+  const range = Math.max(1, best.high - best.low);
+  const rangePct = range / current;
+  if (!Number.isFinite(rangePct) || rangePct < 0.0015) return null;
+
+  if (side === 'BUY_YES') {
+    const retracement = (best.high - current) / range;
+    const extension = 1 + Math.max(0, current - best.high) / range;
+    const target1272 = best.high + range * 0.272;
+    const target1618 = best.high + range * 0.618;
+    const roomToTargetPct = (target1272 - current) / current;
+    const inGoldenPocket = retracement >= 0.382 && retracement <= 0.618;
+    const healthyPullback = retracement >= 0.236 && retracement <= 0.786;
+    const exhausted = extension >= 1.272;
+    const failed = retracement > 0.786;
+    const bias = failed || exhausted ? 'unfavorable'
+      : inGoldenPocket ? 'favorable'
+      : healthyPullback || (retracement >= -0.05 && roomToTargetPct > 0.0015) ? 'neutral'
+      : 'unfavorable';
+    return {
+      ...best,
+      current,
+      range,
+      rangePct,
+      retracement,
+      extension,
+      target1272,
+      target1618,
+      roomToTargetPct,
+      inGoldenPocket,
+      healthyPullback,
+      exhausted,
+      failed,
+      bias,
+    };
+  }
+
+  const retracement = (current - best.low) / range;
+  const extension = 1 + Math.max(0, best.low - current) / range;
+  const target1272 = best.low - range * 0.272;
+  const target1618 = best.low - range * 0.618;
+  const roomToTargetPct = (current - target1272) / current;
+  const inGoldenPocket = retracement >= 0.382 && retracement <= 0.618;
+  const healthyPullback = retracement >= 0.236 && retracement <= 0.786;
+  const exhausted = extension >= 1.272;
+  const failed = retracement > 0.786;
+  const bias = failed || exhausted ? 'unfavorable'
+    : inGoldenPocket ? 'favorable'
+    : healthyPullback || (retracement >= -0.05 && roomToTargetPct > 0.0015) ? 'neutral'
+    : 'unfavorable';
+  return {
+    ...best,
+    current,
+    range,
+    rangePct,
+    retracement,
+    extension,
+    target1272,
+    target1618,
+    roomToTargetPct,
+    inGoldenPocket,
+    healthyPullback,
+    exhausted,
+    failed,
+    bias,
+  };
+}
+
 function getMarketMinEdge(market, volScale = 1) {
   const base = Math.max(0.0015, Number(state.config.minEdge) || 0.02);
   const durationMin = getMarketDurationMinutes(market);
@@ -1819,6 +1941,8 @@ function buildSignalContext(market, now = Date.now()) {
   const bollingerBias = getBollingerBias(side, bollinger);
   const trendIndicators = computeChartTrendIndicators();
   const trendBias = getTrendIndicatorBias(side, trendIndicators);
+  const fib = computeFibContext(side);
+  const fibBias = fib?.bias || 'neutral';
   return {
     marketId: market.id,
     question: market.question,
@@ -1832,6 +1956,8 @@ function buildSignalContext(market, now = Date.now()) {
     bollingerBias,
     trendIndicators,
     trendBias,
+    fib,
+    fibBias,
     timestamp: now,
   };
 }
@@ -2145,6 +2271,8 @@ function runArbitrageCheck() {
       bollingerBias: context?.bollingerBias ?? 'neutral',
       trendIndicators: context?.trendIndicators ?? null,
       trendBias: context?.trendBias ?? 'neutral',
+      fib: context?.fib ?? null,
+      fibBias: context?.fibBias ?? 'neutral',
       pausedUntil: state.trading.pausedUntil,
       pauseReason: state.trading.pauseReason,
       manualRearmRequired: state.trading.manualRearmRequired,
@@ -2224,6 +2352,8 @@ function runArbitrageCheck() {
       bollingerBias: context?.bollingerBias ?? 'neutral',
       trendIndicators: context?.trendIndicators ?? null,
       trendBias: context?.trendBias ?? 'neutral',
+      fib: context?.fib ?? null,
+      fibBias: context?.fibBias ?? 'neutral',
       pausedUntil: state.trading.pausedUntil,
       pauseReason: state.trading.pauseReason,
       blockReason: 'MIN_EDGE',
@@ -2264,6 +2394,8 @@ function runArbitrageCheck() {
     bollingerBias: signalCandidate.bollingerBias,
     trendIndicators: signalCandidate.trendIndicators,
     trendBias: signalCandidate.trendBias,
+    fib: signalCandidate.fib,
+    fibBias: signalCandidate.fibBias,
     timestamp:   signalCandidate.timestamp,
   };
   const side = signalCandidate.side;
@@ -2335,6 +2467,8 @@ function runArbitrageCheck() {
         bollingerBias: altSignal.bollingerBias,
         trendIndicators: altSignal.trendIndicators,
         trendBias: altSignal.trendBias,
+        fib: altSignal.fib,
+        fibBias: altSignal.fibBias,
         timestamp: altSignal.timestamp,
       };
     }
@@ -2432,6 +2566,8 @@ function runArbitrageCheck() {
   const imb = flowImbalance();
   const flowConfirms = Math.abs(imb) >= 0.15 &&
     ((side === 'BUY_YES' && imb > 0) || (side === 'BUY_NO' && imb < 0));
+  const fibConfirms = signalCandidate.fibBias === 'favorable'
+    || (signalCandidate.fibBias === 'neutral' && (signalCandidate.fib?.roomToTargetPct || 0) > 0.0015);
 
   // Confirmação de sinal: bloqueia apenas se MÚLTIPLOS sinais forem explicitamente
   // CONTRÁRIOS ao trade (veto por contradição, não por ausência de confirmação).
@@ -2440,11 +2576,12 @@ function runArbitrageCheck() {
   // Agora: bloqueia se ≥2 sinais contrários estiverem ativos simultaneamente.
   // edgeOk sempre é true aqui (buildTradeSignal já filtrou). O score mantém
   // todos os 5 sinais para diagnóstico e logging.
-  const confirmedSignals = [trendMatches, velOk, edgeOk, confEdgeOk, flowConfirms].filter(Boolean).length;
+  const confirmedSignals = [trendMatches, velOk, edgeOk, confEdgeOk, flowConfirms, fibConfirms].filter(Boolean).length;
   const trendAgainst = !trendMatches && btc10sAgo > 0 && Math.abs(btcTrend10s) > 0.0005;
   const flowAgainst  = Math.abs(imb) >= 0.20 &&
     ((side === 'BUY_YES' && imb < 0) || (side === 'BUY_NO' && imb > 0));
-  const vetoCount    = [trendAgainst, flowAgainst].filter(Boolean).length;
+  const fibAgainst   = signalCandidate.fibBias === 'unfavorable';
+  const vetoCount    = [trendAgainst, flowAgainst, fibAgainst].filter(Boolean).length;
   Object.assign(diagnostics, {
     marketId: state.currentSignal.marketId,
     question: state.currentSignal.question,
@@ -2457,6 +2594,7 @@ function runArbitrageCheck() {
     trendMatches,
     velOk,
     edgeOk,
+    fibConfirms,
     stableOk,
     canTrade,
     safeBalance,
@@ -2469,10 +2607,13 @@ function runArbitrageCheck() {
     bollingerBias: signalCandidate.bollingerBias,
     trendIndicators: state.currentSignal.trendIndicators,
     trendBias: state.currentSignal.trendBias,
+    fib: state.currentSignal.fib,
+    fibBias: state.currentSignal.fibBias,
     pausedUntil: state.trading.pausedUntil,
     pauseReason: state.trading.pauseReason,
     trendAgainst,
     flowAgainst,
+    fibAgainst,
     vetoCount,
   });
   if (!canTrade) diagnostics.blockers.push('max_open_positions');
@@ -2490,6 +2631,14 @@ function runArbitrageCheck() {
     state.currentSignal = null;
     diagnostics.blockers.push('signal_confirmation');
     diagnostics.blockReason = 'SIGNAL_VETO';
+    setSignalDiagnostics(diagnostics);
+    return broadcastSignal();
+  }
+
+  if (fibAgainst && !isSpike && Math.abs(edge) < dynMinEdge * 1.35) {
+    state.currentSignal = null;
+    diagnostics.blockers.push('fib_exhaustion');
+    diagnostics.blockReason = 'FIB_EXHAUSTION';
     setSignalDiagnostics(diagnostics);
     return broadcastSignal();
   }
@@ -2725,6 +2874,8 @@ function openPosition(signal) {
     unrealizedPnl:    0,
     pnlPct:           0,
     edge:             Math.round(edge * 10000) / 10000,
+    fib:              signal.fib || null,
+    fibBias:          signal.fibBias || 'neutral',
     entryTime,
     btcPriceAtEntry:  state.btcPrice,
     // CLOB execution metadata (shown in trade log)
@@ -2900,6 +3051,7 @@ function closePosition(pos, exitOdds, reason) {
     edge:          pos.edge,
     spread:        pos.spread  || null,
     impact:        pos.impact  || null,
+    fibBias:       pos.fibBias || 'neutral',
     outcome,
     closeReason: reason,
     holdMs:      pos.holdMs,
