@@ -763,6 +763,38 @@ function BtcChartBody({ market, candles, currentCandle }) {
   const up   = (market.btcPrice || 0) >= (market.laggedPrice || market.btcPrice || 0);
   const diff = (market.btcPrice || 0) - (market.laggedPrice || market.btcPrice || 0);
   const pct  = market.laggedPrice > 0 ? (diff / market.laggedPrice * 100) : 0;
+
+  // ── Asset selector ──────────────────────────────────────────────────────────
+  const [chartAsset, setChartAsset] = useState('BTC');
+  const [altData, setAltData]       = useState({});  // { SOL: {candles,price,polyPrice,...}, ETH: {...} }
+  const altFetchRef = useRef({});                     // { SOL: ts, ETH: ts } — debounce
+
+  useEffect(() => {
+    if (chartAsset === 'BTC') return;
+    const cached = altFetchRef.current[chartAsset];
+    if (cached && Date.now() - cached < 55000) return; // 55s debounce (cache is 60s)
+    altFetchRef.current[chartAsset] = Date.now();
+    api.getAltCandles(chartAsset)
+      .then(d => setAltData(prev => ({ ...prev, [chartAsset]: d })))
+      .catch(() => {});
+  }, [chartAsset]);
+
+  // Periodic refresh when alt asset is selected (every 60s)
+  useEffect(() => {
+    if (chartAsset === 'BTC') return undefined;
+    const timer = setInterval(() => {
+      altFetchRef.current[chartAsset] = 0; // invalidate cache
+      api.getAltCandles(chartAsset)
+        .then(d => setAltData(prev => ({ ...prev, [chartAsset]: d })))
+        .catch(() => {});
+    }, 60000);
+    return () => clearInterval(timer);
+  }, [chartAsset]);
+
+  // Pick the right candle data
+  const displayCandles       = chartAsset === 'BTC' ? candles       : (altData[chartAsset]?.candles       ?? []);
+  const displayCurrentCandle = chartAsset === 'BTC' ? currentCandle : (altData[chartAsset]?.currentCandle ?? null);
+
   const [indicatorToggles, setIndicatorToggles] = useState(() => {
     try {
       const saved = localStorage.getItem('ptb-chart-indicators-v1');
@@ -792,31 +824,73 @@ function BtcChartBody({ market, candles, currentCandle }) {
         padding: '4px 12px', background: 'var(--s2)', borderBottom: '1px solid var(--border)',
         display: 'flex', justifyContent: 'space-between', alignItems: 'center', flexWrap: 'wrap', gap: 8, flexShrink: 0,
       }}>
-        <div style={{ display: 'flex', gap: 10, alignItems: 'center', fontSize: 8 }}>
-          <span style={{ fontWeight: 700, color: up ? 'var(--green)' : 'var(--red)' }}>
-            {up ? '▲' : '▼'} {Math.abs(pct).toFixed(3)}% vs lag
-          </span>
-          {market.priceSource === 'binance'
-            ? <span className="blink" style={{ color: 'var(--green)' }}>● LIVE</span>
-            : market.priceSource === 'binance-rest'
-              ? <span style={{ color: 'var(--amber)' }}>● REST</span>
-              : <span style={{ color: 'var(--red)' }}>● OFF</span>
-          }
-          <span style={{ color: 'var(--t3)' }}>candles 5s</span>
+        {/* ── Asset toggle ── */}
+        <div style={{ display: 'flex', gap: 4, alignItems: 'center' }}>
+          {['BTC', 'SOL', 'ETH'].map(a => (
+            <button key={a} type="button" onClick={() => setChartAsset(a)} style={{
+              border: `1px solid ${chartAsset === a ? 'var(--blue)' : 'var(--border)'}`,
+              background: chartAsset === a ? 'rgba(72,153,255,0.12)' : 'transparent',
+              color: chartAsset === a ? 'var(--blue)' : 'var(--t3)',
+              borderRadius: 4, padding: '2px 8px', fontSize: 8, fontWeight: 700,
+              cursor: 'pointer', letterSpacing: '0.06em',
+            }}>{a}</button>
+          ))}
         </div>
-        <div style={{ display: 'flex', gap: 12, alignItems: 'center', fontSize: 8 }}>
-          <span style={{ color: 'var(--t2)' }}>
-            IMPLIED <span style={{ color: (market.impliedProb || 0.5) > 0.5 ? 'var(--green)' : 'var(--red)', fontWeight: 700 }}>
-              {((market.impliedProb || 0.5) * 100).toFixed(1)}¢
+        {/* ── Price / connection info ── */}
+        {chartAsset === 'BTC' ? (
+          <div style={{ display: 'flex', gap: 10, alignItems: 'center', fontSize: 8 }}>
+            <span style={{ fontWeight: 700, color: up ? 'var(--green)' : 'var(--red)' }}>
+              {up ? '▲' : '▼'} {Math.abs(pct).toFixed(3)}% vs lag
             </span>
-          </span>
-          <span style={{ color: 'var(--t2)' }}>
-            POLY <span style={{ color: 'var(--t1)', fontWeight: 700 }}>{((market.polyOdds || 0.5) * 100).toFixed(1)}¢</span>
-          </span>
-          <span style={{ fontWeight: 700, color: Math.abs(market.edge || 0) > 0.03 ? ((market.edge || 0) > 0 ? 'var(--green)' : 'var(--red)') : 'var(--t3)' }}>
-            EDGE {fmtEdge(market.edge || 0)}
-          </span>
+            {market.priceSource === 'binance'
+              ? <span className="blink" style={{ color: 'var(--green)' }}>● LIVE</span>
+              : market.priceSource === 'binance-rest'
+                ? <span style={{ color: 'var(--amber)' }}>● REST</span>
+                : <span style={{ color: 'var(--red)' }}>● OFF</span>
+            }
+            <span style={{ color: 'var(--t3)' }}>candles 5s</span>
+          </div>
+        ) : (
+          <div style={{ display: 'flex', gap: 10, alignItems: 'center', fontSize: 8 }}>
+            <span style={{ fontWeight: 700, color: 'var(--t1)' }}>
+              {altData[chartAsset] ? `$${altData[chartAsset].price?.toLocaleString(undefined, { maximumFractionDigits: 4 })}` : '—'}
+            </span>
+            <span style={{ color: 'var(--t3)' }}>candles 1m · Binance REST</span>
+            {!altData[chartAsset] && <span style={{ color: 'var(--amber)' }}>Carregando…</span>}
+          </div>
+        )}
+        {/* ── Poly odds (BTC only) / Alt Poly odds ── */}
+        <div style={{ display: 'flex', gap: 12, alignItems: 'center', fontSize: 8 }}>
+          {chartAsset === 'BTC' ? (
+            <>
+              <span style={{ color: 'var(--t2)' }}>
+                IMPLIED <span style={{ color: (market.impliedProb || 0.5) > 0.5 ? 'var(--green)' : 'var(--red)', fontWeight: 700 }}>
+                  {((market.impliedProb || 0.5) * 100).toFixed(1)}¢
+                </span>
+              </span>
+              <span style={{ color: 'var(--t2)' }}>
+                POLY <span style={{ color: 'var(--t1)', fontWeight: 700 }}>{((market.polyOdds || 0.5) * 100).toFixed(1)}¢</span>
+              </span>
+              <span style={{ fontWeight: 700, color: Math.abs(market.edge || 0) > 0.03 ? ((market.edge || 0) > 0 ? 'var(--green)' : 'var(--red)') : 'var(--t3)' }}>
+                EDGE {fmtEdge(market.edge || 0)}
+              </span>
+            </>
+          ) : altData[chartAsset]?.polyPrice != null ? (
+            <>
+              <span style={{ color: 'var(--t2)' }}>
+                POLY YES <span style={{ color: 'var(--t1)', fontWeight: 700 }}>
+                  {(altData[chartAsset].polyPrice * 100).toFixed(1)}¢
+                </span>
+              </span>
+              {altData[chartAsset]?.polyQuestion && (
+                <span style={{ color: 'var(--t3)', maxWidth: 160, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                  {altData[chartAsset].polyQuestion}
+                </span>
+              )}
+            </>
+          ) : null}
         </div>
+        {/* ── Indicator toggles ── */}
         <div style={{ display: 'flex', gap: 6, alignItems: 'center', flexWrap: 'wrap' }}>
           {indicatorMeta.map((indicator) => {
             const active = !!indicatorToggles[indicator.key];
@@ -846,10 +920,10 @@ function BtcChartBody({ market, candles, currentCandle }) {
         </div>
       </div>
       <div style={{ flex: 1, minHeight: 0 }}>
-        {candles.length > 0 || currentCandle
-          ? <CandleChart candles={candles} currentCandle={currentCandle} indicators={indicatorToggles} />
+        {displayCandles.length > 0 || displayCurrentCandle
+          ? <CandleChart candles={displayCandles} currentCandle={displayCurrentCandle} indicators={indicatorToggles} />
           : <div style={{ height: '100%', display: 'flex', alignItems: 'center', justifyContent: 'center', color: 'var(--t2)', fontSize: 10 }}>
-              Aguardando dados do Binance…
+              {chartAsset === 'BTC' ? 'Aguardando dados do Binance…' : `Carregando ${chartAsset}/USDT…`}
             </div>
         }
       </div>
@@ -1105,10 +1179,10 @@ function TradesBody({ trades }) {
             {trades.map((t, i) => (
               <tr key={t.id || i} style={{ borderBottom: '1px solid var(--border)', fontSize: 9 }}>
                 <td style={{ padding: '5px 4px', color: 'var(--t2)', fontVariantNumeric: 'tabular-nums' }}>{fmtTime(t.timestamp)}</td>
-                <td style={{ padding: '5px 4px', textAlign: 'right', fontWeight: 700, color: t.side === 'BUY_YES' ? 'var(--green)' : 'var(--red)' }}>
-                  {t.side === 'BUY_YES' ? '▲' : '▼'}
+                <td style={{ padding: '5px 4px', textAlign: 'right', fontWeight: 700, color: (t.pnl ?? 0) >= 0 ? 'var(--green)' : 'var(--red)' }}>
+                  {t.side === 'BUY_YES' ? '▲ YES' : '▼ NO'}
                 </td>
-                <td style={{ padding: '5px 4px', textAlign: 'right', color: 'var(--blue)', fontVariantNumeric: 'tabular-nums' }}>{fmtEdge(t.edge)}</td>
+                <td style={{ padding: '5px 4px', textAlign: 'right', color: 'var(--blue)', fontVariantNumeric: 'tabular-nums' }}>{fmtEdge(Math.abs(t.edge ?? 0))}</td>
                 <td style={{ padding: '5px 4px', textAlign: 'right', color: 'var(--amber)', fontVariantNumeric: 'tabular-nums' }}>
                   {fmt$(t.betSize, 1)}
                   {t.partialFill && <span style={{ color: 'var(--amber)', fontSize: 7, marginLeft: 2 }} title={`Pedido: $${t.requestedSize}`}>P</span>}
@@ -1263,8 +1337,8 @@ function HistoryBody({ trades }) {
             {filteredTrades.map((t, i) => (
               <tr key={t.id || i} style={{ borderBottom: '1px solid var(--border)', fontSize: 9 }}>
                 <td style={{ padding: '4px', color: 'var(--t2)' }}>{fmtTime(t.timestamp)}</td>
-                <td style={{ padding: '4px', fontWeight: 700, color: t.side === 'BUY_YES' ? 'var(--green)' : 'var(--red)' }}>
-                  {t.side === 'BUY_YES' ? '▲' : '▼'}
+                <td style={{ padding: '4px', fontWeight: 700, color: (t.pnl ?? 0) >= 0 ? 'var(--green)' : 'var(--red)' }}>
+                  {t.side === 'BUY_YES' ? '▲ YES' : '▼ NO'}
                 </td>
                 <td style={{ padding: '4px', color: 'var(--t3)', fontSize: 8, maxWidth: 130, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
                   {t.question?.slice(0, 32)}

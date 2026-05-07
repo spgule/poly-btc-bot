@@ -54,6 +54,7 @@ export const api = {
   closePosition:  (posId)   => post(`/api/positions/${posId}/close`),
   getFees:        ()        => get('/api/fees'),
   getCandles:     ()        => get('/api/candles'),
+  getAltCandles:  (asset)   => get(`/api/alt/candles?asset=${asset}`),
   simReset:       ()        => post('/api/sim/reset'),
   riskRearm:      ()        => post('/api/risk/rearm'),
 };

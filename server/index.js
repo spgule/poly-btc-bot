@@ -3497,6 +3497,76 @@ app.get('/api/candles', (req, res) => {
   });
 });
 
+// ── ALT ASSET CANDLES (SOL / ETH) ────────────────────────────────────────────
+// Fetches 1m Binance klines and top Poly market price for SOL or ETH.
+// Results cached 60s to avoid hammering Binance REST limits.
+const _altCandleCache = {};
+const ALT_CACHE_MS   = 60000;
+
+app.get('/api/alt/candles', async (req, res) => {
+  const asset = (req.query.asset || '').toUpperCase();
+  if (!['SOL', 'ETH'].includes(asset)) {
+    return res.status(400).json({ error: 'asset must be SOL or ETH' });
+  }
+  const cached = _altCandleCache[asset];
+  if (cached && Date.now() - cached.ts < ALT_CACHE_MS) {
+    return res.json(cached.data);
+  }
+  try {
+    // Binance REST klines — 1m interval, 200 candles ≈ 3h 20m of history
+    const symbol   = `${asset}USDT`;
+    const klineUrl = `https://api.binance.com/api/v3/klines?symbol=${symbol}&interval=1m&limit=200`;
+    const klineResp = await axios.get(klineUrl, { timeout: 10000 });
+    const klines    = Array.isArray(klineResp.data) ? klineResp.data : [];
+    const candles   = klines.map(k => ({
+      time:   Math.floor(Number(k[0]) / 1000),
+      open:   Number(k[1]),
+      high:   Number(k[2]),
+      low:    Number(k[3]),
+      close:  Number(k[4]),
+      volume: Number(k[5]),
+    })).filter(c => c.time > 0 && c.close > 0);
+
+    const price = candles.length > 0 ? candles[candles.length - 1].close : 0;
+
+    // Polymarket: find top binary market for this asset (best-effort, non-blocking)
+    let polyPrice   = null;
+    let polyQuestion = null;
+    try {
+      const keyword = asset === 'SOL' ? 'solana' : 'ethereum';
+      const polyResp = await axios.get(`${POLY_GAMMA}/markets`, {
+        params: { active: true, closed: false, limit: 100, order: 'volume', ascending: false },
+        timeout: 8000,
+        headers: { 'User-Agent': 'poly-btc-bot/1.0' },
+      });
+      const mlist = Array.isArray(polyResp.data) ? polyResp.data : (polyResp.data?.markets || polyResp.data?.results || []);
+      const relevant = mlist.filter(m => {
+        const q = (m.question || m.title || '').toLowerCase();
+        return q.includes(keyword) && !q.includes('btc') && !q.includes('bitcoin');
+      });
+      if (relevant.length > 0) {
+        const top = relevant[0];
+        try {
+          const prices = Array.isArray(top.outcomePrices)
+            ? top.outcomePrices.map(Number)
+            : JSON.parse(top.outcomePrices || '[0.5,0.5]').map(Number);
+          if (prices.length >= 1 && Number.isFinite(prices[0])) {
+            polyPrice    = Math.round(prices[0] * 10000) / 10000;
+            polyQuestion = (top.question || top.title || '').slice(0, 80);
+          }
+        } catch (_) {}
+      }
+    } catch (_) { /* Poly fetch is best-effort */ }
+
+    const data = { candles, currentCandle: null, price, polyPrice, polyQuestion };
+    _altCandleCache[asset] = { data, ts: Date.now() };
+    res.json(data);
+  } catch (e) {
+    console.error(`[Alt] Failed to fetch ${asset} candles:`, e.message);
+    res.status(500).json({ error: e.message });
+  }
+});
+
 app.get('/api/debug/feed', (_req, res) => {
   const market = getActiveSignalMarket();
   const polyLiveAgeMs = getPolyLiveAgeMs();
