@@ -1548,7 +1548,7 @@ function hasUsableSimMarket(now = Date.now()) {
       minutesLeft >= 2 &&
       minutesLeft <= 30.5 &&
       getMarketPriceDistance(m) <= 0.42 &&
-      strikeGap <= 0.012
+      strikeGap <= 0.020
     );
   });
 }
@@ -2419,8 +2419,12 @@ function runArbitrageCheck() {
   if (hasSameSide || hasOpposite) {
     // Try to find an alternative market without a conflicting position for this side.
     // Must pass the same duration filter as getBestMarket — prevents long-dated markets leaking in.
+    // KEY: also prune stale-WS live markets here (same as cascadePool) so SIM markets
+    // fill in seamlessly when all live alternatives have a stale Polymarket feed.
+    // Without this, a stale live market gets selected → POLY_LIVE_STALE fires with no SIM fallback.
     const alternatives = state.markets.filter(m => {
       if (m.id === tradeMarket.id) return false; // skip primary
+      if (_polyStaleExclude(m)) return false; // stale observed live markets → SIM fallback
       if (!isValidTradingMarket(m)) return false; // duration 4.5–30.5 min only
       if (m.priceIsEstimated) return false;
       const priceDist = Math.abs((m.outcomePrices?.[0] ?? 0.5) - 0.5);

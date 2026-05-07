@@ -112,7 +112,7 @@ function useBot() {
     config: {
       mode: 'SIM', capital: 1000,
       entryMode: 'kelly', fixedAmount: 30,
-      maxBetPct: 6, minEdge: 0.03,
+      maxBetPct: 6, minEdge: 0.02,
       killThreshold: 20, autoTrade: false, hasPrivateKey: false,
       takeProfitPct: 14, stopLossPct: 16, posTimeoutMs: 150000,
       maxOpenPos: 10, requireStableEdge: false, allowDuplicateMarkets: true,
