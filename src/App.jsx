@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useRef, useMemo } from 'react';
+import React, { useState, useEffect, useRef, useMemo, useCallback } from 'react';
 import GridLayout, { WidthProvider } from 'react-grid-layout';
 import 'react-grid-layout/css/styles.css';
 import 'react-resizable/css/styles.css';
@@ -769,27 +769,26 @@ function BtcChartBody({ market, candles, currentCandle }) {
   const [altData, setAltData]       = useState({});  // { SOL: {candles,price,polyPrice,...}, ETH: {...} }
   const altFetchRef = useRef({});                     // { SOL: ts, ETH: ts } — debounce
 
+  const fetchAlt = useCallback((asset) => {
+    altFetchRef.current[asset] = Date.now();
+    api.getAltCandles(asset)
+      .then(d => setAltData(prev => ({ ...prev, [asset]: d })))
+      .catch(() => {});
+  }, []);
+
   useEffect(() => {
     if (chartAsset === 'BTC') return;
-    const cached = altFetchRef.current[chartAsset];
-    if (cached && Date.now() - cached < 55000) return; // 55s debounce (cache is 60s)
-    altFetchRef.current[chartAsset] = Date.now();
-    api.getAltCandles(chartAsset)
-      .then(d => setAltData(prev => ({ ...prev, [chartAsset]: d })))
-      .catch(() => {});
-  }, [chartAsset]);
+    fetchAlt(chartAsset);
+  }, [chartAsset, fetchAlt]);
 
-  // Periodic refresh when alt asset is selected (every 60s)
+  // Refresh alt candles every 5s when live WS candles are expected, else every 15s
   useEffect(() => {
     if (chartAsset === 'BTC') return undefined;
     const timer = setInterval(() => {
-      altFetchRef.current[chartAsset] = 0; // invalidate cache
-      api.getAltCandles(chartAsset)
-        .then(d => setAltData(prev => ({ ...prev, [chartAsset]: d })))
-        .catch(() => {});
-    }, 60000);
+      fetchAlt(chartAsset);
+    }, 5000);
     return () => clearInterval(timer);
-  }, [chartAsset]);
+  }, [chartAsset, fetchAlt]);
 
   // Pick the right candle data
   const displayCandles       = chartAsset === 'BTC' ? candles       : (altData[chartAsset]?.candles       ?? []);

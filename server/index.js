@@ -1043,6 +1043,16 @@ function connectAltAsset(symbol, assetKey) {
         w.sumPQ += price * tickW;
         w.sumQ  += tickW;
       }
+
+      // Seed SIM markets for this asset on first price tick (deferred init)
+      const hasSims = state.markets.some(m => !m.live && (m.asset || 'BTC').toUpperCase() === KEY);
+      if (!hasSims) seedSimMarketsForAsset(KEY, price);
+
+      // Trigger arb engine on alt ticks — same as BTC (100ms throttle)
+      if (state.trading.active && now - lastArbCheckTs >= 100) {
+        lastArbCheckTs = now;
+        runArbitrageCheck();
+      }
     } catch (e) { /* ignore */ }
   });
 
@@ -1098,6 +1108,11 @@ function updateCandleForAsset(price, now, qty, candlesKey, curCandleKey) {
 // Fetch live Polymarket markets for SOL or ETH, tag with market.asset, merge into state.markets.
 async function fetchAltMarkets(asset, keyword) {
   const KEY = asset.toUpperCase();
+  // Build a regex that matches the asset ticker AND/OR full name.
+  // Polymarket titles use "SOL", "ETH", "Solana", "Ethereum" interchangeably.
+  const tickerRe = KEY === 'SOL'
+    ? /\bsol\b|solana/i
+    : /\beth\b|ethereum/i;
   try {
     const fetches = [
       axios.get(`${POLY_GAMMA}/markets`, {
@@ -1119,8 +1134,9 @@ async function fetchAltMarkets(asset, keyword) {
       const arr = Array.isArray(resp.data) ? resp.data : (resp.data?.markets || resp.data?.results || []);
       for (const m of arr) {
         const q = (m.question || m.title || '').toLowerCase();
-        if (!q.includes(keyword)) continue;
-        if (q.includes('btc') || q.includes('bitcoin')) continue;
+        // Must mention this asset, must NOT mention BTC/Bitcoin/bitcoin-cash
+        if (!tickerRe.test(q)) continue;
+        if (/btc|bitcoin/.test(q)) continue;
         if (seen.has(m.id)) continue;
         seen.add(m.id);
         altRaw.push(m);
@@ -1128,7 +1144,7 @@ async function fetchAltMarkets(asset, keyword) {
     }
 
     if (altRaw.length === 0) {
-      console.log(`[Polymarket] No live ${KEY} markets found — SIM only`);
+      console.log(`[Polymarket] No live ${KEY} markets found (keyword=${tickerRe}) — SIM only`);
       return;
     }
 
@@ -1141,20 +1157,20 @@ async function fetchAltMarkets(asset, keyword) {
           : JSON.parse(m.outcomePrices || '[0.5,0.5]').map(Number);
         if (!prices.length || !Number.isFinite(prices[0])) continue;
         const vol = Number(m.volume || m.volumeNum || 0);
-        if (vol < 50000) continue; // minimum volume filter
+        if (vol < 5000) continue; // relaxed volume filter for alt assets
         const endDate = m.endDate || m.gameStartTime;
         const startDate = m.startDate;
         if (!endDate) continue;
         const minutesLeft = (new Date(endDate).getTime() - Date.now()) / 60000;
         if (minutesLeft <= 0 || minutesLeft > 1440) continue;
+        const yesPrice = Math.round(prices[0] * 10000) / 10000;
+        const dist = Math.abs(yesPrice - 0.5);
+        if (dist > 0.42) continue; // skip near-resolved markets
         newAltMarkets.push({
           id: m.id,
           question: m.question || m.title,
           outcomes: m.outcomes || ['Yes', 'No'],
-          outcomePrices: [
-            Math.round(prices[0] * 10000) / 10000,
-            Math.round((1 - prices[0]) * 10000) / 10000,
-          ],
+          outcomePrices: [yesPrice, Math.round((1 - yesPrice) * 10000) / 10000],
           volume: vol,
           startDate,
           endDate,
@@ -1166,14 +1182,17 @@ async function fetchAltMarkets(asset, keyword) {
       } catch (_) { continue; }
     }
 
-    if (newAltMarkets.length === 0) return;
+    if (newAltMarkets.length === 0) {
+      console.log(`[Polymarket] ${KEY}: found ${altRaw.length} raw but none passed filters — SIM only`);
+      return;
+    }
 
     // Merge: remove old live alt markets for this asset, add new ones
     state.markets = [
       ...state.markets.filter(m => !(m.live && (m.asset || 'BTC').toUpperCase() === KEY)),
       ...newAltMarkets,
     ];
-    console.log(`[Polymarket] ${KEY} live markets loaded: ${newAltMarkets.length}`);
+    console.log(`[Polymarket] ${KEY} live markets loaded: ${newAltMarkets.length} (from ${altRaw.length} raw)`);
   } catch (err) {
     console.error(`[Polymarket] fetchAltMarkets(${KEY}) error:`, err.message);
   }
@@ -3884,6 +3903,31 @@ app.get('/api/alt/candles', async (req, res) => {
   if (!['SOL', 'ETH'].includes(asset)) {
     return res.status(400).json({ error: 'asset must be SOL or ETH' });
   }
+
+  // ── Prefer live in-memory candles (built from Binance aggTrade WS, 5s resolution)
+  // These are always up-to-date and require no HTTP request.
+  const liveCandles      = asset === 'SOL' ? state.solCandles      : state.ethCandles;
+  const liveCurCandle    = asset === 'SOL' ? state.solCurrentCandle : state.ethCurrentCandle;
+  const livePrice        = asset === 'SOL' ? state.solPrice         : state.ethPrice;
+  const isLiveConnected  = asset === 'SOL' ? state.solConnected     : state.ethConnected;
+
+  if (isLiveConnected && liveCandles.length >= 2) {
+    // Serve live WS candles directly — no caching needed, already in memory
+    // Find best active alt market for this asset to show polyPrice/question
+    const altMkt = state.markets
+      .filter(m => m.live && (m.asset || 'BTC').toUpperCase() === asset)
+      .sort((a, b) => (b.volume || 0) - (a.volume || 0))[0] || null;
+    return res.json({
+      candles:       liveCandles.slice(-300),
+      currentCandle: liveCurCandle,
+      price:         livePrice,
+      polyPrice:     altMkt?.outcomePrices?.[0] ?? null,
+      polyQuestion:  altMkt?.question?.slice(0, 80) ?? null,
+      source:        'live-ws',
+    });
+  }
+
+  // ── Fallback: Binance REST 1m klines (when WS hasn't warmed up yet)
   const cached = _altCandleCache[asset];
   if (cached && Date.now() - cached.ts < ALT_CACHE_MS) {
     return res.json(cached.data);
@@ -3903,38 +3947,16 @@ app.get('/api/alt/candles', async (req, res) => {
       volume: Number(k[5]),
     })).filter(c => c.time > 0 && c.close > 0);
 
-    const price = candles.length > 0 ? candles[candles.length - 1].close : 0;
+    const price = livePrice > 0 ? livePrice : (candles.length > 0 ? candles[candles.length - 1].close : 0);
 
-    // Polymarket: find top binary market for this asset (best-effort, non-blocking)
-    let polyPrice   = null;
-    let polyQuestion = null;
-    try {
-      const keyword = asset === 'SOL' ? 'solana' : 'ethereum';
-      const polyResp = await axios.get(`${POLY_GAMMA}/markets`, {
-        params: { active: true, closed: false, limit: 100, order: 'volume', ascending: false },
-        timeout: 8000,
-        headers: { 'User-Agent': 'poly-btc-bot/1.0' },
-      });
-      const mlist = Array.isArray(polyResp.data) ? polyResp.data : (polyResp.data?.markets || polyResp.data?.results || []);
-      const relevant = mlist.filter(m => {
-        const q = (m.question || m.title || '').toLowerCase();
-        return q.includes(keyword) && !q.includes('btc') && !q.includes('bitcoin');
-      });
-      if (relevant.length > 0) {
-        const top = relevant[0];
-        try {
-          const prices = Array.isArray(top.outcomePrices)
-            ? top.outcomePrices.map(Number)
-            : JSON.parse(top.outcomePrices || '[0.5,0.5]').map(Number);
-          if (prices.length >= 1 && Number.isFinite(prices[0])) {
-            polyPrice    = Math.round(prices[0] * 10000) / 10000;
-            polyQuestion = (top.question || top.title || '').slice(0, 80);
-          }
-        } catch (_) {}
-      }
-    } catch (_) { /* Poly fetch is best-effort */ }
+    // Use alt market already loaded in state (avoid extra Gamma API call)
+    const altMkt = state.markets
+      .filter(m => m.live && (m.asset || 'BTC').toUpperCase() === asset)
+      .sort((a, b) => (b.volume || 0) - (a.volume || 0))[0] || null;
+    let polyPrice   = altMkt?.outcomePrices?.[0] ?? null;
+    let polyQuestion = altMkt?.question?.slice(0, 80) ?? null;
 
-    const data = { candles, currentCandle: null, price, polyPrice, polyQuestion };
+    const data = { candles, currentCandle: null, price, polyPrice, polyQuestion, source: 'rest' };
     _altCandleCache[asset] = { data, ts: Date.now() };
     res.json(data);
   } catch (e) {
@@ -4056,20 +4078,16 @@ server.listen(PORT, async () => {
   connectAltAsset('ethusdt', 'ETH');
   await fetchBTCMarkets();
   // Fetch SOL/ETH markets in parallel (non-blocking, best-effort)
-  fetchAltMarkets('SOL', 'solana').catch(() => {});
-  fetchAltMarkets('ETH', 'ethereum').catch(() => {});
-  // Seed SIM markets for SOL/ETH using current prices (0 = deferred until price arrives)
-  // A short delay allows the WS feeds to deliver first prices
-  setTimeout(() => {
-    if (state.solPrice > 0) seedSimMarketsForAsset('SOL', state.solPrice);
-    if (state.ethPrice > 0) seedSimMarketsForAsset('ETH', state.ethPrice);
-  }, 5000);
+  fetchAltMarkets('SOL', 'sol').catch(() => {});
+  fetchAltMarkets('ETH', 'eth').catch(() => {});
+  // SIM markets for SOL/ETH are seeded automatically on first Binance WS tick
+  // via connectAltAsset → seedSimMarketsForAsset(KEY, price)
   syncPolyMarketSubscription();
   // Refresh markets every 15s
   setInterval(fetchBTCMarkets, 15 * 1000);
   setInterval(() => {
-    fetchAltMarkets('SOL', 'solana').catch(() => {});
-    fetchAltMarkets('ETH', 'ethereum').catch(() => {});
+    fetchAltMarkets('SOL', 'sol').catch(() => {});
+    fetchAltMarkets('ETH', 'eth').catch(() => {});
   }, 30 * 1000);
   setInterval(syncPolyMarketSubscription, 2000);
   // Sim market price model: re-prices non-live markets every 2s using real BTC + binary option math
