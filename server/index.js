@@ -307,6 +307,7 @@ let _idSeq = 0; // Monotonic counter — prevents Date.now() collisions at SIM 1
 const nextId = (prefix) => `${prefix}-${Date.now()}-${++_idSeq}`;
 const PRICE_HIST_MS  = 300000; // 5 minutes of price history for charts
 const POLY_FEE_RATE  = 0.02;   // Polymarket: 2% protocol fee on gross winnings (applied at settlement)
+const POLYGON_GAS_FEE = 0.05;  // Polygon L2 gas per transaction (~$0.05 per on-chain order confirmation)
 const CANDLE_SEC     = 5;      // 5-second OHLCV candles for TradingView-style chart
 
 // ── STATE ─────────────────────────────────────────────────────────────────────
@@ -3197,14 +3198,32 @@ function runArbitrageCheck(assetFilter = null) {
 // ── CLOB REALISM ENGINE ─────────────────────────────────────────────────────
 // Applied identically in SIM and LIVE — makes SIM a faithful dry-run.
 
-// Bid-ask half-spread based on market volume (tighter = more liquid)
+// Volatility multiplier for clobSpread: when BTC is moving fast, market makers
+// widen their quotes to protect against adverse selection. Uses last ~30s of
+// priceHistory (10 ticks at 3s cadence). Returns 1x (calm) to 3x (spike).
+function getBtcVolFactor() {
+  const recent = state.priceHistory.slice(-10);
+  if (recent.length < 3) return 1.0;
+  const prices = recent.map(p => p.price);
+  const hi = Math.max(...prices), lo = Math.min(...prices);
+  const rangePct = (hi - lo) / lo;
+  if (rangePct > 0.005) return 3.0; // >0.5% 30s range → spreads triple
+  if (rangePct > 0.003) return 2.0; // >0.3%
+  if (rangePct > 0.001) return 1.5; // >0.1%
+  return 1.0;
+}
+
+// Bid-ask half-spread based on market volume (tighter = more liquid),
+// multiplied by real-time BTC volatility factor.
 // Source: Polymarket CLOB observed spreads (2024-2025 data)
 function clobSpread(marketVolume) {
-  if (marketVolume >= 500000) return 0.012; // 1.2¢ — deep liquid market
-  if (marketVolume >= 100000) return 0.025; // 2.5¢
-  if (marketVolume >=  50000) return 0.040; // 4¢
-  if (marketVolume >=  10000) return 0.060; // 6¢
-  return 0.080;                             // 8¢ — thin market
+  let base;
+  if (marketVolume >= 500000) base = 0.012; // 1.2¢ — deep liquid market
+  else if (marketVolume >= 100000) base = 0.025; // 2.5¢
+  else if (marketVolume >=  50000) base = 0.040; // 4¢
+  else if (marketVolume >=  10000) base = 0.060; // 6¢
+  else base = 0.080;                             // 8¢ — thin market
+  return Math.min(0.15, base * getBtcVolFactor()); // cap at 15¢
 }
 
 // Price impact: large orders consume depth and get worse fill
@@ -3234,16 +3253,23 @@ function simulateClobFill(side, requestedSize, market) {
   if (orderType === 'MAKER') {
     // GTC limit order posted at mid — fills at mid price (no spread, no impact).
     // Passive fill depth is ~50% of taker depth (conservative: not all resting orders fill).
-    const makerDepth = maxOrderSize(vol) * 0.5;
-    const fillSize   = Math.min(requestedSize, makerDepth);
-    return {
-      fillOdds:    Math.round(midOdds * 10000) / 10000,
-      fillSize:    Math.round(fillSize * 100) / 100,
-      partialFill: fillSize < requestedSize,
-      spread:      0,
-      impact:      0,
-      orderType,
-    };
+    // Non-fill risk: ~25% chance the price moves away before our limit is hit.
+    // In that case downgrade to TAKER so the bot doesn't miss the trade silently.
+    if (Math.random() < 0.25) {
+      // Price walked away — fall through to TAKER logic below.
+      console.log(`[CLOB] MAKER limit not filled (price moved away) — downgrading to TAKER`);
+    } else {
+      const makerDepth = maxOrderSize(vol) * 0.5;
+      const fillSize   = Math.min(requestedSize, makerDepth);
+      return {
+        fillOdds:    Math.round(midOdds * 10000) / 10000,
+        fillSize:    Math.round(fillSize * 100) / 100,
+        partialFill: fillSize < requestedSize,
+        spread:      0,
+        impact:      0,
+        orderType,
+      };
+    }
   }
 
   // TAKER: market order — pays bid-ask spread + price impact
@@ -3382,7 +3408,9 @@ function openPosition(signal) {
   };
   pos.closeDeadline = getPositionCloseDeadline(pos, market);
 
-  state.trading.balance = Math.round((state.trading.balance - fillSize) * 100) / 100;
+  state.trading.balance = Math.round((state.trading.balance - fillSize - POLYGON_GAS_FEE) * 100) / 100;
+  // Track entry gas fee in total fees accounting
+  state.stats.totalFees = Math.round(((state.stats.totalFees || 0) + POLYGON_GAS_FEE) * 100) / 100;
   state.positions.push(pos);
   // Keep history bounded
   if (state.positions.length > 500) state.positions = state.positions.slice(-500);
@@ -3390,7 +3418,7 @@ function openPosition(signal) {
   broadcast({ type: 'POSITION_OPENED', data: pos });
   broadcastStatus();
   const fillNote = fill.partialFill ? ` [PARTIAL ${fill.fillSize}/${betSize}]` : '';
-  console.log(`[CLOB] OPEN ${side} ${shares}sh @ ${fillOdds.toFixed(3)} mid=${midAtEntry.toFixed(3)} | spread=${(fill.spread*100).toFixed(1)}¢ impact=${(fill.impact*100).toFixed(1)}¢ | $${fillSize}${fillNote} | edge ${(edge*100).toFixed(1)}¢`);
+  console.log(`[CLOB] OPEN ${side} ${shares}sh @ ${fillOdds.toFixed(3)} mid=${midAtEntry.toFixed(3)} | spread=${(fill.spread*100).toFixed(1)}¢ impact=${(fill.impact*100).toFixed(1)}¢ gas=${POLYGON_GAS_FEE.toFixed(2)} | $${fillSize}${fillNote} | edge ${(edge*100).toFixed(1)}¢`);
 }
 
 // ── SIM MARKET PRICE MODEL ───────────────────────────────────────────────────────────────
@@ -3471,7 +3499,13 @@ function closePosition(pos, exitOdds, reason) {
   const market = state.markets.find(m => m.id === pos.marketId);
   const isMaker = (pos.orderType === 'MAKER') || (state.config.orderType === 'MAKER');
   const exitSpread    = (reason === 'MERGE' || isMaker) ? 0 : clobSpread(Number(market?.volume || 0));
-  const effectiveExit = Math.max(0.01, exitOdds - exitSpread);
+
+  // Exit fill latency slippage: the CLOB sell order also takes 50-300ms to confirm.
+  // During that window the best-bid can move against you. Model as 0-1.5¢ adverse.
+  // Applied to TAKER exits only (not MERGE settlements or MAKER limit orders).
+  const exitSlip = (reason !== 'MERGE' && !isMaker) ? Math.random() * 0.015 : 0;
+
+  const effectiveExit = Math.max(0.01, exitOdds - exitSpread - exitSlip);
 
   // P&L = (effectiveExit − entryOdds) × shares
   const rawPnl   = (effectiveExit - pos.entryOdds) * pos.shares;
@@ -3480,7 +3514,10 @@ function closePosition(pos, exitOdds, reason) {
   // TP / SL / MANUAL are CLOB early-sells — no settlement fee applies.
   // A TIMEOUT is treated as a settlement only when odds confirm resolution (≥0.95 or ≤0.05).
   const isSettlement = reason === 'TIMEOUT' && (exitOdds >= 0.95 || exitOdds <= 0.05);
-  const fee = (grossPnl > 0 && isSettlement) ? Math.round(grossPnl * POLY_FEE_RATE * 100) / 100 : 0;
+  const settlementFee = (grossPnl > 0 && isSettlement) ? Math.round(grossPnl * POLY_FEE_RATE * 100) / 100 : 0;
+  // Gas fee on exit transaction (Polygon on-chain confirmation); not charged for MERGE (no on-chain tx).
+  const exitGasFee = reason !== 'MERGE' ? POLYGON_GAS_FEE : 0;
+  const fee = Math.round((settlementFee + exitGasFee) * 100) / 100;
   const pnl      = Math.round((grossPnl - fee) * 100) / 100;
   const outcome  = pnl >= 0 ? 'WIN' : 'LOSS';
 
@@ -3497,22 +3534,20 @@ function closePosition(pos, exitOdds, reason) {
   const dayDrawdown = (state.trading.peakBalanceDay - state.trading.balance) / state.trading.peakBalanceDay;
   const monthDrawdown = (state.trading.peakBalanceMonth - state.trading.balance) / state.trading.peakBalanceMonth;
 
-  if (state.config.mode === 'LIVE') {
-    if (state.config.liveRiskEnabled && !isTradingPaused()) {
-      const consecutiveLosses = state.stats.streak < 0 ? Math.abs(state.stats.streak) : 0;
-      const requireStreak = state.config.livePauseRequireStreak && state.config.livePauseLossStreak > 0;
-      const streakOk = !requireStreak || consecutiveLosses >= state.config.livePauseLossStreak;
-      const streakSuffix = requireStreak ? ` + ${state.config.livePauseLossStreak} losses streak` : '';
-      if (monthDrawdown > state.config.liveMonthlyPauseDrawdownPct / 100 && streakOk) {
-        armLiveRiskPause(`${state.config.liveMonthlyPauseDrawdownPct}% Monthly Drawdown${streakSuffix}`, state.config.liveMonthlyPauseMs);
-        console.log(`[Risk] Monthly live drawdown limit reached. Paused for ${Math.round(state.config.liveMonthlyPauseMs / 60000)}m.`);
-      } else if (dayDrawdown > state.config.liveDailyPauseDrawdownPct / 100 && streakOk) {
-        armLiveRiskPause(`${state.config.liveDailyPauseDrawdownPct}% Daily Drawdown${streakSuffix}`, state.config.liveDailyPauseMs);
-        console.log(`[Risk] Daily live drawdown limit reached. Paused for ${Math.round(state.config.liveDailyPauseMs / 60000)}m.`);
-      }
+  // Risk controls apply equally in SIM and LIVE — SIM must validate that
+  // drawdown/streak limits actually fire before going live with real capital.
+  if (state.config.liveRiskEnabled && !isTradingPaused()) {
+    const consecutiveLosses = state.stats.streak < 0 ? Math.abs(state.stats.streak) : 0;
+    const requireStreak = state.config.livePauseRequireStreak && state.config.livePauseLossStreak > 0;
+    const streakOk = !requireStreak || consecutiveLosses >= state.config.livePauseLossStreak;
+    const streakSuffix = requireStreak ? ` + ${state.config.livePauseLossStreak} losses streak` : '';
+    if (monthDrawdown > state.config.liveMonthlyPauseDrawdownPct / 100 && streakOk) {
+      armLiveRiskPause(`${state.config.liveMonthlyPauseDrawdownPct}% Monthly Drawdown${streakSuffix}`, state.config.liveMonthlyPauseMs);
+      console.log(`[Risk] Monthly drawdown limit reached (${state.config.mode}). Paused for ${Math.round(state.config.liveMonthlyPauseMs / 60000)}m.`);
+    } else if (dayDrawdown > state.config.liveDailyPauseDrawdownPct / 100 && streakOk) {
+      armLiveRiskPause(`${state.config.liveDailyPauseDrawdownPct}% Daily Drawdown${streakSuffix}`, state.config.liveDailyPauseMs);
+      console.log(`[Risk] Daily drawdown limit reached (${state.config.mode}). Paused for ${Math.round(state.config.liveDailyPauseMs / 60000)}m.`);
     }
-  } else if (state.trading.pausedUntil > 0 || state.trading.pauseReason || state.trading.manualRearmRequired) {
-    clearTradingPause();
   }
 
   state.stats.totalTrades++;
@@ -3986,7 +4021,8 @@ app.get('/api/fees', (_req, res) => {
     makerFee:      0,
     takerFee:      0,
     resolutionFee: POLY_FEE_RATE,
-    description:   `${(POLY_FEE_RATE * 100).toFixed(0)}% of gross winnings deducted at settlement`,
+    gasFeePerTx:   POLYGON_GAS_FEE,
+    description:   `${(POLY_FEE_RATE * 100).toFixed(0)}% settlement fee on gross winnings + $${POLYGON_GAS_FEE.toFixed(2)} Polygon gas per entry/exit`,
   });
 });
 
