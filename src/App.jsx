@@ -1260,6 +1260,8 @@ function RiskBody({ status }) {
         </div>
       </div>
       {[
+        ['Kill Switch', killOn ? `${kill}% limit` : 'DESLIGADO'],
+        ['Risk Pause',  (status.config?.liveRiskEnabled ?? true) ? 'LIGADO' : 'DESLIGADO'],
         ['Entrada',  status.config?.entryMode === 'fixed' ? `$${status.config.fixedAmount} FIXO` : `${status.config?.maxBetPct}% Kelly`],
         ['Min Edge', `${((status.config?.minEdge ?? 0.05) * 100).toFixed(0)}¢`],
         ['Execução', status.config?.autoTrade ? 'AUTO' : 'MANUAL'],
@@ -1270,7 +1272,11 @@ function RiskBody({ status }) {
           <span style={{ color: 'var(--t2)' }}>{k}</span>
           <span style={{
             fontWeight: 700,
-            color: k === 'Modo' && status.mode === 'LIVE' ? 'var(--red)'
+            color: k === 'Kill Switch' && !killOn ? 'var(--t3)'
+              : k === 'Kill Switch' ? 'var(--red)'
+              : k === 'Risk Pause' && !(status.config?.liveRiskEnabled ?? true) ? 'var(--t3)'
+              : k === 'Risk Pause' ? 'var(--amber)'
+              : k === 'Modo' && status.mode === 'LIVE' ? 'var(--red)'
               : k === 'Execução' && status.config?.autoTrade ? 'var(--amber)'
               : 'var(--t1)',
           }}>{v}</span>

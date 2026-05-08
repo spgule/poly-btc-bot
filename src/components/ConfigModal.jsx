@@ -172,13 +172,12 @@ export default function ConfigModal({ onClose, initialConfig, status }) {
               value={cfg.capital} onChange={e => set('capital', Number(e.target.value))} />
           </div>
 
-          {/* ── ENTRY SIZE MODE ── */}
-          {cfg.mode === 'LIVE' && (
-            <div style={{ ...S.field, background: 'var(--s2)', border: '1px solid var(--border)', borderRadius: 6, padding: '14px 16px', marginBottom: 18 }}>
+          {/* ── RISK PAUSE ── */}
+          <div style={{ ...S.field, background: 'var(--s2)', border: '1px solid var(--border)', borderRadius: 6, padding: '14px 16px', marginBottom: 18 }}>
               <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 12, marginBottom: 12 }}>
                 <div>
-                  <span style={{ ...S.label, marginBottom: 2 }}>LIVE Risk Pause</span>
-                  <span style={{ ...S.hint, marginBottom: 0 }}>Configura como o LIVE desacelera ou pausa quando o risco sai do controle.</span>
+                  <span style={{ ...S.label, marginBottom: 2 }}>Risk Pause</span>
+                  <span style={{ ...S.hint, marginBottom: 0 }}>Pausa temporária quando drawdown diário/mensal ou sequência de perdas é atingida. Funciona em SIM e LIVE.</span>
                 </div>
                 <button
                   onClick={() => set('liveRiskEnabled', !cfg.liveRiskEnabled)}
@@ -291,23 +290,22 @@ export default function ConfigModal({ onClose, initialConfig, status }) {
                 </button>
               </div>
 
-              {status?.mode === 'LIVE' && status?.isPaused && (
+              {status?.isPaused && (
                 <div style={{ marginTop: 12, background: 'var(--red-bg)', border: '1px solid var(--red-b)', borderRadius: 5, padding: '10px 12px' }}>
                   <div style={{ fontSize: 10, color: 'var(--red)', marginBottom: 4 }}>
-                    <strong>LIVE currently paused.</strong> {status.pauseReason || 'Risk protection active.'}
+                    <strong>{cfg.mode === 'LIVE' ? 'LIVE' : 'SIM'} currently paused.</strong> {status.pauseReason || 'Risk protection active.'}
                   </div>
                   <div style={{ fontSize: 9, color: 'var(--t2)', marginBottom: 10 }}>
                     {status.manualRearmRequired
-                      ? 'Manual rearm is required before LIVE can trade again.'
+                      ? 'Manual rearm is required before trading can resume.'
                       : `Remaining pause: ${formatMs(status.pausedRemainingMs || 0)}.`}
                   </div>
                   <button className="btn btn-red" onClick={handleRearm} disabled={rearming}>
-                    {rearming ? 'Rearming…' : 'Clear Pause / Rearm LIVE'}
+                    {rearming ? 'Rearming…' : 'Clear Pause / Rearm'}
                   </button>
                 </div>
               )}
             </div>
-          )}
 
           <div style={{ ...S.field, background: 'var(--s2)', border: '1px solid var(--border)', borderRadius: 6, padding: '14px 16px', marginBottom: 18 }}>
             <span style={{ ...S.label, marginBottom: 10 }}>Entry Size Mode</span>
