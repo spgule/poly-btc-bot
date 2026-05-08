@@ -118,7 +118,7 @@ function useBot() {
       mode: 'SIM', capital: 1000,
       entryMode: 'kelly', fixedAmount: 30,
       maxBetPct: 6, minEdge: 0.02,
-      killThreshold: 20, autoTrade: false, hasPrivateKey: false,
+      killThreshold: 20, killSwitchEnabled: true, autoTrade: false, hasPrivateKey: false,
       takeProfitPct: 14, stopLossPct: 16, posTimeoutMs: 150000,
       maxOpenPos: 10, requireStableEdge: false, allowDuplicateMarkets: true,
       cooldownMs: 2000,
@@ -1182,18 +1182,20 @@ function BalanceCurveBody({ trades, status }) {
 // ─── STATS BODY ───────────────────────────────────────────────────────────────
 function StatsBody({ status }) {
   const { stats, drawdown, startBalance, peakBalance, config } = status;
-  const wr   = stats.totalTrades > 0 ? stats.wins / stats.totalTrades * 100 : 0;
-  const dd   = (drawdown || 0) * 100;
-  const kill = config?.killThreshold ?? 20;
+  const wr     = stats.totalTrades > 0 ? stats.wins / stats.totalTrades * 100 : 0;
+  const dd     = (drawdown || 0) * 100;
+  const kill   = config?.killThreshold ?? 20;
+  const killOn = config?.killSwitchEnabled ?? true;
 
   const tiles = [
     { l: 'WIN RATE',  v: `${wr.toFixed(0)}%`,     s: `${stats.wins}W / ${stats.losses}L`,  c: wr >= 55 ? 'var(--green)' : wr >= 45 ? 'var(--amber)' : 'var(--red)' },
     { l: 'TOTAL P&L', v: fmt$(stats.totalPnl, 2), s: `${stats.totalTrades} trades`,         c: (stats.totalPnl || 0) >= 0 ? 'var(--green)' : 'var(--red)' },
     { l: 'TODAY P&L', v: fmt$(stats.todayPnl, 2), s: 'desde 00:00 UTC',                     c: (stats.todayPnl || 0) >= 0 ? 'var(--green)' : 'var(--red)' },
     { l: 'PEAK',      v: fmtPrice(peakBalance),   s: `início ${fmtPrice(startBalance)}`,    c: 'var(--amber)' },
-    { l: 'DRAWDOWN',  v: `${dd.toFixed(1)}%`,     s: `kill @ ${kill}%`,
-      c: dd > kill * 0.7 ? 'var(--red)' : dd > kill * 0.4 ? 'var(--amber)' : 'var(--t2)',
-      bar: Math.min(100, (dd / kill) * 100), barColor: 'var(--red)' },
+    { l: 'DRAWDOWN',  v: `${dd.toFixed(1)}%`,
+      s: killOn ? `kill @ ${kill}%` : 'kill OFF',
+      c: !killOn ? 'var(--t3)' : dd > kill * 0.7 ? 'var(--red)' : dd > kill * 0.4 ? 'var(--amber)' : 'var(--t2)',
+      bar: killOn ? Math.min(100, (dd / kill) * 100) : 0, barColor: 'var(--red)' },
     { l: 'STREAK',
       v: stats.streak > 0 ? `+${stats.streak}W` : stats.streak < 0 ? `${stats.streak}L` : '—',
       s: 'sequência atual',
@@ -1220,11 +1222,12 @@ function StatsBody({ status }) {
 
 // ─── RISK BODY ────────────────────────────────────────────────────────────────
 function RiskBody({ status }) {
-  const dd    = (status.drawdown || 0) * 100;
-  const kill  = status.config?.killThreshold ?? 20;
-  const pct   = Math.min(100, (dd / kill) * 100);
-  const hot   = dd >= kill * 0.75;
-  const color = hot ? 'var(--red)' : dd > kill * 0.4 ? 'var(--amber)' : 'var(--green)';
+  const dd     = (status.drawdown || 0) * 100;
+  const kill   = status.config?.killThreshold ?? 20;
+  const killOn = status.config?.killSwitchEnabled ?? true;
+  const pct    = killOn ? Math.min(100, (dd / kill) * 100) : 0;
+  const hot    = killOn && dd >= kill * 0.75;
+  const color  = !killOn ? 'var(--t3)' : hot ? 'var(--red)' : dd > kill * 0.4 ? 'var(--amber)' : 'var(--green)';
 
   return (
     <div style={{ padding: '12px 14px', display: 'flex', flexDirection: 'column', gap: 10, overflowY: 'auto', height: '100%' }}>
@@ -1237,12 +1240,22 @@ function RiskBody({ status }) {
           Aproximando kill switch — pare o bot
         </div>
       )}
+      {!killOn && (
+        <div style={{
+          display: 'flex', gap: 6, background: 'var(--s3)', border: '1px solid var(--border)',
+          borderRadius: 4, padding: '7px 10px', fontSize: 9, color: 'var(--t3)',
+        }}>
+          Kill Switch desativado — sem proteção de drawdown
+        </div>
+      )}
       <div>
         <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: 9, marginBottom: 5 }}>
           <span style={{ color: 'var(--t2)' }}>Drawdown</span>
-          <span style={{ fontWeight: 700, color }}>{dd.toFixed(1)}% / {kill}%</span>
+          <span style={{ fontWeight: 700, color }}>
+            {dd.toFixed(1)}% {killOn ? `/ ${kill}%` : '(kill OFF)'}
+          </span>
         </div>
-        <div className="progress-track" style={{ height: 5 }}>
+        <div className="progress-track" style={{ height: 5, opacity: killOn ? 1 : 0.3 }}>
           <div className="progress-fill" style={{ width: `${pct}%`, background: color }} />
         </div>
       </div>

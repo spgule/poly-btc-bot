@@ -120,6 +120,7 @@ function saveConfig() {
       maxBetPct:             state.config.maxBetPct,
       minEdge:               state.config.minEdge,
       killThreshold:         state.config.killThreshold,
+      killSwitchEnabled:     state.config.killSwitchEnabled,
       autoTrade:             state.config.autoTrade,
       takeProfitPct:         state.config.takeProfitPct,
       stopLossPct:           state.config.stopLossPct,
@@ -176,6 +177,7 @@ function applyConfigPatch(patch = {}) {
   if (patch.maxBetPct !== undefined) c.maxBetPct = Math.min(50, Math.max(1, Number(patch.maxBetPct) || c.maxBetPct));
   if (patch.minEdge !== undefined) c.minEdge = Math.min(0.5, Math.max(0.01, Number(patch.minEdge) || c.minEdge));
   if (patch.killThreshold !== undefined) c.killThreshold = Math.min(100, Math.max(0, Number(patch.killThreshold) || 0));
+  if (patch.killSwitchEnabled !== undefined) c.killSwitchEnabled = Boolean(patch.killSwitchEnabled);
   if (patch.autoTrade !== undefined) c.autoTrade = Boolean(patch.autoTrade);
   if (patch.takeProfitPct !== undefined) c.takeProfitPct = Math.min(100, Math.max(1, Number(patch.takeProfitPct) || c.takeProfitPct));
   if (patch.stopLossPct !== undefined) c.stopLossPct = Math.min(100, Math.max(1, Number(patch.stopLossPct) || c.stopLossPct));
@@ -329,6 +331,7 @@ const state = {
     maxBetPct: 6,
     minEdge: 0.02,
     killThreshold: 20,
+    killSwitchEnabled: true,
     autoTrade: false,
     privateKey: null,
     takeProfitPct: 14,
@@ -3733,7 +3736,7 @@ async function executeTrade(signal) {
   const drawdown     = state.trading.startBalance > 0
     ? (state.trading.startBalance - effectiveBal) / state.trading.startBalance
     : 0;
-  if (drawdown >= state.config.killThreshold / 100) {
+  if (state.config.killSwitchEnabled && drawdown >= state.config.killThreshold / 100) {
     console.log('[Bot] KILL SWITCH triggered – stopping bot');
     state.trading.active = false;
     broadcastStatus();
@@ -3882,6 +3885,7 @@ function buildStatusPayload() {
       maxBetPct:             state.config.maxBetPct,
       minEdge:               state.config.minEdge,
       killThreshold:         state.config.killThreshold,
+      killSwitchEnabled:     state.config.killSwitchEnabled,
       autoTrade:             state.config.autoTrade,
       hasPrivateKey:         Boolean(state.config.privateKey),
       takeProfitPct:         state.config.takeProfitPct,

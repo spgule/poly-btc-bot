@@ -53,6 +53,7 @@ export default function ConfigModal({ onClose, initialConfig, status }) {
     maxBetPct:             initialConfig?.maxBetPct || 10,
     minEdge:               initialConfig?.minEdge || 0.05,
     killThreshold:         initialConfig?.killThreshold || 20,
+    killSwitchEnabled:     initialConfig?.killSwitchEnabled ?? true,
     autoTrade:             initialConfig?.autoTrade || false,
     takeProfitPct:         initialConfig?.takeProfitPct || 14,
     stopLossPct:           initialConfig?.stopLossPct   || 16,
@@ -382,12 +383,28 @@ export default function ConfigModal({ onClose, initialConfig, status }) {
 
           {/* Kill Threshold */}
           <div style={S.field}>
-            <label style={S.label}>Kill Switch Drawdown: <strong style={{ color: 'var(--red)' }}>{cfg.killThreshold}%</strong></label>
-            <span style={S.hint}>Auto-stop bot when drawdown exceeds this % from starting balance.</span>
-            <input style={S.range} type="range" min={0} max={100} step={1}
-              value={cfg.killThreshold} onChange={e => set('killThreshold', Number(e.target.value))} />
+            <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 3 }}>
+              <label style={{ ...S.label, marginBottom: 0 }}>
+                Kill Switch Drawdown: <strong style={{ color: cfg.killSwitchEnabled ? 'var(--red)' : 'var(--t3)' }}>{cfg.killThreshold}%</strong>
+              </label>
+              <button
+                onClick={() => set('killSwitchEnabled', !cfg.killSwitchEnabled)}
+                style={{
+                  fontSize: 9, fontWeight: 700, padding: '2px 8px', borderRadius: 4,
+                  cursor: 'pointer', border: 'none',
+                  background: cfg.killSwitchEnabled ? 'var(--red-bg)' : 'var(--s3)',
+                  color: cfg.killSwitchEnabled ? 'var(--red)' : 'var(--t3)',
+                }}
+              >
+                {cfg.killSwitchEnabled ? 'LIGADO' : 'DESLIGADO'}
+              </button>
+            </div>
+            <span style={S.hint}>Para o bot permanentemente quando drawdown exceder este % desde o saldo inicial.</span>
+            <input style={{ ...S.range, opacity: cfg.killSwitchEnabled ? 1 : 0.35 }} type="range" min={1} max={100} step={1}
+              value={cfg.killThreshold} onChange={e => set('killThreshold', Number(e.target.value))}
+              disabled={!cfg.killSwitchEnabled} />
             <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: 9, color: 'var(--t3)', marginTop: 3 }}>
-              <span>0%</span><span>100%</span>
+              <span>1%</span><span>100%</span>
             </div>
           </div>
 
