@@ -15,6 +15,7 @@ import { cn } from './lib/utils';
 import { api, getWsUrl, BASE } from './services/api';
 import ConfigModal from './components/ConfigModal';
 import CandleChart from './components/CandleChart';
+import { FusionRiskWidget } from './components/FusionRisk';
 
 const RGL = WidthProvider(GridLayout);
 
@@ -1696,7 +1697,7 @@ export default function App() {
       case 'edge':      return <EdgeChartBody market={market} />;
       case 'balance':   return <BalanceCurveBody trades={trades} status={status} />;
       case 'stats':     return <StatsBody status={status} />;
-      case 'risk':      return <RiskBody status={status} />;
+      case 'risk':      return <FusionRiskWidget riskStatus={market.riskStatus} fusionStatus={market.signalFusion} />;
       case 'positions': return <PositionsBody positions={positions} onClose={closePosition} />;
       case 'trades':    return <TradesBody trades={trades} />;
       case 'history':   return <HistoryBody trades={trades} />;

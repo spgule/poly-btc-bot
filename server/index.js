@@ -29,6 +29,13 @@ const http    = require('http');
 const axios   = require('axios');
 const fs      = require('fs');
 const path    = require('path');
+// ── NEW MODULES (2026-05-15) ──────────────────────────────────────────────────
+const { RiskManager }  = require('./risk-manager');
+const { SignalFusion } = require('./signal-fusion');
+
+// Singleton instances — created once, used throughout
+const riskMgr   = new RiskManager();
+const signalFusion = new SignalFusion();
 
 const CONFIG_FILE  = path.join(__dirname, 'bot-config.json');
 const TRADES_FILE  = path.join(__dirname, 'bot-trades.json');
@@ -955,6 +962,8 @@ function connectBinance() {
       const now = Date.now();
       const qty = parseFloat(msg.q || 0);
       const isSell = msg.m === true;
+      // Feed real-time price to SignalFusion for spike + divergence detection
+      signalFusion.onBinancePrice(price, now);
       state.volHistory.push({ qty, isSell, time: now });
       state.volHistory = state.volHistory.filter(v => now - v.time <= 60000); // 60s window
       state.priceHistory.push({ price, time: now });
@@ -3824,6 +3833,10 @@ function broadcastMarketData() {
       bollinger:    computeBollinger(),
       trendIndicators: computeChartTrendIndicators(),
       priceSource:  state.priceSource,
+      // Signal Fusion status (Coinbase divergence + Fear&Greed + Spike)
+      signalFusion: signalFusion.getStatus(),
+      // Risk Manager status (4-layer protection)
+      riskStatus:   riskMgr.getStatus(),
       timestamp:    Date.now(),
     },
   });
@@ -4007,6 +4020,23 @@ app.post('/api/config', (req, res) => {
   saveSession();
   broadcastStatus();
   res.json({ success: true, config: buildStatusPayload().config });
+});
+
+// ── FUSION STATUS endpoint ────────────────────────────────────────────────────
+app.get('/api/fusion', (_req, res) => {
+  res.json(signalFusion.getStatus());
+});
+
+// ── RISK MANAGER status endpoint ─────────────────────────────────────────────
+app.get('/api/risk/status', (_req, res) => {
+  res.json(riskMgr.getStatus());
+});
+
+app.post('/api/risk/rearm-ext', (req, res) => {
+  const { balance } = req.body;
+  riskMgr.rearm(balance || state.trading.balance);
+  broadcastStatus();
+  res.json({ success: true, status: riskMgr.getStatus() });
 });
 
 app.post('/api/risk/rearm', (_req, res) => {
@@ -4296,6 +4326,11 @@ server.listen(PORT, async () => {
     state.trading.lastTradeTs = 0; // reset cooldown so first trade fires immediately
     console.log('[Bot] Auto-resumed: autoTrade=true in saved config');
   }
+
+  // ── Initialise new modules ─────────────────────────────────────────────────
+  riskMgr.init(state.trading.balance);
+  signalFusion.start();  // starts Coinbase + Fear&Greed background pollers
+  console.log('[Modules] RiskManager + SignalFusion initialised');
 
   await loadBinanceHistory();
   seedSimMarkets();
